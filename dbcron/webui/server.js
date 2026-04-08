@@ -8,8 +8,7 @@ app.use(express.json());
 app.use(express.static(path.join(__dirname, "public")));
 
 const PORT = process.env.PORT || 3000;
-const PYTHON = process.env.PYTHON_BIN || "python";
-const PROJECT_ROOT = path.resolve(__dirname, "..");
+const PROJECT_ROOT = path.resolve(__dirname, "../..");
 
 // -------------------------------------------------------------------
 // Available jobs — add new entries when you create a new Job subclass
@@ -33,15 +32,18 @@ let nextId = 1;
 // -------------------------------------------------------------------
 function runJob(jobName, args = {}) {
   return new Promise((resolve, reject) => {
-    const cliArgs = ["-m", "dbcron.main", jobName];
+    const cliArgs = ["run", "python", "-m", "dbcron.main", jobName];
     for (const [k, v] of Object.entries(args)) {
       cliArgs.push(`--${k}`, String(v));
     }
 
-    const proc = spawn(PYTHON, cliArgs, { cwd: PROJECT_ROOT });
+    const proc = spawn("uv", cliArgs, { cwd: PROJECT_ROOT });
     let stdout = "";
     let stderr = "";
 
+    proc.on("error", (err) => {
+      reject({ jobName, args, success: false, stdout: "", stderr: err.message, finishedAt: new Date().toISOString() });
+    });
     proc.stdout.on("data", (d) => (stdout += d));
     proc.stderr.on("data", (d) => (stderr += d));
 
