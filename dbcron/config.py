@@ -40,15 +40,14 @@ class S3Config:
 
 
 @dataclass(frozen=True)
-class AppConfig:
+class InfraConfig:
     susdb: DBConfig
     coredb: DBConfig
     s3: S3Config
-    recommend_api_host: str
 
 
-def load_config() -> AppConfig:
-    return AppConfig(
+def load_config() -> InfraConfig:
+    return InfraConfig(
         susdb=DBConfig(
             host=_env("SUSDB_HOST"),
             port=int(_env("SUSDB_PORT", "5432")),
@@ -69,5 +68,4 @@ def load_config() -> AppConfig:
             secret_key=_env("S3_SECRET_KEY"),
             bucket_name=_env("S3_BUCKET_NAME"),
         ),
-        recommend_api_host=_env("SUS_RECOMMEND_API_HOST"),
     )

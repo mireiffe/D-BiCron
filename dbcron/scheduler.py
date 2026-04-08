@@ -7,13 +7,13 @@ import logging
 from apscheduler.schedulers.blocking import BlockingScheduler
 from apscheduler.triggers.cron import CronTrigger
 
-from .config import AppConfig
+from .config import InfraConfig
 from .jobs import JOB_REGISTRY
 
 logger = logging.getLogger(__name__)
 
 
-def run_scheduled(job_name: str, config: AppConfig, cron_expr: str, **job_kwargs):
+def run_scheduled(job_name: str, config: InfraConfig, cron_expr: str, **job_kwargs):
     """Register a job with a cron expression and start the scheduler."""
     job_cls = JOB_REGISTRY.get(job_name)
     if job_cls is None:

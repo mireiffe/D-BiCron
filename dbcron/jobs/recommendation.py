@@ -8,6 +8,7 @@ from datetime import datetime, timedelta
 import httpx
 from sqlalchemy import text
 
+from ..config import _env
 from ..db import create_coredb_engine, create_susdb_engine
 from .base import Job, JobResult
 
@@ -40,7 +41,7 @@ class RecommendationJob(Job):
         self.logger.info("Fetched %d records from susdb", len(rows))
 
         # 2) 추천 API 호출
-        api_url = f"{self.config.recommend_api_host}/api/v1/recommend"
+        api_url = f"{_env('SUS_RECOMMEND_API_HOST')}/api/v1/recommend"
         results = []
         with httpx.Client(timeout=30) as client:
             for row in rows:
