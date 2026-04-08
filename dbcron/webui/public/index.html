@@ -3,308 +3,711 @@
 <head>
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-  <title>db_manager - coredb Job Scheduler</title>
+  <title>D-BiCron // coredb scheduler</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com" />
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+  <link href="https://fonts.googleapis.com/css2?family=DM+Mono:wght@400;500&family=Oxanium:wght@400;600;700&display=swap" rel="stylesheet" />
   <style>
     :root {
-      --bg: #0f172a;
-      --surface: #1e293b;
-      --border: #334155;
-      --text: #e2e8f0;
-      --muted: #94a3b8;
-      --accent: #3b82f6;
-      --accent-hover: #2563eb;
-      --success: #22c55e;
-      --danger: #ef4444;
+      --bg: #eae5db;
+      --bg-dots: #d8d3c9;
+      --sidebar-bg: #f3f0e9;
+      --surface: #ffffff;
+      --dark: #1a1a2e;
+      --dark-mid: #2d2d48;
+      --border-color: #1a1a2e;
+      --border-w: 3px;
+      --text: #1a1a2e;
+      --text-dim: #6b6880;
+      --lime: #c8ff00;
+      --lime-dim: #b0e000;
+      --cyan: #00e5ff;
+      --cyan-dim: #00bcd4;
+      --magenta: #ff2d8a;
+      --yellow: #ffd000;
+      --red: #ff3355;
+      --green: #00c853;
+      --shadow: 5px 5px 0 var(--dark);
+      --shadow-sm: 3px 3px 0 var(--dark);
+      --font-display: 'Oxanium', sans-serif;
+      --font-mono: 'DM Mono', monospace;
+      --radius: 4px;
     }
+
     * { margin: 0; padding: 0; box-sizing: border-box; }
+
     body {
-      font-family: 'Inter', -apple-system, BlinkMacSystemFont, sans-serif;
+      font-family: var(--font-mono);
+      font-size: 13px;
       background: var(--bg);
       color: var(--text);
-      line-height: 1.6;
-    }
-    .container { max-width: 960px; margin: 0 auto; padding: 2rem 1.5rem; }
-    h1 { font-size: 1.5rem; font-weight: 600; margin-bottom: 2rem; }
-    h1 span { color: var(--muted); font-weight: 400; }
-    h2 { font-size: 1.1rem; font-weight: 600; margin-bottom: 1rem; color: var(--muted); text-transform: uppercase; letter-spacing: .05em; }
-
-    .card {
-      background: var(--surface);
-      border: 1px solid var(--border);
-      border-radius: 8px;
-      padding: 1.25rem;
-      margin-bottom: 1.5rem;
+      line-height: 1.5;
+      min-height: 100vh;
+      /* Dot grid pattern */
+      background-image: radial-gradient(circle, var(--bg-dots) 1px, transparent 1px);
+      background-size: 20px 20px;
     }
 
-    .job-row {
+    /* ── Neon top bar ── */
+    .glow-bar {
+      height: 4px;
+      background: linear-gradient(90deg, var(--lime), var(--cyan), var(--magenta), var(--lime));
+      background-size: 300% 100%;
+      animation: glowSlide 5s linear infinite;
+    }
+    @keyframes glowSlide {
+      0% { background-position: 0% 0; }
+      100% { background-position: 300% 0; }
+    }
+
+    /* ── Header ── */
+    .header {
+      background: var(--dark);
+      padding: 10px 24px;
       display: flex;
       align-items: center;
       justify-content: space-between;
-      padding: .75rem 0;
-      border-bottom: 1px solid var(--border);
+      border-bottom: var(--border-w) solid var(--dark);
     }
-    .job-row:last-child { border-bottom: none; }
-    .job-info strong { display: block; }
-    .job-info small { color: var(--muted); }
-
-    button, .btn {
-      cursor: pointer;
-      border: none;
-      border-radius: 6px;
-      padding: .5rem 1rem;
-      font-size: .85rem;
-      font-weight: 500;
-      transition: background .15s;
-    }
-    .btn-primary { background: var(--accent); color: #fff; }
-    .btn-primary:hover { background: var(--accent-hover); }
-    .btn-danger { background: var(--danger); color: #fff; }
-    .btn-danger:hover { opacity: .85; }
-    .btn-sm { padding: .35rem .75rem; font-size: .8rem; }
-
-    .schedule-form {
+    .header-left {
       display: flex;
-      gap: .75rem;
-      flex-wrap: wrap;
-      align-items: end;
-      margin-bottom: 1rem;
+      align-items: baseline;
+      gap: 12px;
     }
-    .field { display: flex; flex-direction: column; gap: .25rem; }
-    .field label { font-size: .75rem; color: var(--muted); text-transform: uppercase; letter-spacing: .04em; }
-    .field select, .field input {
-      background: var(--bg);
-      border: 1px solid var(--border);
-      border-radius: 6px;
-      color: var(--text);
-      padding: .45rem .65rem;
-      font-size: .85rem;
+    .logo {
+      font-family: var(--font-display);
+      font-weight: 700;
+      font-size: 20px;
+      color: var(--lime);
+      letter-spacing: 3px;
+      text-transform: uppercase;
+      text-shadow: 0 0 20px rgba(200, 255, 0, .5);
+    }
+    .logo-sub {
+      font-family: var(--font-mono);
+      font-size: 11px;
+      color: #888;
+      letter-spacing: 1px;
+    }
+    .header-right {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+    }
+    .status-pill {
+      display: flex;
+      align-items: center;
+      gap: 6px;
+      background: rgba(0, 200, 83, .12);
+      border: 1.5px solid var(--green);
+      border-radius: 20px;
+      padding: 3px 12px 3px 8px;
+      font-size: 10px;
+      font-family: var(--font-display);
+      font-weight: 600;
+      color: var(--green);
+      letter-spacing: 1.5px;
+      text-transform: uppercase;
+    }
+    .status-dot {
+      width: 6px;
+      height: 6px;
+      border-radius: 50%;
+      background: var(--green);
+      box-shadow: 0 0 6px var(--green);
+      animation: pulse 2s ease-in-out infinite;
+    }
+    @keyframes pulse {
+      0%, 100% { opacity: 1; }
+      50% { opacity: .3; }
     }
 
-    table { width: 100%; border-collapse: collapse; font-size: .85rem; }
-    th { text-align: left; color: var(--muted); font-weight: 500; padding: .5rem .25rem; border-bottom: 1px solid var(--border); }
-    td { padding: .5rem .25rem; border-bottom: 1px solid var(--border); }
+    /* ── Layout ── */
+    .dashboard {
+      display: grid;
+      grid-template-columns: 280px 1fr;
+      min-height: calc(100vh - 54px);
+    }
+
+    /* ── Sidebar ── */
+    .sidebar {
+      background: var(--sidebar-bg);
+      border-right: var(--border-w) solid var(--border-color);
+      padding: 18px 14px;
+      display: flex;
+      flex-direction: column;
+      gap: 12px;
+      overflow-y: auto;
+    }
+
+    /* ── Main ── */
+    .main {
+      padding: 18px 20px;
+      display: flex;
+      flex-direction: column;
+      gap: 18px;
+    }
+    .main-row {
+      display: grid;
+      grid-template-columns: 1fr 1fr;
+      gap: 18px;
+    }
+
+    /* ── Section Title ── */
+    .stitle {
+      font-family: var(--font-display);
+      font-size: 11px;
+      font-weight: 700;
+      color: var(--text);
+      text-transform: uppercase;
+      letter-spacing: 2px;
+      margin-bottom: 10px;
+      display: flex;
+      align-items: center;
+      gap: 8px;
+    }
+    .stitle-icon {
+      font-size: 13px;
+      width: 22px;
+      height: 22px;
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      border: 2px solid var(--border-color);
+      border-radius: 3px;
+      font-weight: 700;
+      flex-shrink: 0;
+    }
+    .stitle-icon.lime { background: var(--lime); }
+    .stitle-icon.cyan { background: var(--cyan); }
+    .stitle-icon.magenta { background: var(--magenta); color: #fff; }
+    .stitle-icon.yellow { background: var(--yellow); }
+    .stitle .count {
+      font-family: var(--font-mono);
+      font-size: 10px;
+      font-weight: 500;
+      background: var(--dark);
+      color: var(--lime);
+      padding: 1px 7px;
+      border-radius: 3px;
+      letter-spacing: 0;
+    }
+
+    /* ── Card ── */
+    .card {
+      background: var(--surface);
+      border: var(--border-w) solid var(--border-color);
+      border-radius: var(--radius);
+      box-shadow: var(--shadow);
+      transition: transform .1s, box-shadow .1s;
+    }
+    .card:hover {
+      transform: translate(-1px, -1px);
+      box-shadow: 7px 7px 0 var(--dark);
+    }
+    .card-body { padding: 16px; }
+
+    /* ── Job Card (sidebar) ── */
+    .job-card {
+      background: var(--surface);
+      border: var(--border-w) solid var(--border-color);
+      border-radius: var(--radius);
+      padding: 12px;
+      box-shadow: var(--shadow-sm);
+      border-left: 6px solid var(--lime);
+      transition: transform .1s, box-shadow .1s;
+    }
+    .job-card:hover {
+      transform: translate(-1px, -1px);
+      box-shadow: 5px 5px 0 var(--dark);
+    }
+    .job-name {
+      font-family: var(--font-display);
+      font-weight: 700;
+      font-size: 13px;
+      color: var(--text);
+      margin-bottom: 3px;
+    }
+    .job-desc {
+      font-size: 11px;
+      color: var(--text-dim);
+      margin-bottom: 10px;
+    }
+    .job-actions {
+      display: flex;
+      gap: 8px;
+      align-items: center;
+    }
+    .field-inline {
+      display: flex;
+      align-items: center;
+      gap: 4px;
+    }
+    .field-inline label {
+      font-size: 10px;
+      color: var(--text-dim);
+      text-transform: uppercase;
+      letter-spacing: .5px;
+    }
+    .field-inline input {
+      width: 46px;
+      background: var(--bg);
+      border: 2px solid var(--border-color);
+      border-radius: 3px;
+      color: var(--text);
+      font-family: var(--font-mono);
+      font-size: 12px;
+      padding: 3px 6px;
+      text-align: center;
+    }
+    .field-inline input:focus {
+      outline: none;
+      border-color: var(--lime-dim);
+      box-shadow: 0 0 0 2px rgba(200, 255, 0, .3);
+    }
+
+    /* ── Buttons ── */
+    .btn {
+      display: inline-flex;
+      align-items: center;
+      gap: 4px;
+      cursor: pointer;
+      border: var(--border-w) solid var(--border-color);
+      border-radius: var(--radius);
+      font-family: var(--font-display);
+      font-weight: 700;
+      font-size: 11px;
+      letter-spacing: 1px;
+      text-transform: uppercase;
+      padding: 5px 14px;
+      box-shadow: var(--shadow-sm);
+      transition: transform .08s, box-shadow .08s;
+      white-space: nowrap;
+    }
+    .btn:hover {
+      transform: translate(-1px, -1px);
+      box-shadow: 5px 5px 0 var(--dark);
+    }
+    .btn:active {
+      transform: translate(2px, 2px);
+      box-shadow: 1px 1px 0 var(--dark);
+    }
+    .btn-lime {
+      background: var(--lime);
+      color: var(--dark);
+    }
+    .btn-cyan {
+      background: var(--cyan);
+      color: var(--dark);
+    }
+    .btn-red {
+      background: var(--red);
+      color: #fff;
+    }
+    .btn-sm {
+      padding: 3px 10px;
+      font-size: 10px;
+      box-shadow: 2px 2px 0 var(--dark);
+    }
+    .btn-sm:hover { box-shadow: 3px 3px 0 var(--dark); }
+    .btn:disabled { opacity: .4; pointer-events: none; }
+
+    /* ── Schedule Form ── */
+    .sched-form {
+      display: flex;
+      gap: 10px;
+      align-items: end;
+      flex-wrap: wrap;
+    }
+    .field {
+      display: flex;
+      flex-direction: column;
+      gap: 4px;
+    }
+    .field-label {
+      font-family: var(--font-display);
+      font-size: 10px;
+      font-weight: 600;
+      color: var(--text-dim);
+      text-transform: uppercase;
+      letter-spacing: 1.5px;
+    }
+    .field select,
+    .field input {
+      background: var(--surface);
+      border: 2px solid var(--border-color);
+      border-radius: var(--radius);
+      color: var(--text);
+      font-family: var(--font-mono);
+      font-size: 12px;
+      padding: 6px 10px;
+    }
+    .field select:focus,
+    .field input:focus {
+      outline: none;
+      border-color: var(--cyan-dim);
+      box-shadow: 0 0 0 2px rgba(0, 229, 255, .25);
+    }
+    .field select { cursor: pointer; }
+
+    /* ── Table ── */
+    .tbl {
+      width: 100%;
+      border-collapse: collapse;
+      font-size: 12px;
+    }
+    .tbl th {
+      text-align: left;
+      font-family: var(--font-display);
+      font-size: 10px;
+      font-weight: 700;
+      color: var(--lime);
+      text-transform: uppercase;
+      letter-spacing: 1.5px;
+      padding: 8px 10px;
+      background: var(--dark);
+      border-bottom: 2px solid var(--dark);
+    }
+    .tbl th:first-child { border-radius: var(--radius) 0 0 0; }
+    .tbl th:last-child { border-radius: 0 var(--radius) 0 0; }
+    .tbl td {
+      padding: 7px 10px;
+      border-bottom: 1.5px solid #e0ddd6;
+      vertical-align: middle;
+    }
+    .tbl tbody tr {
+      transition: background .1s;
+    }
+    .tbl tbody tr:hover {
+      background: rgba(200, 255, 0, .08);
+    }
+    /* Terminal-style cron code */
+    .tbl code {
+      display: inline-block;
+      background: var(--dark);
+      color: var(--lime);
+      padding: 2px 8px;
+      border-radius: 3px;
+      font-size: 11px;
+      font-family: var(--font-mono);
+      letter-spacing: .5px;
+    }
+
+    /* ── Badges ── */
     .badge {
       display: inline-block;
-      padding: .15rem .5rem;
-      border-radius: 4px;
-      font-size: .75rem;
-      font-weight: 600;
+      padding: 2px 10px;
+      border-radius: 3px;
+      font-family: var(--font-display);
+      font-size: 10px;
+      font-weight: 700;
+      letter-spacing: 1px;
+      text-transform: uppercase;
+      border: 2px solid var(--border-color);
     }
-    .badge-ok { background: #14532d; color: var(--success); }
-    .badge-fail { background: #450a0a; color: var(--danger); }
-    .empty { color: var(--muted); text-align: center; padding: 1.5rem; }
+    .badge-ok {
+      background: var(--lime);
+      color: var(--dark);
+    }
+    .badge-fail {
+      background: var(--red);
+      color: #fff;
+    }
 
+    /* ── Empty ── */
+    .empty {
+      color: var(--text-dim);
+      text-align: center;
+      padding: 20px 14px;
+      font-size: 12px;
+      border: 2px dashed #c8c4bb;
+      border-radius: var(--radius);
+      background: rgba(0,0,0,.02);
+    }
+
+    /* ── Output cell ── */
+    .output-cell {
+      max-width: 280px;
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+      font-size: 11px;
+      color: var(--text-dim);
+    }
+
+    /* ── Spinner ── */
     .spinner {
       display: inline-block;
-      width: 14px; height: 14px;
-      border: 2px solid var(--border);
-      border-top-color: var(--accent);
+      width: 12px;
+      height: 12px;
+      border: 2px solid var(--bg-dots);
+      border-top-color: var(--dark);
       border-radius: 50%;
-      animation: spin .6s linear infinite;
-      margin-right: .4rem;
+      animation: spin .5s linear infinite;
       vertical-align: middle;
     }
     @keyframes spin { to { transform: rotate(360deg); } }
+
+    /* ── Toast ── */
+    .toast-container {
+      position: fixed;
+      bottom: 16px;
+      right: 16px;
+      z-index: 1000;
+      display: flex;
+      flex-direction: column;
+      gap: 8px;
+    }
+    .toast {
+      font-family: var(--font-mono);
+      font-size: 12px;
+      padding: 8px 14px;
+      border: var(--border-w) solid var(--border-color);
+      border-radius: var(--radius);
+      box-shadow: var(--shadow-sm);
+      animation: toastIn .2s ease-out;
+      max-width: 320px;
+    }
+    .toast-ok { background: var(--lime); color: var(--dark); }
+    .toast-err { background: var(--red); color: #fff; }
+    @keyframes toastIn {
+      from { opacity: 0; transform: translateY(8px); }
+      to { opacity: 1; transform: translateY(0); }
+    }
+
+    /* ── Scrollbar ── */
+    ::-webkit-scrollbar { width: 6px; }
+    ::-webkit-scrollbar-track { background: var(--bg); }
+    ::-webkit-scrollbar-thumb { background: #c0bbb0; border-radius: 3px; }
+    ::-webkit-scrollbar-thumb:hover { background: #a0998e; }
+
+    /* ── Responsive ── */
+    @media (max-width: 900px) {
+      .dashboard { grid-template-columns: 1fr; }
+      .sidebar { border-right: none; border-bottom: var(--border-w) solid var(--border-color); }
+      .main-row { grid-template-columns: 1fr; }
+      .sched-form { flex-direction: column; align-items: stretch; }
+    }
   </style>
 </head>
 <body>
-  <div class="container">
-    <h1>db_manager <span>coredb Job Scheduler</span></h1>
 
-    <section>
-      <h2>Available Jobs</h2>
-      <div class="card" id="jobs-list">
-        <div class="empty">Loading...</div>
+<div class="glow-bar"></div>
+
+<header class="header">
+  <div class="header-left">
+    <div class="logo">D-BiCron</div>
+    <span class="logo-sub">coredb scheduler</span>
+  </div>
+  <div class="header-right">
+    <div class="status-pill">
+      <div class="status-dot"></div>
+      Online
+    </div>
+  </div>
+</header>
+
+<div class="dashboard">
+  <aside class="sidebar">
+    <div class="stitle">
+      <span class="stitle-icon lime">&gt;</span>
+      Jobs <span class="count" id="job-count">0</span>
+    </div>
+    <div id="jobs-list"></div>
+  </aside>
+
+  <div class="main">
+    <!-- Schedule Form -->
+    <div>
+      <div class="stitle">
+        <span class="stitle-icon cyan">+</span>
+        Create Schedule
       </div>
-    </section>
-
-    <section>
-      <h2>Create Schedule</h2>
       <div class="card">
-        <div class="schedule-form" id="schedule-form">
-          <div class="field">
-            <label>Job</label>
-            <select id="sched-job"></select>
+        <div class="card-body">
+          <div class="sched-form">
+            <div class="field" style="flex:1;min-width:140px">
+              <span class="field-label">Job</span>
+              <select id="sched-job"></select>
+            </div>
+            <div class="field">
+              <span class="field-label">Cron</span>
+              <input id="sched-cron" type="text" placeholder="*/10 * * * *" value="*/10 * * * *" style="width:140px" />
+            </div>
+            <div class="field">
+              <span class="field-label">Days</span>
+              <input id="sched-days" type="number" value="1" min="1" style="width:60px" />
+            </div>
+            <div class="field">
+              <span class="field-label">&nbsp;</span>
+              <button class="btn btn-cyan" onclick="createSchedule()">+ Register</button>
+            </div>
           </div>
-          <div class="field">
-            <label>Cron Expression</label>
-            <input id="sched-cron" type="text" placeholder="*/10 * * * *" value="*/10 * * * *" />
-          </div>
-          <div class="field">
-            <label>Days</label>
-            <input id="sched-days" type="number" value="1" min="1" style="width:70px" />
-          </div>
-          <button class="btn btn-primary" onclick="createSchedule()">Register</button>
         </div>
       </div>
-    </section>
+    </div>
 
-    <section>
-      <h2>Active Schedules</h2>
-      <div class="card" id="schedules-list">
-        <div class="empty">No active schedules</div>
+    <!-- Two-column row -->
+    <div class="main-row">
+      <div class="card">
+        <div class="card-body">
+          <div class="stitle">
+            <span class="stitle-icon yellow">&#9776;</span>
+            Active Schedules <span class="count" id="sched-count">0</span>
+          </div>
+          <div id="schedules-list"></div>
+        </div>
       </div>
-    </section>
-
-    <section>
-      <h2>Run History</h2>
-      <div class="card" id="history-list">
-        <div class="empty">No runs yet</div>
+      <div class="card">
+        <div class="card-body">
+          <div class="stitle">
+            <span class="stitle-icon magenta">&#9656;</span>
+            Run History <span class="count" id="history-count">0</span>
+          </div>
+          <div id="history-list"></div>
+        </div>
       </div>
-    </section>
+    </div>
   </div>
+</div>
+
+<div class="toast-container" id="toasts"></div>
 
 <script>
-const API = "";
-
-// Escape HTML to prevent XSS
-function esc(str) {
-  const el = document.createElement("span");
-  el.textContent = String(str);
-  return el.innerHTML;
-}
-
-async function fetchJSON(url, opts) {
-  const res = await fetch(API + url, { headers: { "Content-Type": "application/json" }, ...opts });
-  return res.json();
-}
-
-// --- DOM helpers ---
 function clearEl(el) { while (el.firstChild) el.removeChild(el.firstChild); }
-
 function makeEl(tag, attrs, children) {
   const el = document.createElement(tag);
   if (attrs) Object.entries(attrs).forEach(([k, v]) => {
     if (k === "className") el.className = v;
-    else if (k.startsWith("on")) el.addEventListener(k.slice(2).toLowerCase(), v);
+    else if (k.startsWith("on") && typeof v === "function") el.addEventListener(k.slice(2).toLowerCase(), v);
     else el.setAttribute(k, v);
   });
   if (typeof children === "string") el.textContent = children;
   else if (Array.isArray(children)) children.forEach(c => { if (c) el.appendChild(c); });
   return el;
 }
+async function api(url, opts) {
+  const res = await fetch(url, { headers: { "Content-Type": "application/json" }, ...opts });
+  return res.json();
+}
+function toast(msg, ok) {
+  const t = makeEl("div", { className: `toast ${ok ? "toast-ok" : "toast-err"}` }, msg);
+  document.getElementById("toasts").appendChild(t);
+  setTimeout(() => t.remove(), 3500);
+}
 
-// --- Jobs ---
+// ── Jobs ──
 async function loadJobs() {
-  const jobs = await fetchJSON("/api/jobs");
+  const jobs = await api("/api/jobs");
   const el = document.getElementById("jobs-list");
-  clearEl(el);
+  const sel = document.getElementById("sched-job");
+  document.getElementById("job-count").textContent = jobs.length;
+  clearEl(el); clearEl(sel);
 
   if (!jobs.length) { el.appendChild(makeEl("div", { className: "empty" }, "No jobs registered")); return; }
 
-  const sel = document.getElementById("sched-job");
-  clearEl(sel);
   jobs.forEach(j => {
-    const opt = makeEl("option", { value: j.name }, j.label);
-    sel.appendChild(opt);
-  });
+    sel.appendChild(makeEl("option", { value: j.name }, j.label));
 
-  jobs.forEach(j => {
-    const info = makeEl("div", { className: "job-info" }, [
-      makeEl("strong", null, j.label),
-      makeEl("small", null, j.description),
-    ]);
-    const btn = makeEl("button", {
-      className: "btn btn-primary btn-sm",
-      onClick: async (e) => {
-        const days = Number(document.getElementById("sched-days").value) || 1;
-        btn.disabled = true;
-        btn.textContent = "Running...";
+    const daysInput = makeEl("input", { type: "number", value: String(j.defaultArgs?.days ?? 1), min: "1" });
+
+    const runBtn = makeEl("button", {
+      className: "btn btn-lime btn-sm",
+      onClick: async () => {
+        runBtn.disabled = true;
+        runBtn.textContent = "";
+        runBtn.appendChild(makeEl("span", { className: "spinner" }));
         try {
-          await fetchJSON(`/api/jobs/${encodeURIComponent(j.name)}/run`, { method: "POST", body: JSON.stringify({ days }) });
-        } catch {}
-        btn.disabled = false;
-        btn.textContent = "Run Now";
+          await api(`/api/jobs/${encodeURIComponent(j.name)}/run`, {
+            method: "POST",
+            body: JSON.stringify({ days: Number(daysInput.value) || 1 }),
+          });
+          toast(`${j.label} completed`, true);
+        } catch { toast(`${j.label} failed`, false); }
+        runBtn.disabled = false;
+        runBtn.textContent = "RUN";
         loadHistory();
       },
-    }, "Run Now");
-    const row = makeEl("div", { className: "job-row" }, [info, btn]);
-    el.appendChild(row);
+    }, "RUN");
+
+    el.appendChild(makeEl("div", { className: "job-card" }, [
+      makeEl("div", { className: "job-name" }, j.label),
+      makeEl("div", { className: "job-desc" }, j.description),
+      makeEl("div", { className: "job-actions" }, [
+        makeEl("div", { className: "field-inline" }, [makeEl("label", null, "days"), daysInput]),
+        runBtn,
+      ]),
+    ]));
   });
 }
 
-// --- Schedules ---
+// ── Schedules ──
 async function loadSchedules() {
-  const list = await fetchJSON("/api/schedules");
+  const list = await api("/api/schedules");
   const el = document.getElementById("schedules-list");
+  document.getElementById("sched-count").textContent = list.length;
   clearEl(el);
 
   if (!list.length) { el.appendChild(makeEl("div", { className: "empty" }, "No active schedules")); return; }
 
-  const table = makeEl("table", null, [
+  el.appendChild(makeEl("table", { className: "tbl" }, [
     makeEl("thead", null, [
-      makeEl("tr", null, [
-        makeEl("th", null, "ID"),
-        makeEl("th", null, "Job"),
-        makeEl("th", null, "Cron"),
-        makeEl("th", null, "Created"),
-        makeEl("th"),
-      ]),
+      makeEl("tr", null, [makeEl("th", null, "#"), makeEl("th", null, "Job"), makeEl("th", null, "Cron"), makeEl("th")]),
     ]),
-    makeEl("tbody", null, list.map(s => {
-      const delBtn = makeEl("button", {
-        className: "btn btn-danger btn-sm",
-        onClick: () => deleteSchedule(s.id),
-      }, "Delete");
-      return makeEl("tr", null, [
+    makeEl("tbody", null, list.map(s =>
+      makeEl("tr", null, [
         makeEl("td", null, String(s.id)),
         makeEl("td", null, s.jobName),
         makeEl("td", null, [makeEl("code", null, s.cron)]),
-        makeEl("td", null, new Date(s.createdAt).toLocaleString()),
-        makeEl("td", null, [delBtn]),
-      ]);
-    })),
-  ]);
-  el.appendChild(table);
+        makeEl("td", null, [makeEl("button", { className: "btn btn-red btn-sm", onClick: () => deleteSchedule(s.id) }, "DEL")]),
+      ])
+    )),
+  ]));
 }
 
 async function createSchedule() {
   const jobName = document.getElementById("sched-job").value;
   const cronExpr = document.getElementById("sched-cron").value;
   const days = Number(document.getElementById("sched-days").value) || 1;
-  await fetchJSON("/api/schedules", {
-    method: "POST",
-    body: JSON.stringify({ jobName, cronExpr, args: { days } }),
-  });
+  try {
+    await api("/api/schedules", { method: "POST", body: JSON.stringify({ jobName, cronExpr, args: { days } }) });
+    toast("Schedule registered", true);
+  } catch { toast("Failed to register", false); }
   loadSchedules();
 }
 
 async function deleteSchedule(id) {
-  await fetchJSON(`/api/schedules/${encodeURIComponent(id)}`, { method: "DELETE" });
+  await api(`/api/schedules/${encodeURIComponent(id)}`, { method: "DELETE" });
+  toast("Schedule deleted", true);
   loadSchedules();
 }
 
-// --- History ---
+// ── History ──
 async function loadHistory() {
-  const list = await fetchJSON("/api/history");
+  const list = await api("/api/history");
   const el = document.getElementById("history-list");
+  document.getElementById("history-count").textContent = list.length;
   clearEl(el);
 
   if (!list.length) { el.appendChild(makeEl("div", { className: "empty" }, "No runs yet")); return; }
 
-  const table = makeEl("table", null, [
+  el.appendChild(makeEl("table", { className: "tbl" }, [
     makeEl("thead", null, [
-      makeEl("tr", null, [
-        makeEl("th", null, "Job"),
-        makeEl("th", null, "Status"),
-        makeEl("th", null, "Output"),
-        makeEl("th", null, "Finished"),
-      ]),
+      makeEl("tr", null, [makeEl("th", null, "Job"), makeEl("th", null, "Status"), makeEl("th", null, "Output"), makeEl("th", null, "Time")]),
     ]),
     makeEl("tbody", null, list.map(h => {
-      const badge = makeEl("span", { className: `badge ${h.success ? "badge-ok" : "badge-fail"}` }, h.success ? "OK" : "FAIL");
+      const out = makeEl("td", { className: "output-cell" }, h.success ? (h.stdout || "-") : (h.stderr || "-"));
+      out.title = h.success ? (h.stdout || "") : (h.stderr || "");
       return makeEl("tr", null, [
         makeEl("td", null, h.jobName),
-        makeEl("td", null, [badge]),
-        makeEl("td", null, h.success ? (h.stdout || "") : (h.stderr || "")),
+        makeEl("td", null, [makeEl("span", { className: `badge ${h.success ? "badge-ok" : "badge-fail"}` }, h.success ? "OK" : "FAIL")]),
+        out,
         makeEl("td", null, new Date(h.finishedAt).toLocaleString()),
       ]);
     })),
-  ]);
-  el.appendChild(table);
+  ]));
 }
 
-// Init
 loadJobs();
 loadSchedules();
 loadHistory();
