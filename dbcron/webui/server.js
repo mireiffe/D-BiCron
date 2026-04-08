@@ -13,14 +13,7 @@ const PROJECT_ROOT = path.resolve(__dirname, "../..");
 // -------------------------------------------------------------------
 // Available jobs — add new entries when you create a new Job subclass
 // -------------------------------------------------------------------
-const AVAILABLE_JOBS = [
-  {
-    name: "recommendation",
-    label: "Recommendation 적재",
-    description: "susdb → 추천 API → coredb 적재",
-    defaultArgs: { days: 1 },
-  },
-];
+const AVAILABLE_JOBS = [];
 
 // In-memory state
 const scheduledTasks = new Map(); // id -> { cron, jobName, args, task, createdAt }
