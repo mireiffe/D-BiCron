@@ -33,7 +33,7 @@ let nextId = 1;
 // -------------------------------------------------------------------
 function runJob(jobName, args = {}) {
   return new Promise((resolve, reject) => {
-    const cliArgs = ["-m", "manage_coredb.main", jobName];
+    const cliArgs = ["-m", "dbcron.main", jobName];
     for (const [k, v] of Object.entries(args)) {
       cliArgs.push(`--${k}`, String(v));
     }
