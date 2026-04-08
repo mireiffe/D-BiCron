@@ -1,0 +1,314 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>db_manager - coredb Job Scheduler</title>
+  <style>
+    :root {
+      --bg: #0f172a;
+      --surface: #1e293b;
+      --border: #334155;
+      --text: #e2e8f0;
+      --muted: #94a3b8;
+      --accent: #3b82f6;
+      --accent-hover: #2563eb;
+      --success: #22c55e;
+      --danger: #ef4444;
+    }
+    * { margin: 0; padding: 0; box-sizing: border-box; }
+    body {
+      font-family: 'Inter', -apple-system, BlinkMacSystemFont, sans-serif;
+      background: var(--bg);
+      color: var(--text);
+      line-height: 1.6;
+    }
+    .container { max-width: 960px; margin: 0 auto; padding: 2rem 1.5rem; }
+    h1 { font-size: 1.5rem; font-weight: 600; margin-bottom: 2rem; }
+    h1 span { color: var(--muted); font-weight: 400; }
+    h2 { font-size: 1.1rem; font-weight: 600; margin-bottom: 1rem; color: var(--muted); text-transform: uppercase; letter-spacing: .05em; }
+
+    .card {
+      background: var(--surface);
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      padding: 1.25rem;
+      margin-bottom: 1.5rem;
+    }
+
+    .job-row {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      padding: .75rem 0;
+      border-bottom: 1px solid var(--border);
+    }
+    .job-row:last-child { border-bottom: none; }
+    .job-info strong { display: block; }
+    .job-info small { color: var(--muted); }
+
+    button, .btn {
+      cursor: pointer;
+      border: none;
+      border-radius: 6px;
+      padding: .5rem 1rem;
+      font-size: .85rem;
+      font-weight: 500;
+      transition: background .15s;
+    }
+    .btn-primary { background: var(--accent); color: #fff; }
+    .btn-primary:hover { background: var(--accent-hover); }
+    .btn-danger { background: var(--danger); color: #fff; }
+    .btn-danger:hover { opacity: .85; }
+    .btn-sm { padding: .35rem .75rem; font-size: .8rem; }
+
+    .schedule-form {
+      display: flex;
+      gap: .75rem;
+      flex-wrap: wrap;
+      align-items: end;
+      margin-bottom: 1rem;
+    }
+    .field { display: flex; flex-direction: column; gap: .25rem; }
+    .field label { font-size: .75rem; color: var(--muted); text-transform: uppercase; letter-spacing: .04em; }
+    .field select, .field input {
+      background: var(--bg);
+      border: 1px solid var(--border);
+      border-radius: 6px;
+      color: var(--text);
+      padding: .45rem .65rem;
+      font-size: .85rem;
+    }
+
+    table { width: 100%; border-collapse: collapse; font-size: .85rem; }
+    th { text-align: left; color: var(--muted); font-weight: 500; padding: .5rem .25rem; border-bottom: 1px solid var(--border); }
+    td { padding: .5rem .25rem; border-bottom: 1px solid var(--border); }
+    .badge {
+      display: inline-block;
+      padding: .15rem .5rem;
+      border-radius: 4px;
+      font-size: .75rem;
+      font-weight: 600;
+    }
+    .badge-ok { background: #14532d; color: var(--success); }
+    .badge-fail { background: #450a0a; color: var(--danger); }
+    .empty { color: var(--muted); text-align: center; padding: 1.5rem; }
+
+    .spinner {
+      display: inline-block;
+      width: 14px; height: 14px;
+      border: 2px solid var(--border);
+      border-top-color: var(--accent);
+      border-radius: 50%;
+      animation: spin .6s linear infinite;
+      margin-right: .4rem;
+      vertical-align: middle;
+    }
+    @keyframes spin { to { transform: rotate(360deg); } }
+  </style>
+</head>
+<body>
+  <div class="container">
+    <h1>db_manager <span>coredb Job Scheduler</span></h1>
+
+    <section>
+      <h2>Available Jobs</h2>
+      <div class="card" id="jobs-list">
+        <div class="empty">Loading...</div>
+      </div>
+    </section>
+
+    <section>
+      <h2>Create Schedule</h2>
+      <div class="card">
+        <div class="schedule-form" id="schedule-form">
+          <div class="field">
+            <label>Job</label>
+            <select id="sched-job"></select>
+          </div>
+          <div class="field">
+            <label>Cron Expression</label>
+            <input id="sched-cron" type="text" placeholder="*/10 * * * *" value="*/10 * * * *" />
+          </div>
+          <div class="field">
+            <label>Days</label>
+            <input id="sched-days" type="number" value="1" min="1" style="width:70px" />
+          </div>
+          <button class="btn btn-primary" onclick="createSchedule()">Register</button>
+        </div>
+      </div>
+    </section>
+
+    <section>
+      <h2>Active Schedules</h2>
+      <div class="card" id="schedules-list">
+        <div class="empty">No active schedules</div>
+      </div>
+    </section>
+
+    <section>
+      <h2>Run History</h2>
+      <div class="card" id="history-list">
+        <div class="empty">No runs yet</div>
+      </div>
+    </section>
+  </div>
+
+<script>
+const API = "";
+
+// Escape HTML to prevent XSS
+function esc(str) {
+  const el = document.createElement("span");
+  el.textContent = String(str);
+  return el.innerHTML;
+}
+
+async function fetchJSON(url, opts) {
+  const res = await fetch(API + url, { headers: { "Content-Type": "application/json" }, ...opts });
+  return res.json();
+}
+
+// --- DOM helpers ---
+function clearEl(el) { while (el.firstChild) el.removeChild(el.firstChild); }
+
+function makeEl(tag, attrs, children) {
+  const el = document.createElement(tag);
+  if (attrs) Object.entries(attrs).forEach(([k, v]) => {
+    if (k === "className") el.className = v;
+    else if (k.startsWith("on")) el.addEventListener(k.slice(2).toLowerCase(), v);
+    else el.setAttribute(k, v);
+  });
+  if (typeof children === "string") el.textContent = children;
+  else if (Array.isArray(children)) children.forEach(c => { if (c) el.appendChild(c); });
+  return el;
+}
+
+// --- Jobs ---
+async function loadJobs() {
+  const jobs = await fetchJSON("/api/jobs");
+  const el = document.getElementById("jobs-list");
+  clearEl(el);
+
+  if (!jobs.length) { el.appendChild(makeEl("div", { className: "empty" }, "No jobs registered")); return; }
+
+  const sel = document.getElementById("sched-job");
+  clearEl(sel);
+  jobs.forEach(j => {
+    const opt = makeEl("option", { value: j.name }, j.label);
+    sel.appendChild(opt);
+  });
+
+  jobs.forEach(j => {
+    const info = makeEl("div", { className: "job-info" }, [
+      makeEl("strong", null, j.label),
+      makeEl("small", null, j.description),
+    ]);
+    const btn = makeEl("button", {
+      className: "btn btn-primary btn-sm",
+      onClick: async (e) => {
+        const days = Number(document.getElementById("sched-days").value) || 1;
+        btn.disabled = true;
+        btn.textContent = "Running...";
+        try {
+          await fetchJSON(`/api/jobs/${encodeURIComponent(j.name)}/run`, { method: "POST", body: JSON.stringify({ days }) });
+        } catch {}
+        btn.disabled = false;
+        btn.textContent = "Run Now";
+        loadHistory();
+      },
+    }, "Run Now");
+    const row = makeEl("div", { className: "job-row" }, [info, btn]);
+    el.appendChild(row);
+  });
+}
+
+// --- Schedules ---
+async function loadSchedules() {
+  const list = await fetchJSON("/api/schedules");
+  const el = document.getElementById("schedules-list");
+  clearEl(el);
+
+  if (!list.length) { el.appendChild(makeEl("div", { className: "empty" }, "No active schedules")); return; }
+
+  const table = makeEl("table", null, [
+    makeEl("thead", null, [
+      makeEl("tr", null, [
+        makeEl("th", null, "ID"),
+        makeEl("th", null, "Job"),
+        makeEl("th", null, "Cron"),
+        makeEl("th", null, "Created"),
+        makeEl("th"),
+      ]),
+    ]),
+    makeEl("tbody", null, list.map(s => {
+      const delBtn = makeEl("button", {
+        className: "btn btn-danger btn-sm",
+        onClick: () => deleteSchedule(s.id),
+      }, "Delete");
+      return makeEl("tr", null, [
+        makeEl("td", null, String(s.id)),
+        makeEl("td", null, s.jobName),
+        makeEl("td", null, [makeEl("code", null, s.cron)]),
+        makeEl("td", null, new Date(s.createdAt).toLocaleString()),
+        makeEl("td", null, [delBtn]),
+      ]);
+    })),
+  ]);
+  el.appendChild(table);
+}
+
+async function createSchedule() {
+  const jobName = document.getElementById("sched-job").value;
+  const cronExpr = document.getElementById("sched-cron").value;
+  const days = Number(document.getElementById("sched-days").value) || 1;
+  await fetchJSON("/api/schedules", {
+    method: "POST",
+    body: JSON.stringify({ jobName, cronExpr, args: { days } }),
+  });
+  loadSchedules();
+}
+
+async function deleteSchedule(id) {
+  await fetchJSON(`/api/schedules/${encodeURIComponent(id)}`, { method: "DELETE" });
+  loadSchedules();
+}
+
+// --- History ---
+async function loadHistory() {
+  const list = await fetchJSON("/api/history");
+  const el = document.getElementById("history-list");
+  clearEl(el);
+
+  if (!list.length) { el.appendChild(makeEl("div", { className: "empty" }, "No runs yet")); return; }
+
+  const table = makeEl("table", null, [
+    makeEl("thead", null, [
+      makeEl("tr", null, [
+        makeEl("th", null, "Job"),
+        makeEl("th", null, "Status"),
+        makeEl("th", null, "Output"),
+        makeEl("th", null, "Finished"),
+      ]),
+    ]),
+    makeEl("tbody", null, list.map(h => {
+      const badge = makeEl("span", { className: `badge ${h.success ? "badge-ok" : "badge-fail"}` }, h.success ? "OK" : "FAIL");
+      return makeEl("tr", null, [
+        makeEl("td", null, h.jobName),
+        makeEl("td", null, [badge]),
+        makeEl("td", null, h.success ? (h.stdout || "") : (h.stderr || "")),
+        makeEl("td", null, new Date(h.finishedAt).toLocaleString()),
+      ]);
+    })),
+  ]);
+  el.appendChild(table);
+}
+
+// Init
+loadJobs();
+loadSchedules();
+loadHistory();
+setInterval(() => { loadSchedules(); loadHistory(); }, 30000);
+</script>
+</body>
+</html>
