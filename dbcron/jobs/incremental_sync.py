@@ -207,7 +207,7 @@ class IncrementalSyncJob(Job):
                   FROM unnest(i.indkey) WITH ORDINALITY AS k(attnum, ord)
                   JOIN pg_catalog.pg_attribute a
                     ON a.attrelid = c.oid AND a.attnum = k.attnum
-              ) = :cols
+              ) = CAST(:cols AS name[])
             LIMIT 1
         """)
         with engine.begin() as conn:
