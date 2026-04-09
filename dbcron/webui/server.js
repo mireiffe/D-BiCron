@@ -33,6 +33,9 @@ try {
 const DATA_DIR = path.join(PROJECT_ROOT, "data");
 const SCHEDULES_FILE = path.join(DATA_DIR, "schedules.json");
 const RUNNING_FILE = path.join(DATA_DIR, "running.json");
+const HISTORY_FILE = path.join(DATA_DIR, "history.json");
+const HISTORY_RETENTION_MS =
+  (Number(process.env.HISTORY_RETENTION_HOURS) || 168) * 3600_000;
 
 function loadSchedules() {
   try {
@@ -51,6 +54,29 @@ function saveSchedules() {
   fs.mkdirSync(DATA_DIR, { recursive: true });
   const data = JSON.stringify({ nextId, schedules: entries }, null, 2);
   fs.writeFileSync(SCHEDULES_FILE, data, "utf-8");
+}
+
+function loadHistory() {
+  try {
+    const raw = fs.readFileSync(HISTORY_FILE, "utf-8");
+    return JSON.parse(raw);
+  } catch {
+    return [];
+  }
+}
+
+function saveHistory() {
+  fs.mkdirSync(DATA_DIR, { recursive: true });
+  fs.writeFileSync(HISTORY_FILE, JSON.stringify(runHistory, null, 2), "utf-8");
+}
+
+function pruneHistory() {
+  const cutoff = Date.now() - HISTORY_RETENTION_MS;
+  const before = runHistory.length;
+  while (runHistory.length && new Date(runHistory[runHistory.length - 1].finishedAt).getTime() < cutoff) {
+    runHistory.pop();
+  }
+  if (runHistory.length !== before) saveHistory();
 }
 
 function loadRunning() {
@@ -78,7 +104,7 @@ function isProcessAlive(pid) {
 // Runtime state
 const scheduledTasks = new Map(); // id -> { cron, jobName, args, task, createdAt }
 const runningJobs = new Map();    // runId -> { jobName, args, startedAt, stdout, stderr }
-const runHistory = []; // last 100 results
+const runHistory = loadHistory(); // persisted history (pruned by retention)
 
 // Restore running jobs from previous session
 const persistedRunning = loadRunning();
@@ -105,6 +131,8 @@ if (persistedRunning.jobs.length) {
   console.log(`Recovered running jobs: ${alive} alive, ${dead} finished`);
   saveRunning();
 }
+pruneHistory();
+console.log(`Loaded ${runHistory.length} history entry(ies), retention ${process.env.HISTORY_RETENTION_HOURS || 168}h`);
 
 // Restore persisted schedules
 const persisted = loadSchedules();
@@ -174,7 +202,7 @@ function startJob(jobName, args = {}) {
       success: false, stdout: "", stderr: err.message,
       finishedAt: new Date().toISOString(),
     });
-    if (runHistory.length > 100) runHistory.pop();
+    saveHistory();
   });
 
   proc.stdout.on("data", (d) => (tracker.stdout += d));
@@ -190,7 +218,7 @@ function startJob(jobName, args = {}) {
       stderr: tracker.stderr.trim(),
       finishedAt: new Date().toISOString(),
     });
-    if (runHistory.length > 100) runHistory.pop();
+    saveHistory();
   });
 
   return runId;
@@ -301,6 +329,9 @@ app.delete("/api/running/:id", (req, res) => {
 app.get("/api/history", (_req, res) => {
   res.json(runHistory);
 });
+
+// Prune expired history entries every hour
+setInterval(pruneHistory, 3600_000);
 
 // -------------------------------------------------------------------
 app.listen(PORT, "0.0.0.0", () => {
