@@ -241,6 +241,21 @@
     }
     .output-cell:hover { color: var(--cyan); }
 
+    .badge-run {
+      border-color: var(--cyan); color: var(--cyan); background: var(--cyan-dim);
+      text-shadow: 0 0 6px var(--cyan-glow); animation: pulse 2s ease-in-out infinite;
+    }
+    .running-row { background: rgba(0, 229, 255, .04); }
+    .running-row:hover { background: rgba(0, 229, 255, .08) !important; }
+    .running-output {
+      max-width: 260px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+      font-size: 11px; color: var(--cyan-dim); cursor: pointer;
+    }
+    .running-output:hover { color: var(--cyan); }
+
+    .modal-log { max-height: 55vh; overflow-y: auto; }
+    .modal-log-live { border-color: var(--cyan); box-shadow: 0 0 12px var(--cyan-glow); }
+
     .modal-overlay {
       position: fixed; inset: 0; background: rgba(12, 12, 30, .7);
       backdrop-filter: blur(4px); z-index: 2000;
@@ -422,20 +437,71 @@ async function api(url, opts) {
   const res = await fetch(url, { headers: { "Content-Type": "application/json" }, ...opts });
   return res.json();
 }
+let liveLogInterval = null;
+let liveRunId = null;
+
 function openLogModal(h) {
+  stopLiveLog();
   const modal = document.getElementById("log-modal");
   document.getElementById("log-modal-badge").className = `badge ${h.success ? "badge-ok" : "badge-fail"}`;
   document.getElementById("log-modal-badge").textContent = h.success ? "OK" : "FAIL";
   document.getElementById("log-modal-job").textContent = h.jobName;
   document.getElementById("log-modal-time").textContent = new Date(h.finishedAt).toLocaleString();
   const content = document.getElementById("log-modal-content");
+  content.className = "modal-log";
   const parts = [];
   if (h.stdout) parts.push(h.stdout);
   if (h.stderr) parts.push((h.stdout ? "\n\u2500\u2500 stderr \u2500\u2500\n" : "") + h.stderr);
   content.textContent = parts.join("") || "(no output)";
   modal.style.display = "";
 }
-function closeLogModal() { document.getElementById("log-modal").style.display = "none"; }
+
+function openLiveLogModal(r) {
+  stopLiveLog();
+  const modal = document.getElementById("log-modal");
+  document.getElementById("log-modal-badge").className = "badge badge-run";
+  document.getElementById("log-modal-badge").textContent = "RUNNING";
+  document.getElementById("log-modal-job").textContent = r.jobName;
+  document.getElementById("log-modal-time").textContent = new Date(r.startedAt).toLocaleString();
+  const content = document.getElementById("log-modal-content");
+  content.className = "modal-log modal-log-live";
+  updateLiveContent(r);
+  modal.style.display = "";
+  liveRunId = r.runId;
+  liveLogInterval = setInterval(async () => {
+    try {
+      const res = await fetch(`/api/running/${liveRunId}`);
+      if (!res.ok) {
+        stopLiveLog();
+        content.className = "modal-log";
+        document.getElementById("log-modal-badge").className = "badge badge-ok";
+        document.getElementById("log-modal-badge").textContent = "DONE";
+        loadHistory();
+        return;
+      }
+      updateLiveContent(await res.json());
+    } catch {}
+  }, 1000);
+}
+
+function updateLiveContent(r) {
+  const content = document.getElementById("log-modal-content");
+  const parts = [];
+  if (r.stdout) parts.push(r.stdout);
+  if (r.stderr) parts.push((r.stdout ? "\n\u2500\u2500 stderr \u2500\u2500\n" : "") + r.stderr);
+  content.textContent = parts.join("") || "(waiting for output...)";
+  content.scrollTop = content.scrollHeight;
+}
+
+function stopLiveLog() {
+  if (liveLogInterval) { clearInterval(liveLogInterval); liveLogInterval = null; }
+  liveRunId = null;
+}
+
+function closeLogModal() {
+  stopLiveLog();
+  document.getElementById("log-modal").style.display = "none";
+}
 document.addEventListener("keydown", e => { if (e.key === "Escape") closeLogModal(); });
 
 function toast(msg, ok) {
@@ -515,28 +581,52 @@ async function deleteSchedule(id) {
 }
 
 async function loadHistory() {
-  const list = await api("/api/history");
+  const [running, list] = await Promise.all([api("/api/running"), api("/api/history")]);
   const el = document.getElementById("history-list");
-  document.getElementById("history-count").textContent = list.length;
+  document.getElementById("history-count").textContent = running.length + list.length;
   clearEl(el);
-  if (!list.length) { el.appendChild(makeEl("div", { className: "empty" }, "No runs yet")); return; }
+  if (!running.length && !list.length) { el.appendChild(makeEl("div", { className: "empty" }, "No runs yet")); return; }
+
+  const runningRows = running.map(r => {
+    const out = makeEl("td", { className: "running-output", onClick: () => openLiveLogModal(r) },
+      r.stdout.slice(-80) || r.stderr.slice(-80) || "(running...)");
+    out.title = "Click to view live log";
+    return makeEl("tr", { className: "running-row" }, [
+      makeEl("td", null, r.jobName),
+      makeEl("td", null, [makeEl("span", { className: "badge badge-run" }, [
+        makeEl("span", { className: "spinner", style: "margin-right:4px;width:10px;height:10px;border-width:1.5px" }),
+        document.createTextNode("RUN"),
+      ])]),
+      out,
+      makeEl("td", null, new Date(r.startedAt).toLocaleString()),
+    ]);
+  });
+
+  const historyRows = list.map(h => {
+    const out = makeEl("td", { className: "output-cell", onClick: () => openLogModal(h) }, h.success ? (h.stdout || "-") : (h.stderr || "-"));
+    out.title = "Click to view full log";
+    return makeEl("tr", null, [
+      makeEl("td", null, h.jobName),
+      makeEl("td", null, [makeEl("span", { className: `badge ${h.success ? "badge-ok" : "badge-fail"}` }, h.success ? "OK" : "FAIL")]),
+      out,
+      makeEl("td", null, new Date(h.finishedAt).toLocaleString()),
+    ]);
+  });
+
   el.appendChild(makeEl("table", { className: "tbl mag-tbl" }, [
     makeEl("thead", null, [makeEl("tr", null, [makeEl("th", null, "Job"), makeEl("th", null, "Status"), makeEl("th", null, "Output"), makeEl("th", null, "Time")])]),
-    makeEl("tbody", null, list.map(h => {
-      const out = makeEl("td", { className: "output-cell", onClick: () => openLogModal(h) }, h.success ? (h.stdout || "-") : (h.stderr || "-"));
-      out.title = "Click to view full log";
-      return makeEl("tr", null, [
-        makeEl("td", null, h.jobName),
-        makeEl("td", null, [makeEl("span", { className: `badge ${h.success ? "badge-ok" : "badge-fail"}` }, h.success ? "OK" : "FAIL")]),
-        out,
-        makeEl("td", null, new Date(h.finishedAt).toLocaleString()),
-      ]);
-    })),
+    makeEl("tbody", null, [...runningRows, ...historyRows]),
   ]));
 }
 
 loadJobs(); loadSchedules(); loadHistory();
-setInterval(() => { loadSchedules(); loadHistory(); }, 30000);
+async function pollHistory() {
+  await loadHistory();
+  const hasRunning = document.querySelector(".running-row");
+  setTimeout(pollHistory, hasRunning ? 3000 : 30000);
+}
+pollHistory();
+setInterval(loadSchedules, 30000);
 </script>
 </body>
 </html>
