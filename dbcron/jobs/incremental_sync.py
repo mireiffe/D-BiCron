@@ -1,14 +1,15 @@
-"""Incremental sync: append new rows from susdb -> coredb.
+"""Incremental sync: upsert rows from susdb -> coredb.
 
-Append-only 증분 동기화 Job.
-Source DB 에서 timestamp 기준으로 신규 행만 읽어서 Target DB 에 삽입합니다.
+증분 동기화 Job.
+Source DB 에서 timestamp 기준으로 delta 행을 읽어서 Target DB 에 upsert 합니다.
 
 흐름:
   1) Target 에서 MAX(ts_column) 조회 (인덱스 있으므로 빠름)
-  2) Source 에서 COPY (SELECT ... WHERE ts > cutoff) TO STDOUT  (순차스캔, read-only → lock 없음)
-  3) Target temp table 에 COPY FROM STDIN
-  4) INSERT INTO target SELECT ... FROM temp ON CONFLICT DO NOTHING
-  5) Temp table 자동 삭제 (ON COMMIT DROP)
+  2) Cutoff = MAX(ts) - overlap_minutes (기본 30분, 변경분 누락 방지)
+  3) Source 에서 COPY (SELECT ... WHERE ts > cutoff) TO STDOUT  (read-only, lock 없음)
+  4) Target temp table 에 COPY FROM STDIN
+  5) INSERT INTO target SELECT ... FROM temp ON CONFLICT DO UPDATE (upsert)
+  6) Temp table 자동 삭제 (ON COMMIT DROP)
 
 설정:
   SYNC_CONFIG 환경변수로 JSON 설정 파일 경로 지정 (기본: sync_config.json)
@@ -30,7 +31,7 @@ from .base import Job, JobResult
 class IncrementalSyncJob(Job):
     name = "incremental_sync"
     label = "증분 동기화"
-    description = "Source DB 신규 행을 Target DB 로 증분 복사 (append-only)"
+    description = "Source DB delta 행을 Target DB 로 증분 동기화 (upsert)"
     default_args = {"days": 1}
 
     def run(self, *, days: int = 1, **kwargs) -> JobResult:
@@ -105,12 +106,14 @@ class IncrementalSyncJob(Job):
                 text(f'SELECT MAX("{ts_col}") FROM {q_tgt}')
             ).scalar()
 
+        overlap_min = tc.get("overlap_minutes", 30)
+
         if max_ts is None:
             cutoff = datetime.now() - timedelta(days=days)
             self.logger.info("%s: empty target, lookback %d days", table, days)
         else:
-            cutoff = max_ts
-            self.logger.info("%s: resume from %s", table, cutoff)
+            cutoff = max_ts - timedelta(minutes=overlap_min)
+            self.logger.info("%s: resume from %s (overlap %dm)", table, cutoff, overlap_min)
 
         # 3) Target 컬럼 목록
         with tgt_engine.connect() as conn:
@@ -144,9 +147,12 @@ class IncrementalSyncJob(Job):
         buf.seek(0)
         data_bytes = buf.getbuffer().nbytes
 
-        # 5) Target: temp table → INSERT ... ON CONFLICT DO NOTHING
+        # 5) Target: temp table → INSERT ... ON CONFLICT DO UPDATE (upsert)
         temp = f"_sync_tmp_{table}"
         pk_list = ", ".join(f'"{c}"' for c in pk_cols)
+        pk_set = set(pk_cols)
+        update_cols = [c for c in columns if c not in pk_set]
+        update_set = ", ".join(f'"{c}" = EXCLUDED."{c}"' for c in update_cols)
 
         tgt_raw = tgt_engine.raw_connection()
         try:
@@ -163,16 +169,16 @@ class IncrementalSyncJob(Job):
                 cur.execute(
                     f"INSERT INTO {q_tgt} ({col_list}) "
                     f'SELECT {col_list} FROM "{temp}" '
-                    f"ON CONFLICT ({pk_list}) DO NOTHING"
+                    f"ON CONFLICT ({pk_list}) DO UPDATE SET {update_set}"
                 )
-                inserted = cur.rowcount
+                upserted = cur.rowcount
 
             tgt_raw.commit()
             self.logger.info(
-                "%s: +%d rows (%d candidates, %s)",
-                table, inserted, candidates, _fmt_bytes(data_bytes),
+                "%s: %d upserted (%d candidates, %s)",
+                table, upserted, candidates, _fmt_bytes(data_bytes),
             )
-            return inserted
+            return upserted
         except Exception:
             tgt_raw.rollback()
             raise
@@ -183,15 +189,40 @@ class IncrementalSyncJob(Job):
 
     @staticmethod
     def _ensure_unique_index(engine, schema: str, table: str, pk_cols: list[str]):
-        """ON CONFLICT 에 필요한 unique index 를 target 에 생성합니다 (IF NOT EXISTS)."""
-        idx_name = f"uq_sync_{table}_{'_'.join(pk_cols)}"
-        col_list = ", ".join(f'"{c}"' for c in pk_cols)
-        sql = (
-            f'CREATE UNIQUE INDEX IF NOT EXISTS "{idx_name}" '
-            f'ON "{schema}"."{table}" ({col_list})'
-        )
+        """ON CONFLICT 에 필요한 unique index 를 target 에 생성합니다.
+
+        해당 컬럼 조합에 unique index/constraint 가 이미 존재하면 스킵합니다.
+        """
+        # 해당 컬럼 조합의 unique index 존재 여부 확인
+        check_sql = text("""
+            SELECT 1
+            FROM pg_catalog.pg_index i
+            JOIN pg_catalog.pg_class c ON c.oid = i.indrelid
+            JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace
+            WHERE n.nspname = :schema
+              AND c.relname = :table
+              AND i.indisunique
+              AND (
+                  SELECT array_agg(a.attname ORDER BY k.ord)
+                  FROM unnest(i.indkey) WITH ORDINALITY AS k(attnum, ord)
+                  JOIN pg_catalog.pg_attribute a
+                    ON a.attrelid = c.oid AND a.attnum = k.attnum
+              ) = :cols
+            LIMIT 1
+        """)
         with engine.begin() as conn:
-            conn.execute(text(sql))
+            exists = conn.execute(
+                check_sql, {"schema": schema, "table": table, "cols": pk_cols}
+            ).scalar()
+            if exists:
+                return
+
+            idx_name = f"uq_sync_{table}_{'_'.join(pk_cols)}"
+            col_list = ", ".join(f'"{c}"' for c in pk_cols)
+            conn.execute(text(
+                f'CREATE UNIQUE INDEX "{idx_name}" '
+                f'ON "{schema}"."{table}" ({col_list})'
+            ))
 
 
 def _fmt_bytes(n: int) -> str:

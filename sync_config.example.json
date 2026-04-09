@@ -25,7 +25,8 @@
     {
       "table": "sensor_readings",
       "pk_columns": ["device_id", "measured_at"],
-      "ts_column": "created_at"
+      "ts_column": "created_at",
+      "overlap_minutes": 60
     }
   ]
 }
