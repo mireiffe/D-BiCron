@@ -1,5 +1,6 @@
 const express = require("express");
 const cron = require("node-cron");
+const fs = require("fs");
 const { spawn, execFileSync } = require("child_process");
 const path = require("path");
 
@@ -26,12 +27,55 @@ try {
   console.error("Failed to load jobs from registry:", err.message);
 }
 
-// In-memory state
+// -------------------------------------------------------------------
+// Schedule persistence (filesystem-based)
+// -------------------------------------------------------------------
+const DATA_DIR = path.join(PROJECT_ROOT, "data");
+const SCHEDULES_FILE = path.join(DATA_DIR, "schedules.json");
+
+function loadSchedules() {
+  try {
+    const raw = fs.readFileSync(SCHEDULES_FILE, "utf-8");
+    return JSON.parse(raw);
+  } catch {
+    return { nextId: 1, schedules: [] };
+  }
+}
+
+function saveSchedules() {
+  const entries = [];
+  for (const [id, s] of scheduledTasks) {
+    entries.push({ id, jobName: s.jobName, cron: s.cron, args: s.args, createdAt: s.createdAt });
+  }
+  fs.mkdirSync(DATA_DIR, { recursive: true });
+  const data = JSON.stringify({ nextId, schedules: entries }, null, 2);
+  fs.writeFileSync(SCHEDULES_FILE, data, "utf-8");
+}
+
+// Runtime state
 const scheduledTasks = new Map(); // id -> { cron, jobName, args, task, createdAt }
 const runningJobs = new Map();    // runId -> { jobName, args, startedAt, stdout, stderr }
 const runHistory = []; // last 100 results
-let nextId = 1;
 let nextRunId = 1;
+
+// Restore persisted schedules
+const persisted = loadSchedules();
+let nextId = persisted.nextId;
+for (const s of persisted.schedules) {
+  const task = cron.schedule(s.cron, () => {
+    startJob(s.jobName, s.args);
+  });
+  scheduledTasks.set(s.id, {
+    cron: s.cron,
+    jobName: s.jobName,
+    args: s.args || {},
+    task,
+    createdAt: s.createdAt,
+  });
+}
+if (persisted.schedules.length) {
+  console.log(`Restored ${persisted.schedules.length} schedule(s) from disk`);
+}
 
 // -------------------------------------------------------------------
 // Helpers
@@ -140,6 +184,7 @@ app.post("/api/schedules", (req, res) => {
     task,
     createdAt: new Date().toISOString(),
   });
+  saveSchedules();
 
   res.status(201).json({ id, jobName, cron: cronExpr });
 });
@@ -152,6 +197,7 @@ app.delete("/api/schedules/:id", (req, res) => {
 
   entry.task.stop();
   scheduledTasks.delete(id);
+  saveSchedules();
   res.json({ deleted: id });
 });
 
