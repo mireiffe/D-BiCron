@@ -97,8 +97,7 @@ class IncrementalSyncJob(Job):
         q_src = f'"{src_schema}"."{table}"'
         q_tgt = f'"{tgt_schema}"."{table}"'
 
-        # 1) Target 에 unique index 보장 (ON CONFLICT 에 필요, 최초 1회만 실질 생성)
-        self._ensure_unique_index(tgt_engine, tgt_schema, table, pk_cols)
+        # (unique index 불필요 — DELETE+INSERT 방식 사용)
 
         # 2) Cutoff: target 의 MAX(ts_column), 없으면 days 만큼 lookback
         with tgt_engine.connect() as conn:
@@ -147,12 +146,12 @@ class IncrementalSyncJob(Job):
         buf.seek(0)
         data_bytes = buf.getbuffer().nbytes
 
-        # 5) Target: temp table → INSERT ... ON CONFLICT DO UPDATE (upsert)
+        # 5) Target: temp table → DELETE 기존 매칭 행 → INSERT (upsert)
         temp = f"_sync_tmp_{table}"
         pk_list = ", ".join(f'"{c}"' for c in pk_cols)
-        pk_set = set(pk_cols)
-        update_cols = [c for c in columns if c not in pk_set]
-        update_set = ", ".join(f'"{c}" = EXCLUDED."{c}"' for c in update_cols)
+        pk_match = " AND ".join(
+            f'{q_tgt}."{c}" = "{temp}"."{c}"' for c in pk_cols
+        )
 
         tgt_raw = tgt_engine.raw_connection()
         try:
@@ -166,10 +165,13 @@ class IncrementalSyncJob(Job):
                 cur.execute(f'SELECT COUNT(*) FROM "{temp}"')
                 candidates = cur.fetchone()[0]
 
+                # PK 매칭되는 기존 행 삭제 후 새로 삽입
+                cur.execute(
+                    f"DELETE FROM {q_tgt} USING \"{temp}\" WHERE {pk_match}"
+                )
                 cur.execute(
                     f"INSERT INTO {q_tgt} ({col_list}) "
-                    f'SELECT {col_list} FROM "{temp}" '
-                    f"ON CONFLICT ({pk_list}) DO UPDATE SET {update_set}"
+                    f'SELECT {col_list} FROM "{temp}"'
                 )
                 upserted = cur.rowcount
 
@@ -185,44 +187,6 @@ class IncrementalSyncJob(Job):
         finally:
             tgt_raw.close()
 
-    # ── helpers ───────────────────────────────────────────────────────
-
-    @staticmethod
-    def _ensure_unique_index(engine, schema: str, table: str, pk_cols: list[str]):
-        """ON CONFLICT 에 필요한 unique index 를 target 에 생성합니다.
-
-        해당 컬럼 조합에 unique index/constraint 가 이미 존재하면 스킵합니다.
-        """
-        # 해당 컬럼 조합의 unique index 존재 여부 확인
-        check_sql = text("""
-            SELECT 1
-            FROM pg_catalog.pg_index i
-            JOIN pg_catalog.pg_class c ON c.oid = i.indrelid
-            JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace
-            WHERE n.nspname = :schema
-              AND c.relname = :table
-              AND i.indisunique
-              AND (
-                  SELECT array_agg(a.attname ORDER BY k.ord)
-                  FROM unnest(i.indkey) WITH ORDINALITY AS k(attnum, ord)
-                  JOIN pg_catalog.pg_attribute a
-                    ON a.attrelid = c.oid AND a.attnum = k.attnum
-              ) = CAST(:cols AS name[])
-            LIMIT 1
-        """)
-        with engine.begin() as conn:
-            exists = conn.execute(
-                check_sql, {"schema": schema, "table": table, "cols": pk_cols}
-            ).scalar()
-            if exists:
-                return
-
-            idx_name = f"uq_sync_{table}_{'_'.join(pk_cols)}"
-            col_list = ", ".join(f'"{c}"' for c in pk_cols)
-            conn.execute(text(
-                f'CREATE UNIQUE INDEX "{idx_name}" '
-                f'ON "{schema}"."{table}" ({col_list})'
-            ))
 
 
 def _fmt_bytes(n: int) -> str:
