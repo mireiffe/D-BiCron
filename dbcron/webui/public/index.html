@@ -609,6 +609,17 @@ async function loadHistory() {
     const out = makeEl("td", { className: "running-output", onClick: () => openLiveLogModal(r) },
       r.stdout.slice(-80) || r.stderr.slice(-80) || "(running...)");
     out.title = "Click to view live log";
+    const killBtn = makeEl("button", {
+      className: "btn btn-red btn-sm",
+      onClick: async () => {
+        killBtn.disabled = true;
+        try {
+          await api(`/api/running/${r.runId}`, { method: "DELETE" });
+          toast("Job killed (PID " + r.pid + ")", true);
+        } catch { toast("Kill failed", false); }
+        loadHistory();
+      },
+    }, "KILL");
     return makeEl("tr", { className: "running-row" }, [
       makeEl("td", null, r.jobName),
       makePidCell(r.pid),
@@ -618,6 +629,7 @@ async function loadHistory() {
       ])]),
       out,
       makeEl("td", null, new Date(r.startedAt).toLocaleString()),
+      makeEl("td", null, [killBtn]),
     ]);
   });
 
@@ -630,11 +642,12 @@ async function loadHistory() {
       makeEl("td", null, [makeEl("span", { className: `badge ${h.success ? "badge-ok" : "badge-fail"}` }, h.success ? "OK" : "FAIL")]),
       out,
       makeEl("td", null, new Date(h.finishedAt).toLocaleString()),
+      makeEl("td"),
     ]);
   });
 
   el.appendChild(makeEl("table", { className: "tbl mag-tbl" }, [
-    makeEl("thead", null, [makeEl("tr", null, [makeEl("th", null, "Job"), makeEl("th", null, "PID"), makeEl("th", null, "Status"), makeEl("th", null, "Output"), makeEl("th", null, "Time")])]),
+    makeEl("thead", null, [makeEl("tr", null, [makeEl("th", null, "Job"), makeEl("th", null, "PID"), makeEl("th", null, "Status"), makeEl("th", null, "Output"), makeEl("th", null, "Time"), makeEl("th")])]),
     makeEl("tbody", null, [...runningRows, ...historyRows]),
   ]));
 }

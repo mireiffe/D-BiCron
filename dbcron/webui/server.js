@@ -43,8 +43,12 @@ function runJob(jobName, args = {}) {
       cliArgs.push(`--${k}`, String(v));
     }
 
-    const proc = spawn("uv", cliArgs, { cwd: PROJECT_ROOT });
+    const proc = spawn("uv", cliArgs, {
+      cwd: PROJECT_ROOT,
+      env: { ...process.env, PYTHONUNBUFFERED: "1" },
+    });
     tracker.pid = proc.pid;
+    tracker.proc = proc;
 
     proc.on("error", (err) => {
       runningJobs.delete(runId);
@@ -154,6 +158,16 @@ app.get("/api/running/:id", (req, res) => {
   const r = runningJobs.get(Number(req.params.id));
   if (!r) return res.status(404).json({ error: "Not running" });
   res.json({ runId: r.runId, jobName: r.jobName, args: r.args, pid: r.pid, startedAt: r.startedAt, stdout: r.stdout, stderr: r.stderr });
+});
+
+// Kill a running job
+app.delete("/api/running/:id", (req, res) => {
+  const r = runningJobs.get(Number(req.params.id));
+  if (!r) return res.status(404).json({ error: "Not running" });
+  r.proc.kill("SIGTERM");
+  // Give it 3s, then force kill
+  setTimeout(() => { try { r.proc.kill("SIGKILL"); } catch {} }, 3000);
+  res.json({ killed: r.runId, pid: r.pid });
 });
 
 // Run history
