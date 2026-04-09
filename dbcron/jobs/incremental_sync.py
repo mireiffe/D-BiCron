@@ -21,7 +21,7 @@ import json
 import os
 from datetime import datetime, timedelta
 
-from sqlalchemy import text
+from sqlalchemy import create_engine, text
 
 from ..db import create_coredb_engine, create_susdb_engine
 from .base import Job, JobResult
@@ -37,8 +37,8 @@ class IncrementalSyncJob(Job):
         sync_cfg = self._load_sync_config()
         tables = sync_cfg["tables"]
 
-        src_engine = create_susdb_engine(self.config)
-        tgt_engine = create_coredb_engine(self.config)
+        src_engine = self._build_engine(sync_cfg, "source", create_susdb_engine)
+        tgt_engine = self._build_engine(sync_cfg, "target", create_coredb_engine)
 
         total = 0
         errors: list[str] = []
@@ -71,6 +71,18 @@ class IncrementalSyncJob(Job):
         path = os.getenv("SYNC_CONFIG", "sync_config.json")
         with open(path) as f:
             return json.load(f)
+
+    def _build_engine(self, sync_cfg: dict, key: str, fallback_factory):
+        """sync_config 에 DB 접속 정보가 있으면 사용, 없으면 기존 susdb/coredb fallback."""
+        db = sync_cfg.get(key)
+        if db:
+            url = (
+                f"postgresql://{db['user']}:{db['password']}"
+                f"@{db['host']}:{db.get('port', 5432)}/{db['database']}"
+            )
+            self.logger.info("%s DB: %s@%s/%s", key, db["user"], db["host"], db["database"])
+            return create_engine(url, pool_pre_ping=True)
+        return fallback_factory(self.config)
 
     # ── per-table sync ────────────────────────────────────────────────
 

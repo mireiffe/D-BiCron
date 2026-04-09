@@ -1,4 +1,19 @@
 {
+  "_comment": "source/target 생략 시 .env 의 SUSDB_*/COREDB_* 사용",
+  "source": {
+    "host": "source-db.example.com",
+    "port": 5432,
+    "database": "production",
+    "user": "reader",
+    "password": "secret"
+  },
+  "target": {
+    "host": "target-db.example.com",
+    "port": 5432,
+    "database": "analytics",
+    "user": "writer",
+    "password": "secret"
+  },
   "tables": [
     {
       "table": "device_master",
