@@ -1,0 +1,16 @@
+{
+  "tables": [
+    {
+      "table": "device_master",
+      "pk_columns": ["id"],
+      "ts_column": "updated_at",
+      "source_schema": "public",
+      "target_schema": "public"
+    },
+    {
+      "table": "sensor_readings",
+      "pk_columns": ["device_id", "measured_at"],
+      "ts_column": "created_at"
+    }
+  ]
+}
