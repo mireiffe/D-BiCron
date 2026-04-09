@@ -433,6 +433,130 @@
       white-space: nowrap;
       font-size: 11px;
       color: var(--text-dim);
+      cursor: pointer;
+    }
+    .output-cell:hover {
+      color: var(--cyan);
+    }
+
+    /* ── Log Modal ── */
+    .modal-overlay {
+      position: fixed;
+      inset: 0;
+      background: rgba(26, 26, 46, .6);
+      backdrop-filter: blur(3px);
+      z-index: 2000;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      animation: modalFadeIn .15s ease-out;
+    }
+    @keyframes modalFadeIn {
+      from { opacity: 0; }
+      to { opacity: 1; }
+    }
+    .modal-box {
+      background: var(--surface);
+      border: var(--border-w) solid var(--border-color);
+      border-radius: var(--radius);
+      box-shadow: 8px 8px 0 var(--dark);
+      width: 90%;
+      max-width: 700px;
+      max-height: 80vh;
+      display: flex;
+      flex-direction: column;
+      animation: modalSlideIn .15s ease-out;
+    }
+    @keyframes modalSlideIn {
+      from { opacity: 0; transform: translateY(12px); }
+      to { opacity: 1; transform: translateY(0); }
+    }
+    .modal-header {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      padding: 10px 16px;
+      background: var(--dark);
+      border-bottom: 2px solid var(--dark);
+      border-radius: var(--radius) var(--radius) 0 0;
+    }
+    .modal-title {
+      font-family: var(--font-display);
+      font-size: 11px;
+      font-weight: 700;
+      color: var(--lime);
+      text-transform: uppercase;
+      letter-spacing: 2px;
+      display: flex;
+      align-items: center;
+      gap: 8px;
+    }
+    .modal-close {
+      background: var(--red);
+      color: #fff;
+      border: 2px solid var(--border-color);
+      border-radius: 3px;
+      font-family: var(--font-display);
+      font-weight: 700;
+      font-size: 11px;
+      padding: 2px 10px;
+      cursor: pointer;
+      letter-spacing: 1px;
+      transition: transform .08s, box-shadow .08s;
+      box-shadow: 2px 2px 0 rgba(0,0,0,.3);
+    }
+    .modal-close:hover {
+      transform: translate(-1px, -1px);
+      box-shadow: 3px 3px 0 rgba(0,0,0,.3);
+    }
+    .modal-body {
+      padding: 16px;
+      overflow-y: auto;
+      flex: 1;
+    }
+    .modal-log {
+      background: var(--dark);
+      color: #d4d4d4;
+      font-family: var(--font-mono);
+      font-size: 12px;
+      line-height: 1.6;
+      padding: 14px;
+      border-radius: var(--radius);
+      border: 2px solid var(--dark-mid);
+      white-space: pre-wrap;
+      word-break: break-word;
+      min-height: 80px;
+      max-height: 55vh;
+      overflow-y: auto;
+    }
+    .modal-log-live {
+      border-color: var(--cyan);
+      box-shadow: 0 0 8px rgba(0, 229, 255, .15);
+    }
+
+    /* ── Running badge ── */
+    .badge-run {
+      background: var(--cyan);
+      color: var(--dark);
+      animation: pulse 2s ease-in-out infinite;
+    }
+    .running-row {
+      background: rgba(0, 229, 255, .06);
+    }
+    .running-row:hover {
+      background: rgba(0, 229, 255, .12) !important;
+    }
+    .running-output {
+      max-width: 280px;
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+      font-size: 11px;
+      color: var(--cyan-dim);
+      cursor: pointer;
+    }
+    .running-output:hover {
+      color: var(--cyan);
     }
 
     /* ── Spinner ── */
@@ -571,6 +695,18 @@
   </div>
 </div>
 
+<div class="modal-overlay" id="log-modal" style="display:none" onclick="if(event.target===this)closeLogModal()">
+  <div class="modal-box">
+    <div class="modal-header">
+      <div class="modal-title"><span id="log-modal-badge"></span> <span id="log-modal-job"></span> — <span id="log-modal-time"></span></div>
+      <button class="modal-close" onclick="closeLogModal()">✕ ESC</button>
+    </div>
+    <div class="modal-body">
+      <div class="modal-log" id="log-modal-content"></div>
+    </div>
+  </div>
+</div>
+
 <div class="toast-container" id="toasts"></div>
 
 <script>
@@ -590,6 +726,76 @@ async function api(url, opts) {
   const res = await fetch(url, { headers: { "Content-Type": "application/json" }, ...opts });
   return res.json();
 }
+let liveLogInterval = null;
+let liveRunId = null;
+
+function openLogModal(h) {
+  stopLiveLog();
+  const modal = document.getElementById("log-modal");
+  document.getElementById("log-modal-badge").className = `badge ${h.success ? "badge-ok" : "badge-fail"}`;
+  document.getElementById("log-modal-badge").textContent = h.success ? "OK" : "FAIL";
+  document.getElementById("log-modal-job").textContent = h.jobName;
+  document.getElementById("log-modal-time").textContent = new Date(h.finishedAt).toLocaleString();
+  const content = document.getElementById("log-modal-content");
+  content.className = "modal-log";
+  const parts = [];
+  if (h.stdout) parts.push(h.stdout);
+  if (h.stderr) parts.push((h.stdout ? "\n── stderr ──\n" : "") + h.stderr);
+  content.textContent = parts.join("") || "(no output)";
+  modal.style.display = "";
+}
+
+function openLiveLogModal(r) {
+  stopLiveLog();
+  const modal = document.getElementById("log-modal");
+  document.getElementById("log-modal-badge").className = "badge badge-run";
+  document.getElementById("log-modal-badge").textContent = "RUNNING";
+  document.getElementById("log-modal-job").textContent = r.jobName;
+  document.getElementById("log-modal-time").textContent = new Date(r.startedAt).toLocaleString();
+  const content = document.getElementById("log-modal-content");
+  content.className = "modal-log modal-log-live";
+  updateLiveContent(r);
+  modal.style.display = "";
+
+  liveRunId = r.runId;
+  liveLogInterval = setInterval(async () => {
+    try {
+      const res = await fetch(`/api/running/${liveRunId}`);
+      if (!res.ok) {
+        // Job finished — stop polling, refresh history
+        stopLiveLog();
+        content.className = "modal-log";
+        document.getElementById("log-modal-badge").className = "badge badge-ok";
+        document.getElementById("log-modal-badge").textContent = "DONE";
+        loadHistory();
+        return;
+      }
+      const data = await res.json();
+      updateLiveContent(data);
+    } catch { /* ignore fetch errors */ }
+  }, 1000);
+}
+
+function updateLiveContent(r) {
+  const content = document.getElementById("log-modal-content");
+  const parts = [];
+  if (r.stdout) parts.push(r.stdout);
+  if (r.stderr) parts.push((r.stdout ? "\n── stderr ──\n" : "") + r.stderr);
+  content.textContent = parts.join("") || "(waiting for output...)";
+  content.scrollTop = content.scrollHeight;
+}
+
+function stopLiveLog() {
+  if (liveLogInterval) { clearInterval(liveLogInterval); liveLogInterval = null; }
+  liveRunId = null;
+}
+
+function closeLogModal() {
+  stopLiveLog();
+  document.getElementById("log-modal").style.display = "none";
+}
+document.addEventListener("keydown", e => { if (e.key === "Escape") closeLogModal(); });
+
 function toast(msg, ok) {
   const t = makeEl("div", { className: `toast ${ok ? "toast-ok" : "toast-err"}` }, msg);
   document.getElementById("toasts").appendChild(t);
@@ -684,34 +890,60 @@ async function deleteSchedule(id) {
 
 // ── History ──
 async function loadHistory() {
-  const list = await api("/api/history");
+  const [running, list] = await Promise.all([api("/api/running"), api("/api/history")]);
   const el = document.getElementById("history-list");
-  document.getElementById("history-count").textContent = list.length;
+  document.getElementById("history-count").textContent = running.length + list.length;
   clearEl(el);
 
-  if (!list.length) { el.appendChild(makeEl("div", { className: "empty" }, "No runs yet")); return; }
+  if (!running.length && !list.length) { el.appendChild(makeEl("div", { className: "empty" }, "No runs yet")); return; }
+
+  const runningRows = running.map(r => {
+    const out = makeEl("td", { className: "running-output", onClick: () => openLiveLogModal(r) },
+      r.stdout.slice(-80) || r.stderr.slice(-80) || "(running...)");
+    out.title = "Click to view live log";
+    return makeEl("tr", { className: "running-row" }, [
+      makeEl("td", null, r.jobName),
+      makeEl("td", null, [makeEl("span", { className: "badge badge-run" }, [
+        makeEl("span", { className: "spinner", style: "margin-right:4px;width:10px;height:10px;border-width:1.5px" }),
+        document.createTextNode("RUN"),
+      ])]),
+      out,
+      makeEl("td", null, new Date(r.startedAt).toLocaleString()),
+    ]);
+  });
+
+  const historyRows = list.map(h => {
+    const out = makeEl("td", { className: "output-cell", onClick: () => openLogModal(h) }, h.success ? (h.stdout || "-") : (h.stderr || "-"));
+    out.title = "Click to view full log";
+    return makeEl("tr", null, [
+      makeEl("td", null, h.jobName),
+      makeEl("td", null, [makeEl("span", { className: `badge ${h.success ? "badge-ok" : "badge-fail"}` }, h.success ? "OK" : "FAIL")]),
+      out,
+      makeEl("td", null, new Date(h.finishedAt).toLocaleString()),
+    ]);
+  });
 
   el.appendChild(makeEl("table", { className: "tbl" }, [
     makeEl("thead", null, [
       makeEl("tr", null, [makeEl("th", null, "Job"), makeEl("th", null, "Status"), makeEl("th", null, "Output"), makeEl("th", null, "Time")]),
     ]),
-    makeEl("tbody", null, list.map(h => {
-      const out = makeEl("td", { className: "output-cell" }, h.success ? (h.stdout || "-") : (h.stderr || "-"));
-      out.title = h.success ? (h.stdout || "") : (h.stderr || "");
-      return makeEl("tr", null, [
-        makeEl("td", null, h.jobName),
-        makeEl("td", null, [makeEl("span", { className: `badge ${h.success ? "badge-ok" : "badge-fail"}` }, h.success ? "OK" : "FAIL")]),
-        out,
-        makeEl("td", null, new Date(h.finishedAt).toLocaleString()),
-      ]);
-    })),
+    makeEl("tbody", null, [...runningRows, ...historyRows]),
   ]));
 }
 
 loadJobs();
 loadSchedules();
 loadHistory();
-setInterval(() => { loadSchedules(); loadHistory(); }, 30000);
+// Poll faster (3s) when jobs are running, otherwise every 30s
+let historyTimer = null;
+async function pollHistory() {
+  await loadHistory();
+  const running = document.querySelector(".running-row");
+  const interval = running ? 3000 : 30000;
+  historyTimer = setTimeout(pollHistory, interval);
+}
+pollHistory();
+setInterval(loadSchedules, 30000);
 </script>
 </body>
 </html>

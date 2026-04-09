@@ -17,13 +17,26 @@ const AVAILABLE_JOBS = [];
 
 // In-memory state
 const scheduledTasks = new Map(); // id -> { cron, jobName, args, task, createdAt }
+const runningJobs = new Map();    // runId -> { jobName, args, startedAt, stdout, stderr }
 const runHistory = []; // last 100 results
 let nextId = 1;
+let nextRunId = 1;
 
 // -------------------------------------------------------------------
 // Helpers
 // -------------------------------------------------------------------
 function runJob(jobName, args = {}) {
+  const runId = nextRunId++;
+  const tracker = {
+    runId,
+    jobName,
+    args,
+    startedAt: new Date().toISOString(),
+    stdout: "",
+    stderr: "",
+  };
+  runningJobs.set(runId, tracker);
+
   return new Promise((resolve, reject) => {
     const cliArgs = ["run", "python", "-m", "dbcron.main", jobName];
     for (const [k, v] of Object.entries(args)) {
@@ -31,22 +44,22 @@ function runJob(jobName, args = {}) {
     }
 
     const proc = spawn("uv", cliArgs, { cwd: PROJECT_ROOT });
-    let stdout = "";
-    let stderr = "";
 
     proc.on("error", (err) => {
+      runningJobs.delete(runId);
       reject({ jobName, args, success: false, stdout: "", stderr: err.message, finishedAt: new Date().toISOString() });
     });
-    proc.stdout.on("data", (d) => (stdout += d));
-    proc.stderr.on("data", (d) => (stderr += d));
+    proc.stdout.on("data", (d) => (tracker.stdout += d));
+    proc.stderr.on("data", (d) => (tracker.stderr += d));
 
     proc.on("close", (code) => {
+      runningJobs.delete(runId);
       const entry = {
         jobName,
         args,
         success: code === 0,
-        stdout: stdout.trim(),
-        stderr: stderr.trim(),
+        stdout: tracker.stdout.trim(),
+        stderr: tracker.stderr.trim(),
         finishedAt: new Date().toISOString(),
       };
       runHistory.unshift(entry);
@@ -124,6 +137,21 @@ app.delete("/api/schedules/:id", (req, res) => {
   entry.task.stop();
   scheduledTasks.delete(id);
   res.json({ deleted: id });
+});
+
+// Running jobs
+app.get("/api/running", (_req, res) => {
+  const list = [];
+  for (const [, r] of runningJobs) {
+    list.push({ runId: r.runId, jobName: r.jobName, args: r.args, startedAt: r.startedAt, stdout: r.stdout, stderr: r.stderr });
+  }
+  res.json(list);
+});
+
+app.get("/api/running/:id", (req, res) => {
+  const r = runningJobs.get(Number(req.params.id));
+  if (!r) return res.status(404).json({ error: "Not running" });
+  res.json({ runId: r.runId, jobName: r.jobName, args: r.args, startedAt: r.startedAt, stdout: r.stdout, stderr: r.stderr });
 });
 
 // Run history
