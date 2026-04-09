@@ -124,7 +124,36 @@
     }
 
     .main { padding: 18px 20px; display: flex; flex-direction: column; gap: 18px; }
-    .main-row { display: grid; grid-template-columns: 1fr 1fr; gap: 18px; }
+
+    .tab-bar { display: flex; gap: 4px; }
+    .tab-btn {
+      display: inline-flex; align-items: center; gap: 8px;
+      cursor: pointer; background: var(--surface-hi);
+      border: var(--border-w) solid rgba(255, 255, 255, .06);
+      border-bottom: none;
+      border-radius: var(--radius) var(--radius) 0 0;
+      font-family: var(--font-display); font-weight: 700; font-size: 12px;
+      letter-spacing: 1.5px; text-transform: uppercase;
+      padding: 8px 18px; color: var(--text-dim);
+      transition: all .15s;
+    }
+    .tab-btn:hover { color: var(--text); }
+    .tab-btn.tab-active {
+      background: var(--surface);
+      border-color: rgba(255, 45, 138, .35);
+      color: var(--magenta);
+      box-shadow: 0 -2px 10px var(--magenta-glow);
+    }
+    .tab-btn .tab-count {
+      font-family: var(--font-code); font-size: 10px;
+      background: var(--bg); padding: 1px 7px; border-radius: 2px;
+      border: 1px solid rgba(255, 255, 255, .1);
+    }
+    .tab-btn.tab-active .tab-count {
+      color: var(--magenta); border-color: rgba(255, 45, 138, .3);
+    }
+    .tab-panel { display: none; }
+    .tab-panel.tab-visible { display: block; }
 
     .stitle {
       font-family: var(--font-display); font-size: 12px; font-weight: 700;
@@ -330,7 +359,6 @@
     @media (max-width: 900px) {
       .dashboard { grid-template-columns: 1fr; }
       .sidebar { border-right: none; border-bottom: var(--border-w) solid rgba(0, 229, 255, .2); }
-      .main-row { grid-template-columns: 1fr; }
       .sched-form { flex-direction: column; align-items: stretch; }
     }
   </style>
@@ -389,23 +417,23 @@
       </div>
     </div>
 
-    <div class="main-row">
-      <div class="card">
+    <div>
+      <div class="tab-bar">
+        <button class="tab-btn tab-active" id="tab-btn-history" onclick="switchTab('history')">
+          Run History <span class="tab-count" id="history-count">0</span>
+        </button>
+        <button class="tab-btn" id="tab-btn-schedules" onclick="switchTab('schedules')">
+          Schedules <span class="tab-count" id="sched-count">0</span>
+        </button>
+      </div>
+      <div class="card mag-card tab-panel tab-visible" id="tab-history">
         <div class="card-body">
-          <div class="stitle">
-            <span class="stitle-tag yel">&#9776;</span>
-            Active Schedules <span class="count" id="sched-count">0</span>
-          </div>
-          <div id="schedules-list"></div>
+          <div id="history-list"></div>
         </div>
       </div>
-      <div class="card mag-card">
+      <div class="card tab-panel" id="tab-schedules">
         <div class="card-body">
-          <div class="stitle">
-            <span class="stitle-tag mag">&#9656;</span>
-            Run History <span class="count" id="history-count">0</span>
-          </div>
-          <div id="history-list"></div>
+          <div id="schedules-list"></div>
         </div>
       </div>
     </div>
@@ -446,6 +474,13 @@ async function api(url, opts) {
 let liveLogInterval = null;
 let liveRunId = null;
 
+function switchTab(name) {
+  document.getElementById('tab-history').className = 'card mag-card tab-panel' + (name === 'history' ? ' tab-visible' : '');
+  document.getElementById('tab-schedules').className = 'card tab-panel' + (name === 'schedules' ? ' tab-visible' : '');
+  document.getElementById('tab-btn-history').className = 'tab-btn' + (name === 'history' ? ' tab-active' : '');
+  document.getElementById('tab-btn-schedules').className = 'tab-btn' + (name === 'schedules' ? ' tab-active' : '');
+}
+
 function openLogModal(h) {
   stopLiveLog();
   const modal = document.getElementById("log-modal");
@@ -478,10 +513,24 @@ function openLiveLogModal(r) {
     try {
       const res = await fetch(`/api/running/${liveRunId}`);
       if (!res.ok) {
+        const finishedRunId = liveRunId;
         stopLiveLog();
         content.className = "modal-log";
-        document.getElementById("log-modal-badge").className = "badge badge-ok";
-        document.getElementById("log-modal-badge").textContent = "DONE";
+        // Fetch final output from history
+        const history = await api("/api/history");
+        const final = history.find(h => h.runId === finishedRunId);
+        if (final) {
+          document.getElementById("log-modal-badge").className = `badge ${final.success ? "badge-ok" : "badge-fail"}`;
+          document.getElementById("log-modal-badge").textContent = final.success ? "OK" : "FAIL";
+          document.getElementById("log-modal-time").textContent = new Date(final.finishedAt).toLocaleString();
+          const parts = [];
+          if (final.stdout) parts.push(final.stdout);
+          if (final.stderr) parts.push((final.stdout ? "\n\u2500\u2500 stderr \u2500\u2500\n" : "") + final.stderr);
+          content.textContent = parts.join("") || "(no output)";
+        } else {
+          document.getElementById("log-modal-badge").className = "badge badge-ok";
+          document.getElementById("log-modal-badge").textContent = "DONE";
+        }
         loadHistory();
         return;
       }
@@ -529,14 +578,14 @@ async function loadJobs() {
     const runBtn = makeEl("button", {
       className: "btn btn-lime btn-sm",
       onClick: async () => {
-        runBtn.disabled = true; runBtn.textContent = "";
-        runBtn.appendChild(makeEl("span", { className: "spinner" }));
+        runBtn.disabled = true;
         try {
           await api(`/api/jobs/${encodeURIComponent(j.name)}/run`, { method: "POST", body: JSON.stringify({ days: Number(daysInput.value) || 1 }) });
-          toast(`${j.label} completed`, true);
-        } catch { toast(`${j.label} failed`, false); }
-        runBtn.disabled = false; runBtn.textContent = "RUN";
-        loadHistory();
+          toast(`${j.label} started`, true);
+          switchTab('history');
+          loadHistory();
+        } catch { toast(`${j.label} failed to start`, false); }
+        runBtn.disabled = false;
       },
     }, "RUN");
     el.appendChild(makeEl("div", { className: "job-card" }, [
@@ -576,6 +625,7 @@ async function createSchedule() {
   try {
     await api("/api/schedules", { method: "POST", body: JSON.stringify({ jobName, cronExpr, args: { days } }) });
     toast("Schedule registered", true);
+    switchTab('schedules');
   } catch { toast("Failed to register", false); }
   loadSchedules();
 }

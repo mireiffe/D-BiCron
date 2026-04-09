@@ -25,7 +25,7 @@ let nextRunId = 1;
 // -------------------------------------------------------------------
 // Helpers
 // -------------------------------------------------------------------
-function runJob(jobName, args = {}) {
+function startJob(jobName, args = {}) {
   const runId = nextRunId++;
   const tracker = {
     runId,
@@ -37,42 +37,45 @@ function runJob(jobName, args = {}) {
   };
   runningJobs.set(runId, tracker);
 
-  return new Promise((resolve, reject) => {
-    const cliArgs = ["run", "python", "-m", "dbcron.main", jobName];
-    for (const [k, v] of Object.entries(args)) {
-      cliArgs.push(`--${k}`, String(v));
-    }
+  const cliArgs = ["-u", "-m", "dbcron.main", jobName];
+  for (const [k, v] of Object.entries(args)) {
+    cliArgs.push(`--${k}`, String(v));
+  }
 
-    const proc = spawn("uv", cliArgs, {
-      cwd: PROJECT_ROOT,
-      env: { ...process.env, PYTHONUNBUFFERED: "1" },
-    });
-    tracker.pid = proc.pid;
-    tracker.proc = proc;
+  const proc = spawn(
+    path.join(PROJECT_ROOT, ".venv", "bin", "python"),
+    cliArgs,
+    { cwd: PROJECT_ROOT },
+  );
+  tracker.pid = proc.pid;
+  tracker.proc = proc;
 
-    proc.on("error", (err) => {
-      runningJobs.delete(runId);
-      reject({ jobName, args, pid: proc.pid, success: false, stdout: "", stderr: err.message, finishedAt: new Date().toISOString() });
+  proc.on("error", (err) => {
+    runningJobs.delete(runId);
+    runHistory.unshift({
+      runId, jobName, args, pid: proc.pid,
+      success: false, stdout: "", stderr: err.message,
+      finishedAt: new Date().toISOString(),
     });
-    proc.stdout.on("data", (d) => (tracker.stdout += d));
-    proc.stderr.on("data", (d) => (tracker.stderr += d));
-
-    proc.on("close", (code) => {
-      runningJobs.delete(runId);
-      const entry = {
-        jobName,
-        args,
-        pid: proc.pid,
-        success: code === 0,
-        stdout: tracker.stdout.trim(),
-        stderr: tracker.stderr.trim(),
-        finishedAt: new Date().toISOString(),
-      };
-      runHistory.unshift(entry);
-      if (runHistory.length > 100) runHistory.pop();
-      code === 0 ? resolve(entry) : reject(entry);
-    });
+    if (runHistory.length > 100) runHistory.pop();
   });
+
+  proc.stdout.on("data", (d) => (tracker.stdout += d));
+  proc.stderr.on("data", (d) => (tracker.stderr += d));
+
+  proc.on("close", (code) => {
+    runningJobs.delete(runId);
+    runHistory.unshift({
+      runId, jobName, args, pid: proc.pid,
+      success: code === 0,
+      stdout: tracker.stdout.trim(),
+      stderr: tracker.stderr.trim(),
+      finishedAt: new Date().toISOString(),
+    });
+    if (runHistory.length > 100) runHistory.pop();
+  });
+
+  return runId;
 }
 
 // -------------------------------------------------------------------
@@ -84,18 +87,14 @@ app.get("/api/jobs", (_req, res) => {
   res.json(AVAILABLE_JOBS);
 });
 
-// Run a job immediately (one-shot)
-app.post("/api/jobs/:name/run", async (req, res) => {
+// Run a job immediately (fire-and-forget)
+app.post("/api/jobs/:name/run", (req, res) => {
   const jobMeta = AVAILABLE_JOBS.find((j) => j.name === req.params.name);
   if (!jobMeta) return res.status(404).json({ error: "Unknown job" });
 
   const args = { ...jobMeta.defaultArgs, ...req.body };
-  try {
-    const result = await runJob(req.params.name, args);
-    res.json(result);
-  } catch (err) {
-    res.status(500).json(err);
-  }
+  const runId = startJob(req.params.name, args);
+  res.json({ runId });
 });
 
 // List scheduled tasks
@@ -120,7 +119,7 @@ app.post("/api/schedules", (req, res) => {
 
   const id = nextId++;
   const task = cron.schedule(cronExpr, () => {
-    runJob(jobName, args).catch(() => {});
+    startJob(jobName, args);
   });
 
   scheduledTasks.set(id, {
