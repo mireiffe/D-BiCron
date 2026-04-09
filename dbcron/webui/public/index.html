@@ -253,6 +253,12 @@
     }
     .running-output:hover { color: var(--cyan); }
 
+    .pid-cell {
+      font-family: var(--font-code); font-size: 11px; color: var(--yellow);
+      cursor: pointer; user-select: none; white-space: nowrap;
+    }
+    .pid-cell:hover { color: var(--text-bright); text-shadow: 0 0 6px var(--yellow); }
+
     .modal-log { max-height: 55vh; overflow-y: auto; }
     .modal-log-live { border-color: var(--cyan); box-shadow: 0 0 12px var(--cyan-glow); }
 
@@ -587,12 +593,25 @@ async function loadHistory() {
   clearEl(el);
   if (!running.length && !list.length) { el.appendChild(makeEl("div", { className: "empty" }, "No runs yet")); return; }
 
+  function makePidCell(pid) {
+    const cell = makeEl("td", {
+      className: "pid-cell",
+      onClick: () => {
+        navigator.clipboard.writeText(String(pid));
+        toast("PID " + pid + " copied", true);
+      },
+    }, pid != null ? String(pid) : "-");
+    cell.title = "Click to copy PID";
+    return cell;
+  }
+
   const runningRows = running.map(r => {
     const out = makeEl("td", { className: "running-output", onClick: () => openLiveLogModal(r) },
       r.stdout.slice(-80) || r.stderr.slice(-80) || "(running...)");
     out.title = "Click to view live log";
     return makeEl("tr", { className: "running-row" }, [
       makeEl("td", null, r.jobName),
+      makePidCell(r.pid),
       makeEl("td", null, [makeEl("span", { className: "badge badge-run" }, [
         makeEl("span", { className: "spinner", style: "margin-right:4px;width:10px;height:10px;border-width:1.5px" }),
         document.createTextNode("RUN"),
@@ -607,6 +626,7 @@ async function loadHistory() {
     out.title = "Click to view full log";
     return makeEl("tr", null, [
       makeEl("td", null, h.jobName),
+      makePidCell(h.pid),
       makeEl("td", null, [makeEl("span", { className: `badge ${h.success ? "badge-ok" : "badge-fail"}` }, h.success ? "OK" : "FAIL")]),
       out,
       makeEl("td", null, new Date(h.finishedAt).toLocaleString()),
@@ -614,7 +634,7 @@ async function loadHistory() {
   });
 
   el.appendChild(makeEl("table", { className: "tbl mag-tbl" }, [
-    makeEl("thead", null, [makeEl("tr", null, [makeEl("th", null, "Job"), makeEl("th", null, "Status"), makeEl("th", null, "Output"), makeEl("th", null, "Time")])]),
+    makeEl("thead", null, [makeEl("tr", null, [makeEl("th", null, "Job"), makeEl("th", null, "PID"), makeEl("th", null, "Status"), makeEl("th", null, "Output"), makeEl("th", null, "Time")])]),
     makeEl("tbody", null, [...runningRows, ...historyRows]),
   ]));
 }

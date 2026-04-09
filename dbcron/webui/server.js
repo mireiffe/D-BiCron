@@ -44,10 +44,11 @@ function runJob(jobName, args = {}) {
     }
 
     const proc = spawn("uv", cliArgs, { cwd: PROJECT_ROOT });
+    tracker.pid = proc.pid;
 
     proc.on("error", (err) => {
       runningJobs.delete(runId);
-      reject({ jobName, args, success: false, stdout: "", stderr: err.message, finishedAt: new Date().toISOString() });
+      reject({ jobName, args, pid: proc.pid, success: false, stdout: "", stderr: err.message, finishedAt: new Date().toISOString() });
     });
     proc.stdout.on("data", (d) => (tracker.stdout += d));
     proc.stderr.on("data", (d) => (tracker.stderr += d));
@@ -57,6 +58,7 @@ function runJob(jobName, args = {}) {
       const entry = {
         jobName,
         args,
+        pid: proc.pid,
         success: code === 0,
         stdout: tracker.stdout.trim(),
         stderr: tracker.stderr.trim(),
@@ -143,7 +145,7 @@ app.delete("/api/schedules/:id", (req, res) => {
 app.get("/api/running", (_req, res) => {
   const list = [];
   for (const [, r] of runningJobs) {
-    list.push({ runId: r.runId, jobName: r.jobName, args: r.args, startedAt: r.startedAt, stdout: r.stdout, stderr: r.stderr });
+    list.push({ runId: r.runId, jobName: r.jobName, args: r.args, pid: r.pid, startedAt: r.startedAt, stdout: r.stdout, stderr: r.stderr });
   }
   res.json(list);
 });
@@ -151,7 +153,7 @@ app.get("/api/running", (_req, res) => {
 app.get("/api/running/:id", (req, res) => {
   const r = runningJobs.get(Number(req.params.id));
   if (!r) return res.status(404).json({ error: "Not running" });
-  res.json({ runId: r.runId, jobName: r.jobName, args: r.args, startedAt: r.startedAt, stdout: r.stdout, stderr: r.stderr });
+  res.json({ runId: r.runId, jobName: r.jobName, args: r.args, pid: r.pid, startedAt: r.startedAt, stdout: r.stdout, stderr: r.stderr });
 });
 
 // Run history
