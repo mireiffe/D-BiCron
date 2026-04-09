@@ -34,7 +34,9 @@ class Job(ABC):
     """Base class for all scheduled jobs."""
 
     name: str = "base"
+    label: str = ""
     description: str = ""
+    default_args: dict = {"days": 1}
 
     def __init__(self, config: InfraConfig):
         self.config = config

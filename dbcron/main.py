@@ -1,6 +1,7 @@
 """CLI entrypoint for running jobs (one-shot or cron)."""
 
 import argparse
+import json
 import logging
 import sys
 
@@ -20,6 +21,7 @@ def main():
     )
     parser.add_argument(
         "job",
+        nargs="?",
         choices=list(JOB_REGISTRY),
         help="Job to execute",
     )
@@ -35,10 +37,35 @@ def main():
         default=None,
         help='Cron expression for repeated execution (e.g. "*/10 * * * *")',
     )
+    parser.add_argument(
+        "--list-jobs",
+        action="store_true",
+        help="Print available jobs as JSON and exit",
+    )
 
     args = parser.parse_args()
-    config = load_config()
+
+    if args.list_jobs:
+        jobs = []
+        for name, cls in JOB_REGISTRY.items():
+            jobs.append({
+                "name": name,
+                "label": getattr(cls, "label", "") or name,
+                "description": getattr(cls, "description", ""),
+                "defaultArgs": getattr(cls, "default_args", {"days": 1}),
+            })
+        print(json.dumps(jobs))
+        sys.exit(0)
+
+    if not args.job:
+        parser.error("job is required (or use --list-jobs)")
+
     job_kwargs = {"days": args.days}
+
+    try:
+        config = load_config()
+    except EnvironmentError:
+        config = None  # jobs that don't need infra can run without config
 
     if args.cron:
         run_scheduled(args.job, config, args.cron, **job_kwargs)

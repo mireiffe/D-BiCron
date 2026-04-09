@@ -1,6 +1,6 @@
 const express = require("express");
 const cron = require("node-cron");
-const { spawn } = require("child_process");
+const { spawn, execFileSync } = require("child_process");
 const path = require("path");
 
 const app = express();
@@ -13,7 +13,18 @@ const PROJECT_ROOT = path.resolve(__dirname, "../..");
 // -------------------------------------------------------------------
 // Available jobs — add new entries when you create a new Job subclass
 // -------------------------------------------------------------------
-const AVAILABLE_JOBS = [];
+let AVAILABLE_JOBS = [];
+try {
+  const out = execFileSync(
+    path.join(PROJECT_ROOT, ".venv", "bin", "python"),
+    ["-m", "dbcron.main", "--list-jobs"],
+    { cwd: PROJECT_ROOT, timeout: 10000 },
+  );
+  AVAILABLE_JOBS = JSON.parse(out);
+  console.log(`Loaded ${AVAILABLE_JOBS.length} job(s) from registry`);
+} catch (err) {
+  console.error("Failed to load jobs from registry:", err.message);
+}
 
 // In-memory state
 const scheduledTasks = new Map(); // id -> { cron, jobName, args, task, createdAt }
