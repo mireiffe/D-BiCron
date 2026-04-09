@@ -6,609 +6,309 @@
   <title>D-BiCron // coredb scheduler</title>
   <link rel="preconnect" href="https://fonts.googleapis.com" />
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
-  <link href="https://fonts.googleapis.com/css2?family=DM+Mono:wght@400;500&family=Oxanium:wght@400;600;700&display=swap" rel="stylesheet" />
+  <link href="https://fonts.googleapis.com/css2?family=Rajdhani:wght@400;500;600;700&family=Fira+Code:wght@400;500;600&display=swap" rel="stylesheet" />
   <style>
     :root {
-      --bg: #eae5db;
-      --bg-dots: #d8d3c9;
-      --sidebar-bg: #f3f0e9;
-      --surface: #ffffff;
-      --dark: #1a1a2e;
-      --dark-mid: #2d2d48;
-      --border-color: #1a1a2e;
-      --border-w: 3px;
-      --text: #1a1a2e;
-      --text-dim: #6b6880;
-      --lime: #c8ff00;
-      --lime-dim: #b0e000;
+      --bg: #12122a;
+      --bg-mid: #181838;
+      --surface: #1e1e42;
+      --surface-hi: #26264e;
+      --text: #e4e2f0;
+      --text-dim: #7b7898;
+      --text-bright: #ffffff;
+
       --cyan: #00e5ff;
-      --cyan-dim: #00bcd4;
+      --cyan-dim: rgba(0, 229, 255, .15);
+      --cyan-glow: rgba(0, 229, 255, .25);
+      --lime: #c8ff00;
+      --lime-dim: rgba(200, 255, 0, .12);
+      --lime-glow: rgba(200, 255, 0, .2);
       --magenta: #ff2d8a;
+      --magenta-dim: rgba(255, 45, 138, .12);
+      --magenta-glow: rgba(255, 45, 138, .2);
       --yellow: #ffd000;
+      --yellow-dim: rgba(255, 208, 0, .12);
       --red: #ff3355;
-      --green: #00c853;
-      --shadow: 5px 5px 0 var(--dark);
-      --shadow-sm: 3px 3px 0 var(--dark);
-      --font-display: 'Oxanium', sans-serif;
-      --font-mono: 'DM Mono', monospace;
-      --radius: 4px;
+      --green: #00e676;
+
+      --border-w: 2.5px;
+      --shadow-cyan: 4px 4px 0 var(--cyan-glow);
+      --shadow-lime: 4px 4px 0 var(--lime-glow);
+      --shadow-magenta: 4px 4px 0 var(--magenta-glow);
+      --font-display: 'Rajdhani', sans-serif;
+      --font-code: 'Fira Code', monospace;
+      --radius: 3px;
     }
 
     * { margin: 0; padding: 0; box-sizing: border-box; }
 
     body {
-      font-family: var(--font-mono);
+      font-family: var(--font-code);
       font-size: 13px;
       background: var(--bg);
       color: var(--text);
       line-height: 1.5;
       min-height: 100vh;
-      /* Dot grid pattern */
-      background-image: radial-gradient(circle, var(--bg-dots) 1px, transparent 1px);
-      background-size: 20px 20px;
+      background-image:
+        linear-gradient(30deg, var(--bg-mid) 12%, transparent 12.5%, transparent 87%, var(--bg-mid) 87.5%, var(--bg-mid)),
+        linear-gradient(150deg, var(--bg-mid) 12%, transparent 12.5%, transparent 87%, var(--bg-mid) 87.5%, var(--bg-mid)),
+        linear-gradient(30deg, var(--bg-mid) 12%, transparent 12.5%, transparent 87%, var(--bg-mid) 87.5%, var(--bg-mid)),
+        linear-gradient(150deg, var(--bg-mid) 12%, transparent 12.5%, transparent 87%, var(--bg-mid) 87.5%, var(--bg-mid)),
+        linear-gradient(60deg, rgba(24, 24, 56, .7) 25%, transparent 25.5%, transparent 75%, rgba(24, 24, 56, .7) 75%),
+        linear-gradient(60deg, rgba(24, 24, 56, .7) 25%, transparent 25.5%, transparent 75%, rgba(24, 24, 56, .7) 75%);
+      background-size: 40px 70px;
+      background-position: 0 0, 0 0, 20px 35px, 20px 35px, 0 0, 20px 35px;
     }
 
-    /* ── Neon top bar ── */
+    body::after {
+      content: '';
+      position: fixed;
+      inset: 0;
+      background: repeating-linear-gradient(0deg, transparent, transparent 3px, rgba(0,0,0,.04) 3px, rgba(0,0,0,.04) 4px);
+      pointer-events: none;
+      z-index: 9999;
+    }
+
     .glow-bar {
-      height: 4px;
-      background: linear-gradient(90deg, var(--lime), var(--cyan), var(--magenta), var(--lime));
+      height: 3px;
+      background: linear-gradient(90deg, var(--cyan), var(--lime), var(--magenta), var(--cyan));
       background-size: 300% 100%;
-      animation: glowSlide 5s linear infinite;
+      animation: glowSlide 6s linear infinite;
+      box-shadow: 0 0 10px var(--cyan-glow), 0 2px 20px var(--cyan-glow);
     }
-    @keyframes glowSlide {
-      0% { background-position: 0% 0; }
-      100% { background-position: 300% 0; }
-    }
+    @keyframes glowSlide { 0%{background-position:0% 0} 100%{background-position:300% 0} }
 
-    /* ── Header ── */
     .header {
-      background: var(--dark);
+      background: var(--surface);
+      border-bottom: var(--border-w) solid var(--cyan);
       padding: 10px 24px;
       display: flex;
       align-items: center;
       justify-content: space-between;
-      border-bottom: var(--border-w) solid var(--dark);
+      box-shadow: 0 4px 20px rgba(0, 229, 255, .08);
     }
-    .header-left {
-      display: flex;
-      align-items: baseline;
-      gap: 12px;
-    }
+    .header-left { display: flex; align-items: baseline; gap: 14px; }
     .logo {
       font-family: var(--font-display);
       font-weight: 700;
-      font-size: 20px;
-      color: var(--lime);
+      font-size: 22px;
+      color: var(--cyan);
       letter-spacing: 3px;
       text-transform: uppercase;
-      text-shadow: 0 0 20px rgba(200, 255, 0, .5);
+      text-shadow: 0 0 15px var(--cyan-glow), 0 0 40px rgba(0, 229, 255, .12);
     }
-    .logo-sub {
-      font-family: var(--font-mono);
-      font-size: 11px;
-      color: #888;
-      letter-spacing: 1px;
-    }
-    .header-right {
-      display: flex;
-      align-items: center;
-      gap: 8px;
-    }
+    .logo-sub { font-family: var(--font-code); font-size: 11px; color: var(--text-dim); letter-spacing: 1px; }
     .status-pill {
-      display: flex;
-      align-items: center;
-      gap: 6px;
-      background: rgba(0, 200, 83, .12);
-      border: 1.5px solid var(--green);
-      border-radius: 20px;
+      display: flex; align-items: center; gap: 6px;
+      border: 1.5px solid var(--green); border-radius: 20px;
       padding: 3px 12px 3px 8px;
-      font-size: 10px;
-      font-family: var(--font-display);
-      font-weight: 600;
-      color: var(--green);
-      letter-spacing: 1.5px;
-      text-transform: uppercase;
+      font-family: var(--font-display); font-size: 11px; font-weight: 600;
+      color: var(--green); letter-spacing: 1.5px; text-transform: uppercase;
+      background: rgba(0, 230, 118, .06);
     }
     .status-dot {
-      width: 6px;
-      height: 6px;
-      border-radius: 50%;
-      background: var(--green);
-      box-shadow: 0 0 6px var(--green);
+      width: 6px; height: 6px; border-radius: 50%;
+      background: var(--green); box-shadow: 0 0 8px var(--green);
       animation: pulse 2s ease-in-out infinite;
     }
-    @keyframes pulse {
-      0%, 100% { opacity: 1; }
-      50% { opacity: .3; }
-    }
+    @keyframes pulse { 0%,100%{opacity:1} 50%{opacity:.3} }
 
-    /* ── Layout ── */
-    .dashboard {
-      display: grid;
-      grid-template-columns: 280px 1fr;
-      min-height: calc(100vh - 54px);
-    }
+    .dashboard { display: grid; grid-template-columns: 280px 1fr; min-height: calc(100vh - 52px); }
 
-    /* ── Sidebar ── */
     .sidebar {
-      background: var(--sidebar-bg);
-      border-right: var(--border-w) solid var(--border-color);
+      background: rgba(20, 20, 48, .6);
+      backdrop-filter: blur(8px);
+      border-right: var(--border-w) solid rgba(0, 229, 255, .2);
       padding: 18px 14px;
-      display: flex;
-      flex-direction: column;
-      gap: 12px;
-      overflow-y: auto;
+      display: flex; flex-direction: column; gap: 12px; overflow-y: auto;
     }
 
-    /* ── Main ── */
-    .main {
-      padding: 18px 20px;
-      display: flex;
-      flex-direction: column;
-      gap: 18px;
-    }
-    .main-row {
-      display: grid;
-      grid-template-columns: 1fr 1fr;
-      gap: 18px;
-    }
+    .main { padding: 18px 20px; display: flex; flex-direction: column; gap: 18px; }
+    .main-row { display: grid; grid-template-columns: 1fr 1fr; gap: 18px; }
 
-    /* ── Section Title ── */
     .stitle {
-      font-family: var(--font-display);
-      font-size: 11px;
-      font-weight: 700;
-      color: var(--text);
-      text-transform: uppercase;
-      letter-spacing: 2px;
-      margin-bottom: 10px;
-      display: flex;
-      align-items: center;
-      gap: 8px;
+      font-family: var(--font-display); font-size: 12px; font-weight: 700;
+      color: var(--text); text-transform: uppercase; letter-spacing: 2.5px;
+      margin-bottom: 10px; display: flex; align-items: center; gap: 8px;
     }
-    .stitle-icon {
-      font-size: 13px;
-      width: 22px;
-      height: 22px;
-      display: inline-flex;
-      align-items: center;
-      justify-content: center;
-      border: 2px solid var(--border-color);
-      border-radius: 3px;
-      font-weight: 700;
-      flex-shrink: 0;
+    .stitle-tag {
+      font-size: 10px; font-weight: 700; padding: 2px 7px; border-radius: 2px;
+      letter-spacing: 1px; border: 2px solid; font-family: var(--font-display);
     }
-    .stitle-icon.lime { background: var(--lime); }
-    .stitle-icon.cyan { background: var(--cyan); }
-    .stitle-icon.magenta { background: var(--magenta); color: #fff; }
-    .stitle-icon.yellow { background: var(--yellow); }
+    .stitle-tag.cyan  { border-color: var(--cyan); color: var(--cyan); background: var(--cyan-dim); }
+    .stitle-tag.lime  { border-color: var(--lime); color: var(--lime); background: var(--lime-dim); }
+    .stitle-tag.mag   { border-color: var(--magenta); color: var(--magenta); background: var(--magenta-dim); }
+    .stitle-tag.yel   { border-color: var(--yellow); color: var(--yellow); background: var(--yellow-dim); }
     .stitle .count {
-      font-family: var(--font-mono);
-      font-size: 10px;
-      font-weight: 500;
-      background: var(--dark);
-      color: var(--lime);
-      padding: 1px 7px;
-      border-radius: 3px;
-      letter-spacing: 0;
+      font-family: var(--font-code); font-size: 10px;
+      background: var(--surface); color: var(--cyan);
+      padding: 1px 7px; border-radius: 2px; border: 1px solid rgba(0, 229, 255, .3);
     }
 
-    /* ── Card ── */
     .card {
       background: var(--surface);
-      border: var(--border-w) solid var(--border-color);
+      border: var(--border-w) solid rgba(0, 229, 255, .35);
       border-radius: var(--radius);
-      box-shadow: var(--shadow);
-      transition: transform .1s, box-shadow .1s;
+      box-shadow: var(--shadow-cyan);
+      transition: transform .1s, box-shadow .1s, border-color .15s;
     }
-    .card:hover {
-      transform: translate(-1px, -1px);
-      box-shadow: 7px 7px 0 var(--dark);
-    }
+    .card:hover { border-color: rgba(0, 229, 255, .55); transform: translate(-1px, -1px); box-shadow: 6px 6px 0 var(--cyan-glow); }
     .card-body { padding: 16px; }
+    .card.mag-card { border-color: rgba(255, 45, 138, .35); box-shadow: var(--shadow-magenta); }
+    .card.mag-card:hover { border-color: rgba(255, 45, 138, .55); box-shadow: 6px 6px 0 var(--magenta-glow); }
 
-    /* ── Job Card (sidebar) ── */
     .job-card {
       background: var(--surface);
-      border: var(--border-w) solid var(--border-color);
-      border-radius: var(--radius);
-      padding: 12px;
-      box-shadow: var(--shadow-sm);
-      border-left: 6px solid var(--lime);
-      transition: transform .1s, box-shadow .1s;
+      border: var(--border-w) solid rgba(200, 255, 0, .3);
+      border-left: 5px solid var(--lime);
+      border-radius: var(--radius); padding: 12px;
+      box-shadow: 3px 3px 0 var(--lime-glow);
+      transition: transform .1s, box-shadow .1s, border-color .15s;
+      margin-bottom: 8px;
     }
-    .job-card:hover {
-      transform: translate(-1px, -1px);
-      box-shadow: 5px 5px 0 var(--dark);
-    }
-    .job-name {
-      font-family: var(--font-display);
-      font-weight: 700;
-      font-size: 13px;
-      color: var(--text);
-      margin-bottom: 3px;
-    }
-    .job-desc {
-      font-size: 11px;
-      color: var(--text-dim);
-      margin-bottom: 10px;
-    }
-    .job-actions {
-      display: flex;
-      gap: 8px;
-      align-items: center;
-    }
-    .field-inline {
-      display: flex;
-      align-items: center;
-      gap: 4px;
-    }
-    .field-inline label {
-      font-size: 10px;
-      color: var(--text-dim);
-      text-transform: uppercase;
-      letter-spacing: .5px;
-    }
+    .job-card:hover { border-color: rgba(200, 255, 0, .5); transform: translate(-1px, -1px); box-shadow: 5px 5px 0 var(--lime-glow); }
+    .job-name { font-family: var(--font-display); font-weight: 700; font-size: 14px; color: var(--text-bright); margin-bottom: 2px; }
+    .job-desc { font-size: 11px; color: var(--text-dim); margin-bottom: 10px; }
+    .job-actions { display: flex; gap: 8px; align-items: center; }
+    .field-inline { display: flex; align-items: center; gap: 4px; }
+    .field-inline label { font-size: 10px; color: var(--text-dim); text-transform: uppercase; letter-spacing: .5px; }
     .field-inline input {
-      width: 46px;
-      background: var(--bg);
-      border: 2px solid var(--border-color);
-      border-radius: 3px;
-      color: var(--text);
-      font-family: var(--font-mono);
-      font-size: 12px;
-      padding: 3px 6px;
-      text-align: center;
+      width: 46px; background: var(--bg); border: 2px solid rgba(200, 255, 0, .25);
+      border-radius: 3px; color: var(--lime); font-family: var(--font-code);
+      font-size: 12px; padding: 3px 6px; text-align: center;
     }
-    .field-inline input:focus {
-      outline: none;
-      border-color: var(--lime-dim);
-      box-shadow: 0 0 0 2px rgba(200, 255, 0, .3);
-    }
+    .field-inline input:focus { outline: none; border-color: var(--lime); box-shadow: 0 0 8px var(--lime-glow); }
 
-    /* ── Buttons ── */
     .btn {
-      display: inline-flex;
-      align-items: center;
-      gap: 4px;
-      cursor: pointer;
-      border: var(--border-w) solid var(--border-color);
-      border-radius: var(--radius);
-      font-family: var(--font-display);
-      font-weight: 700;
-      font-size: 11px;
-      letter-spacing: 1px;
-      text-transform: uppercase;
-      padding: 5px 14px;
-      box-shadow: var(--shadow-sm);
-      transition: transform .08s, box-shadow .08s;
-      white-space: nowrap;
+      display: inline-flex; align-items: center; gap: 4px; cursor: pointer;
+      border: var(--border-w) solid; border-radius: var(--radius);
+      font-family: var(--font-display); font-weight: 700; font-size: 11px;
+      letter-spacing: 1px; text-transform: uppercase; padding: 5px 14px;
+      transition: all .1s; white-space: nowrap;
     }
-    .btn:hover {
-      transform: translate(-1px, -1px);
-      box-shadow: 5px 5px 0 var(--dark);
-    }
-    .btn:active {
-      transform: translate(2px, 2px);
-      box-shadow: 1px 1px 0 var(--dark);
-    }
-    .btn-lime {
-      background: var(--lime);
-      color: var(--dark);
-    }
-    .btn-cyan {
-      background: var(--cyan);
-      color: var(--dark);
-    }
-    .btn-red {
-      background: var(--red);
-      color: #fff;
-    }
-    .btn-sm {
-      padding: 3px 10px;
-      font-size: 10px;
-      box-shadow: 2px 2px 0 var(--dark);
-    }
-    .btn-sm:hover { box-shadow: 3px 3px 0 var(--dark); }
-    .btn:disabled { opacity: .4; pointer-events: none; }
+    .btn:active { transform: translate(2px, 2px); }
+    .btn-lime { background: var(--bg); border-color: var(--lime); color: var(--lime); box-shadow: 3px 3px 0 var(--lime-glow); }
+    .btn-lime:hover { background: var(--lime); color: var(--bg); box-shadow: 3px 3px 0 var(--lime-glow), 0 0 15px var(--lime-glow); }
+    .btn-cyan { background: var(--bg); border-color: var(--cyan); color: var(--cyan); box-shadow: 3px 3px 0 var(--cyan-glow); }
+    .btn-cyan:hover { background: var(--cyan); color: var(--bg); box-shadow: 3px 3px 0 var(--cyan-glow), 0 0 15px var(--cyan-glow); }
+    .btn-red { background: var(--bg); border-color: var(--red); color: var(--red); box-shadow: 3px 3px 0 rgba(255, 51, 85, .2); }
+    .btn-red:hover { background: var(--red); color: #fff; box-shadow: 3px 3px 0 rgba(255, 51, 85, .2), 0 0 15px rgba(255, 51, 85, .2); }
+    .btn-sm { padding: 3px 10px; font-size: 10px; }
+    .btn:disabled { opacity: .35; pointer-events: none; }
 
-    /* ── Schedule Form ── */
-    .sched-form {
-      display: flex;
-      gap: 10px;
-      align-items: end;
-      flex-wrap: wrap;
+    .sched-form { display: flex; gap: 10px; align-items: end; flex-wrap: wrap; }
+    .field { display: flex; flex-direction: column; gap: 4px; }
+    .field-label { font-family: var(--font-display); font-size: 10px; font-weight: 600; color: var(--text-dim); text-transform: uppercase; letter-spacing: 1.5px; }
+    .field select, .field input {
+      background: var(--bg); border: 2px solid rgba(0, 229, 255, .25);
+      border-radius: var(--radius); color: var(--text);
+      font-family: var(--font-code); font-size: 12px; padding: 6px 10px;
     }
-    .field {
-      display: flex;
-      flex-direction: column;
-      gap: 4px;
-    }
-    .field-label {
-      font-family: var(--font-display);
-      font-size: 10px;
-      font-weight: 600;
-      color: var(--text-dim);
-      text-transform: uppercase;
-      letter-spacing: 1.5px;
-    }
-    .field select,
-    .field input {
-      background: var(--surface);
-      border: 2px solid var(--border-color);
-      border-radius: var(--radius);
-      color: var(--text);
-      font-family: var(--font-mono);
-      font-size: 12px;
-      padding: 6px 10px;
-    }
-    .field select:focus,
-    .field input:focus {
-      outline: none;
-      border-color: var(--cyan-dim);
-      box-shadow: 0 0 0 2px rgba(0, 229, 255, .25);
-    }
+    .field select:focus, .field input:focus { outline: none; border-color: var(--cyan); box-shadow: 0 0 10px var(--cyan-glow); }
     .field select { cursor: pointer; }
+    .field select option { background: var(--surface); }
 
-    /* ── Table ── */
-    .tbl {
-      width: 100%;
-      border-collapse: collapse;
-      font-size: 12px;
-    }
+    .tbl { width: 100%; border-collapse: collapse; font-size: 12px; }
     .tbl th {
-      text-align: left;
-      font-family: var(--font-display);
-      font-size: 10px;
-      font-weight: 700;
-      color: var(--lime);
-      text-transform: uppercase;
-      letter-spacing: 1.5px;
-      padding: 8px 10px;
-      background: var(--dark);
-      border-bottom: 2px solid var(--dark);
+      text-align: left; font-family: var(--font-display); font-size: 10px; font-weight: 700;
+      text-transform: uppercase; letter-spacing: 1.5px; padding: 8px 10px; border-bottom: 2px solid;
     }
     .tbl th:first-child { border-radius: var(--radius) 0 0 0; }
     .tbl th:last-child { border-radius: 0 var(--radius) 0 0; }
-    .tbl td {
-      padding: 7px 10px;
-      border-bottom: 1.5px solid #e0ddd6;
-      vertical-align: middle;
-    }
-    .tbl tbody tr {
-      transition: background .1s;
-    }
-    .tbl tbody tr:hover {
-      background: rgba(200, 255, 0, .08);
-    }
-    /* Terminal-style cron code */
+    .tbl.cyan-tbl th { color: var(--cyan); border-bottom-color: rgba(0, 229, 255, .3); background: rgba(0, 229, 255, .05); }
+    .tbl.mag-tbl th { color: var(--magenta); border-bottom-color: rgba(255, 45, 138, .3); background: rgba(255, 45, 138, .05); }
+    .tbl td { padding: 7px 10px; border-bottom: 1px solid rgba(255, 255, 255, .05); vertical-align: middle; }
+    .tbl tbody tr { transition: background .1s; }
+    .tbl tbody tr:hover { background: rgba(255, 255, 255, .03); }
     .tbl code {
-      display: inline-block;
-      background: var(--dark);
-      color: var(--lime);
-      padding: 2px 8px;
-      border-radius: 3px;
-      font-size: 11px;
-      font-family: var(--font-mono);
-      letter-spacing: .5px;
+      display: inline-block; background: var(--bg); color: var(--lime);
+      padding: 2px 8px; border-radius: 3px; border: 1px solid rgba(200, 255, 0, .2); font-size: 11px;
     }
 
-    /* ── Badges ── */
     .badge {
-      display: inline-block;
-      padding: 2px 10px;
-      border-radius: 3px;
-      font-family: var(--font-display);
-      font-size: 10px;
-      font-weight: 700;
-      letter-spacing: 1px;
-      text-transform: uppercase;
-      border: 2px solid var(--border-color);
+      display: inline-block; padding: 2px 9px; border-radius: 3px;
+      font-family: var(--font-display); font-size: 10px; font-weight: 700;
+      letter-spacing: 1px; text-transform: uppercase; border: 2px solid;
     }
-    .badge-ok {
-      background: var(--lime);
-      color: var(--dark);
-    }
-    .badge-fail {
-      background: var(--red);
-      color: #fff;
-    }
+    .badge-ok { border-color: var(--lime); color: var(--lime); background: var(--lime-dim); text-shadow: 0 0 6px var(--lime-glow); }
+    .badge-fail { border-color: var(--red); color: var(--red); background: rgba(255, 51, 85, .1); text-shadow: 0 0 6px rgba(255, 51, 85, .3); }
 
-    /* ── Empty ── */
-    .empty {
-      color: var(--text-dim);
-      text-align: center;
-      padding: 20px 14px;
-      font-size: 12px;
-      border: 2px dashed #c8c4bb;
-      border-radius: var(--radius);
-      background: rgba(0,0,0,.02);
-    }
+    .empty { color: var(--text-dim); text-align: center; padding: 22px 14px; font-size: 12px; border: 2px dashed rgba(255, 255, 255, .08); border-radius: var(--radius); }
 
-    /* ── Output cell ── */
     .output-cell {
-      max-width: 280px;
-      overflow: hidden;
-      text-overflow: ellipsis;
-      white-space: nowrap;
-      font-size: 11px;
-      color: var(--text-dim);
-      cursor: pointer;
+      max-width: 260px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+      font-size: 11px; color: var(--text-dim); cursor: pointer;
     }
-    .output-cell:hover {
-      color: var(--cyan);
-    }
+    .output-cell:hover { color: var(--cyan); }
 
-    /* ── Log Modal ── */
     .modal-overlay {
-      position: fixed;
-      inset: 0;
-      background: rgba(26, 26, 46, .6);
-      backdrop-filter: blur(3px);
-      z-index: 2000;
-      display: flex;
-      align-items: center;
-      justify-content: center;
+      position: fixed; inset: 0; background: rgba(12, 12, 30, .7);
+      backdrop-filter: blur(4px); z-index: 2000;
+      display: flex; align-items: center; justify-content: center;
       animation: modalFadeIn .15s ease-out;
     }
-    @keyframes modalFadeIn {
-      from { opacity: 0; }
-      to { opacity: 1; }
-    }
+    @keyframes modalFadeIn { from{opacity:0} to{opacity:1} }
     .modal-box {
       background: var(--surface);
-      border: var(--border-w) solid var(--border-color);
+      border: var(--border-w) solid var(--cyan);
       border-radius: var(--radius);
-      box-shadow: 8px 8px 0 var(--dark);
-      width: 90%;
-      max-width: 700px;
-      max-height: 80vh;
-      display: flex;
-      flex-direction: column;
+      box-shadow: 8px 8px 0 var(--cyan-glow), 0 0 40px rgba(0, 229, 255, .08);
+      width: 90%; max-width: 700px; max-height: 80vh;
+      display: flex; flex-direction: column;
       animation: modalSlideIn .15s ease-out;
     }
-    @keyframes modalSlideIn {
-      from { opacity: 0; transform: translateY(12px); }
-      to { opacity: 1; transform: translateY(0); }
-    }
+    @keyframes modalSlideIn { from{opacity:0;transform:translateY(12px)} to{opacity:1;transform:translateY(0)} }
     .modal-header {
-      display: flex;
-      align-items: center;
-      justify-content: space-between;
-      padding: 10px 16px;
-      background: var(--dark);
-      border-bottom: 2px solid var(--dark);
+      display: flex; align-items: center; justify-content: space-between;
+      padding: 10px 16px; background: var(--bg);
+      border-bottom: 2px solid rgba(0, 229, 255, .2);
       border-radius: var(--radius) var(--radius) 0 0;
     }
     .modal-title {
-      font-family: var(--font-display);
-      font-size: 11px;
-      font-weight: 700;
-      color: var(--lime);
-      text-transform: uppercase;
-      letter-spacing: 2px;
-      display: flex;
-      align-items: center;
-      gap: 8px;
+      font-family: var(--font-display); font-size: 11px; font-weight: 700;
+      color: var(--cyan); text-transform: uppercase; letter-spacing: 2px;
+      display: flex; align-items: center; gap: 8px;
     }
     .modal-close {
-      background: var(--red);
-      color: #fff;
-      border: 2px solid var(--border-color);
-      border-radius: 3px;
-      font-family: var(--font-display);
-      font-weight: 700;
-      font-size: 11px;
-      padding: 2px 10px;
-      cursor: pointer;
-      letter-spacing: 1px;
-      transition: transform .08s, box-shadow .08s;
-      box-shadow: 2px 2px 0 rgba(0,0,0,.3);
+      background: var(--bg); color: var(--red); border: 2px solid var(--red);
+      border-radius: 3px; font-family: var(--font-display); font-weight: 700;
+      font-size: 11px; padding: 2px 10px; cursor: pointer; letter-spacing: 1px;
+      box-shadow: 2px 2px 0 rgba(255, 51, 85, .2); transition: all .1s;
     }
-    .modal-close:hover {
-      transform: translate(-1px, -1px);
-      box-shadow: 3px 3px 0 rgba(0,0,0,.3);
-    }
-    .modal-body {
-      padding: 16px;
-      overflow-y: auto;
-      flex: 1;
-    }
+    .modal-close:hover { background: var(--red); color: #fff; }
+    .modal-body { padding: 16px; overflow-y: auto; flex: 1; }
     .modal-log {
-      background: var(--dark);
-      color: #d4d4d4;
-      font-family: var(--font-mono);
-      font-size: 12px;
-      line-height: 1.6;
-      padding: 14px;
-      border-radius: var(--radius);
-      border: 2px solid var(--dark-mid);
-      white-space: pre-wrap;
-      word-break: break-word;
-      min-height: 80px;
-      max-height: 55vh;
-      overflow-y: auto;
-    }
-    .modal-log-live {
-      border-color: var(--cyan);
-      box-shadow: 0 0 8px rgba(0, 229, 255, .15);
+      background: var(--bg); color: var(--text); font-family: var(--font-code);
+      font-size: 12px; line-height: 1.6; padding: 14px; border-radius: var(--radius);
+      border: 2px solid rgba(0, 229, 255, .15); white-space: pre-wrap;
+      word-break: break-word; min-height: 80px;
     }
 
-    /* ── Running badge ── */
-    .badge-run {
-      background: var(--cyan);
-      color: var(--dark);
-      animation: pulse 2s ease-in-out infinite;
-    }
-    .running-row {
-      background: rgba(0, 229, 255, .06);
-    }
-    .running-row:hover {
-      background: rgba(0, 229, 255, .12) !important;
-    }
-    .running-output {
-      max-width: 280px;
-      overflow: hidden;
-      text-overflow: ellipsis;
-      white-space: nowrap;
-      font-size: 11px;
-      color: var(--cyan-dim);
-      cursor: pointer;
-    }
-    .running-output:hover {
-      color: var(--cyan);
-    }
-
-    /* ── Spinner ── */
     .spinner {
-      display: inline-block;
-      width: 12px;
-      height: 12px;
-      border: 2px solid var(--bg-dots);
-      border-top-color: var(--dark);
-      border-radius: 50%;
-      animation: spin .5s linear infinite;
-      vertical-align: middle;
+      display: inline-block; width: 12px; height: 12px;
+      border: 2px solid rgba(200, 255, 0, .2); border-top-color: var(--lime);
+      border-radius: 50%; animation: spin .5s linear infinite;
     }
     @keyframes spin { to { transform: rotate(360deg); } }
 
-    /* ── Toast ── */
-    .toast-container {
-      position: fixed;
-      bottom: 16px;
-      right: 16px;
-      z-index: 1000;
-      display: flex;
-      flex-direction: column;
-      gap: 8px;
-    }
+    .toast-container { position: fixed; bottom: 16px; right: 16px; z-index: 1000; display: flex; flex-direction: column; gap: 8px; }
     .toast {
-      font-family: var(--font-mono);
-      font-size: 12px;
-      padding: 8px 14px;
-      border: var(--border-w) solid var(--border-color);
-      border-radius: var(--radius);
-      box-shadow: var(--shadow-sm);
-      animation: toastIn .2s ease-out;
-      max-width: 320px;
+      font-family: var(--font-code); font-size: 12px; padding: 8px 14px;
+      border: var(--border-w) solid; border-radius: var(--radius);
+      animation: toastIn .2s ease-out; max-width: 320px;
     }
-    .toast-ok { background: var(--lime); color: var(--dark); }
-    .toast-err { background: var(--red); color: #fff; }
-    @keyframes toastIn {
-      from { opacity: 0; transform: translateY(8px); }
-      to { opacity: 1; transform: translateY(0); }
-    }
+    .toast-ok { border-color: var(--lime); color: var(--lime); background: var(--surface); box-shadow: 3px 3px 0 var(--lime-glow); }
+    .toast-err { border-color: var(--red); color: var(--red); background: var(--surface); box-shadow: 3px 3px 0 rgba(255, 51, 85, .2); }
+    @keyframes toastIn { from{opacity:0;transform:translateY(8px)} to{opacity:1;transform:translateY(0)} }
 
-    /* ── Scrollbar ── */
     ::-webkit-scrollbar { width: 6px; }
     ::-webkit-scrollbar-track { background: var(--bg); }
-    ::-webkit-scrollbar-thumb { background: #c0bbb0; border-radius: 3px; }
-    ::-webkit-scrollbar-thumb:hover { background: #a0998e; }
+    ::-webkit-scrollbar-thumb { background: var(--surface-hi); border-radius: 3px; }
+    ::-webkit-scrollbar-thumb:hover { background: var(--text-dim); }
 
-    /* ── Responsive ── */
     @media (max-width: 900px) {
       .dashboard { grid-template-columns: 1fr; }
-      .sidebar { border-right: none; border-bottom: var(--border-w) solid var(--border-color); }
+      .sidebar { border-right: none; border-bottom: var(--border-w) solid rgba(0, 229, 255, .2); }
       .main-row { grid-template-columns: 1fr; }
       .sched-form { flex-direction: column; align-items: stretch; }
     }
@@ -620,31 +320,28 @@
 
 <header class="header">
   <div class="header-left">
-    <div class="logo">D-BiCron</div>
+    <span class="logo">D-BiCron</span>
     <span class="logo-sub">coredb scheduler</span>
   </div>
-  <div class="header-right">
-    <div class="status-pill">
-      <div class="status-dot"></div>
-      Online
-    </div>
+  <div class="status-pill">
+    <span class="status-dot"></span>
+    Online
   </div>
 </header>
 
 <div class="dashboard">
   <aside class="sidebar">
     <div class="stitle">
-      <span class="stitle-icon lime">&gt;</span>
+      <span class="stitle-tag lime">&gt;_</span>
       Jobs <span class="count" id="job-count">0</span>
     </div>
     <div id="jobs-list"></div>
   </aside>
 
   <div class="main">
-    <!-- Schedule Form -->
     <div>
       <div class="stitle">
-        <span class="stitle-icon cyan">+</span>
+        <span class="stitle-tag cyan">+</span>
         Create Schedule
       </div>
       <div class="card">
@@ -671,21 +368,20 @@
       </div>
     </div>
 
-    <!-- Two-column row -->
     <div class="main-row">
       <div class="card">
         <div class="card-body">
           <div class="stitle">
-            <span class="stitle-icon yellow">&#9776;</span>
+            <span class="stitle-tag yel">&#9776;</span>
             Active Schedules <span class="count" id="sched-count">0</span>
           </div>
           <div id="schedules-list"></div>
         </div>
       </div>
-      <div class="card">
+      <div class="card mag-card">
         <div class="card-body">
           <div class="stitle">
-            <span class="stitle-icon magenta">&#9656;</span>
+            <span class="stitle-tag mag">&#9656;</span>
             Run History <span class="count" id="history-count">0</span>
           </div>
           <div id="history-list"></div>
@@ -699,7 +395,7 @@
   <div class="modal-box">
     <div class="modal-header">
       <div class="modal-title"><span id="log-modal-badge"></span> <span id="log-modal-job"></span> — <span id="log-modal-time"></span></div>
-      <button class="modal-close" onclick="closeLogModal()">✕ ESC</button>
+      <button class="modal-close" onclick="closeLogModal()">ESC</button>
     </div>
     <div class="modal-body">
       <div class="modal-log" id="log-modal-content"></div>
@@ -726,74 +422,20 @@ async function api(url, opts) {
   const res = await fetch(url, { headers: { "Content-Type": "application/json" }, ...opts });
   return res.json();
 }
-let liveLogInterval = null;
-let liveRunId = null;
-
 function openLogModal(h) {
-  stopLiveLog();
   const modal = document.getElementById("log-modal");
   document.getElementById("log-modal-badge").className = `badge ${h.success ? "badge-ok" : "badge-fail"}`;
   document.getElementById("log-modal-badge").textContent = h.success ? "OK" : "FAIL";
   document.getElementById("log-modal-job").textContent = h.jobName;
   document.getElementById("log-modal-time").textContent = new Date(h.finishedAt).toLocaleString();
   const content = document.getElementById("log-modal-content");
-  content.className = "modal-log";
   const parts = [];
   if (h.stdout) parts.push(h.stdout);
-  if (h.stderr) parts.push((h.stdout ? "\n── stderr ──\n" : "") + h.stderr);
+  if (h.stderr) parts.push((h.stdout ? "\n\u2500\u2500 stderr \u2500\u2500\n" : "") + h.stderr);
   content.textContent = parts.join("") || "(no output)";
   modal.style.display = "";
 }
-
-function openLiveLogModal(r) {
-  stopLiveLog();
-  const modal = document.getElementById("log-modal");
-  document.getElementById("log-modal-badge").className = "badge badge-run";
-  document.getElementById("log-modal-badge").textContent = "RUNNING";
-  document.getElementById("log-modal-job").textContent = r.jobName;
-  document.getElementById("log-modal-time").textContent = new Date(r.startedAt).toLocaleString();
-  const content = document.getElementById("log-modal-content");
-  content.className = "modal-log modal-log-live";
-  updateLiveContent(r);
-  modal.style.display = "";
-
-  liveRunId = r.runId;
-  liveLogInterval = setInterval(async () => {
-    try {
-      const res = await fetch(`/api/running/${liveRunId}`);
-      if (!res.ok) {
-        // Job finished — stop polling, refresh history
-        stopLiveLog();
-        content.className = "modal-log";
-        document.getElementById("log-modal-badge").className = "badge badge-ok";
-        document.getElementById("log-modal-badge").textContent = "DONE";
-        loadHistory();
-        return;
-      }
-      const data = await res.json();
-      updateLiveContent(data);
-    } catch { /* ignore fetch errors */ }
-  }, 1000);
-}
-
-function updateLiveContent(r) {
-  const content = document.getElementById("log-modal-content");
-  const parts = [];
-  if (r.stdout) parts.push(r.stdout);
-  if (r.stderr) parts.push((r.stdout ? "\n── stderr ──\n" : "") + r.stderr);
-  content.textContent = parts.join("") || "(waiting for output...)";
-  content.scrollTop = content.scrollHeight;
-}
-
-function stopLiveLog() {
-  if (liveLogInterval) { clearInterval(liveLogInterval); liveLogInterval = null; }
-  liveRunId = null;
-}
-
-function closeLogModal() {
-  stopLiveLog();
-  document.getElementById("log-modal").style.display = "none";
-}
+function closeLogModal() { document.getElementById("log-modal").style.display = "none"; }
 document.addEventListener("keydown", e => { if (e.key === "Escape") closeLogModal(); });
 
 function toast(msg, ok) {
@@ -802,40 +444,29 @@ function toast(msg, ok) {
   setTimeout(() => t.remove(), 3500);
 }
 
-// ── Jobs ──
 async function loadJobs() {
   const jobs = await api("/api/jobs");
   const el = document.getElementById("jobs-list");
   const sel = document.getElementById("sched-job");
   document.getElementById("job-count").textContent = jobs.length;
   clearEl(el); clearEl(sel);
-
   if (!jobs.length) { el.appendChild(makeEl("div", { className: "empty" }, "No jobs registered")); return; }
-
   jobs.forEach(j => {
     sel.appendChild(makeEl("option", { value: j.name }, j.label));
-
     const daysInput = makeEl("input", { type: "number", value: String(j.defaultArgs?.days ?? 1), min: "1" });
-
     const runBtn = makeEl("button", {
       className: "btn btn-lime btn-sm",
       onClick: async () => {
-        runBtn.disabled = true;
-        runBtn.textContent = "";
+        runBtn.disabled = true; runBtn.textContent = "";
         runBtn.appendChild(makeEl("span", { className: "spinner" }));
         try {
-          await api(`/api/jobs/${encodeURIComponent(j.name)}/run`, {
-            method: "POST",
-            body: JSON.stringify({ days: Number(daysInput.value) || 1 }),
-          });
+          await api(`/api/jobs/${encodeURIComponent(j.name)}/run`, { method: "POST", body: JSON.stringify({ days: Number(daysInput.value) || 1 }) });
           toast(`${j.label} completed`, true);
         } catch { toast(`${j.label} failed`, false); }
-        runBtn.disabled = false;
-        runBtn.textContent = "RUN";
+        runBtn.disabled = false; runBtn.textContent = "RUN";
         loadHistory();
       },
     }, "RUN");
-
     el.appendChild(makeEl("div", { className: "job-card" }, [
       makeEl("div", { className: "job-name" }, j.label),
       makeEl("div", { className: "job-desc" }, j.description),
@@ -847,19 +478,14 @@ async function loadJobs() {
   });
 }
 
-// ── Schedules ──
 async function loadSchedules() {
   const list = await api("/api/schedules");
   const el = document.getElementById("schedules-list");
   document.getElementById("sched-count").textContent = list.length;
   clearEl(el);
-
   if (!list.length) { el.appendChild(makeEl("div", { className: "empty" }, "No active schedules")); return; }
-
-  el.appendChild(makeEl("table", { className: "tbl" }, [
-    makeEl("thead", null, [
-      makeEl("tr", null, [makeEl("th", null, "#"), makeEl("th", null, "Job"), makeEl("th", null, "Cron"), makeEl("th")]),
-    ]),
+  el.appendChild(makeEl("table", { className: "tbl cyan-tbl" }, [
+    makeEl("thead", null, [makeEl("tr", null, [makeEl("th", null, "#"), makeEl("th", null, "Job"), makeEl("th", null, "Cron"), makeEl("th")])]),
     makeEl("tbody", null, list.map(s =>
       makeEl("tr", null, [
         makeEl("td", null, String(s.id)),
@@ -888,62 +514,29 @@ async function deleteSchedule(id) {
   loadSchedules();
 }
 
-// ── History ──
 async function loadHistory() {
-  const [running, list] = await Promise.all([api("/api/running"), api("/api/history")]);
+  const list = await api("/api/history");
   const el = document.getElementById("history-list");
-  document.getElementById("history-count").textContent = running.length + list.length;
+  document.getElementById("history-count").textContent = list.length;
   clearEl(el);
-
-  if (!running.length && !list.length) { el.appendChild(makeEl("div", { className: "empty" }, "No runs yet")); return; }
-
-  const runningRows = running.map(r => {
-    const out = makeEl("td", { className: "running-output", onClick: () => openLiveLogModal(r) },
-      r.stdout.slice(-80) || r.stderr.slice(-80) || "(running...)");
-    out.title = "Click to view live log";
-    return makeEl("tr", { className: "running-row" }, [
-      makeEl("td", null, r.jobName),
-      makeEl("td", null, [makeEl("span", { className: "badge badge-run" }, [
-        makeEl("span", { className: "spinner", style: "margin-right:4px;width:10px;height:10px;border-width:1.5px" }),
-        document.createTextNode("RUN"),
-      ])]),
-      out,
-      makeEl("td", null, new Date(r.startedAt).toLocaleString()),
-    ]);
-  });
-
-  const historyRows = list.map(h => {
-    const out = makeEl("td", { className: "output-cell", onClick: () => openLogModal(h) }, h.success ? (h.stdout || "-") : (h.stderr || "-"));
-    out.title = "Click to view full log";
-    return makeEl("tr", null, [
-      makeEl("td", null, h.jobName),
-      makeEl("td", null, [makeEl("span", { className: `badge ${h.success ? "badge-ok" : "badge-fail"}` }, h.success ? "OK" : "FAIL")]),
-      out,
-      makeEl("td", null, new Date(h.finishedAt).toLocaleString()),
-    ]);
-  });
-
-  el.appendChild(makeEl("table", { className: "tbl" }, [
-    makeEl("thead", null, [
-      makeEl("tr", null, [makeEl("th", null, "Job"), makeEl("th", null, "Status"), makeEl("th", null, "Output"), makeEl("th", null, "Time")]),
-    ]),
-    makeEl("tbody", null, [...runningRows, ...historyRows]),
+  if (!list.length) { el.appendChild(makeEl("div", { className: "empty" }, "No runs yet")); return; }
+  el.appendChild(makeEl("table", { className: "tbl mag-tbl" }, [
+    makeEl("thead", null, [makeEl("tr", null, [makeEl("th", null, "Job"), makeEl("th", null, "Status"), makeEl("th", null, "Output"), makeEl("th", null, "Time")])]),
+    makeEl("tbody", null, list.map(h => {
+      const out = makeEl("td", { className: "output-cell", onClick: () => openLogModal(h) }, h.success ? (h.stdout || "-") : (h.stderr || "-"));
+      out.title = "Click to view full log";
+      return makeEl("tr", null, [
+        makeEl("td", null, h.jobName),
+        makeEl("td", null, [makeEl("span", { className: `badge ${h.success ? "badge-ok" : "badge-fail"}` }, h.success ? "OK" : "FAIL")]),
+        out,
+        makeEl("td", null, new Date(h.finishedAt).toLocaleString()),
+      ]);
+    })),
   ]));
 }
 
-loadJobs();
-loadSchedules();
-loadHistory();
-// Poll faster (3s) when jobs are running, otherwise every 30s
-let historyTimer = null;
-async function pollHistory() {
-  await loadHistory();
-  const running = document.querySelector(".running-row");
-  const interval = running ? 3000 : 30000;
-  historyTimer = setTimeout(pollHistory, interval);
-}
-pollHistory();
-setInterval(loadSchedules, 30000);
+loadJobs(); loadSchedules(); loadHistory();
+setInterval(() => { loadSchedules(); loadHistory(); }, 30000);
 </script>
 </body>
 </html>
