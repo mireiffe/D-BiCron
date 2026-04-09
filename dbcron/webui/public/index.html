@@ -42,13 +42,14 @@
 
     * { margin: 0; padding: 0; box-sizing: border-box; }
 
+    html, body { height: 100%; overflow: hidden; }
+
     body {
       font-family: var(--font-code);
       font-size: 13px;
       background: var(--bg);
       color: var(--text);
       line-height: 1.5;
-      min-height: 100vh;
       background-image:
         linear-gradient(30deg, var(--bg-mid) 12%, transparent 12.5%, transparent 87%, var(--bg-mid) 87.5%, var(--bg-mid)),
         linear-gradient(150deg, var(--bg-mid) 12%, transparent 12.5%, transparent 87%, var(--bg-mid) 87.5%, var(--bg-mid)),
@@ -113,7 +114,7 @@
     }
     @keyframes pulse { 0%,100%{opacity:1} 50%{opacity:.3} }
 
-    .dashboard { display: grid; grid-template-columns: 280px 1fr; min-height: calc(100vh - 52px); }
+    .dashboard { display: grid; grid-template-columns: 280px 1fr; height: calc(100vh - 52px); overflow: hidden; }
 
     .sidebar {
       background: rgba(20, 20, 48, .6);
@@ -123,7 +124,7 @@
       display: flex; flex-direction: column; gap: 12px; overflow-y: auto;
     }
 
-    .main { padding: 18px 20px; display: flex; flex-direction: column; gap: 18px; }
+    .main { padding: 18px 20px; display: flex; flex-direction: column; gap: 18px; overflow-y: auto; }
 
     .tab-bar { display: flex; gap: 4px; }
     .tab-btn {
@@ -265,7 +266,7 @@
     .empty { color: var(--text-dim); text-align: center; padding: 22px 14px; font-size: 12px; border: 2px dashed rgba(255, 255, 255, .08); border-radius: var(--radius); }
 
     .output-cell {
-      max-width: 260px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+      max-width: 140px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
       font-size: 11px; color: var(--text-dim); cursor: pointer;
     }
     .output-cell:hover { color: var(--cyan); }
@@ -277,10 +278,12 @@
     .running-row { background: rgba(0, 229, 255, .04); }
     .running-row:hover { background: rgba(0, 229, 255, .08) !important; }
     .running-output {
-      max-width: 260px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+      max-width: 140px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
       font-size: 11px; color: var(--cyan-dim); cursor: pointer;
     }
     .running-output:hover { color: var(--cyan); }
+
+    .time-cell { white-space: nowrap; }
 
     .pid-cell {
       font-family: var(--font-code); font-size: 11px; color: var(--yellow);
@@ -678,7 +681,7 @@ async function loadHistory() {
         document.createTextNode("RUN"),
       ])]),
       out,
-      makeEl("td", null, new Date(r.startedAt).toLocaleString()),
+      makeEl("td", { className: "time-cell" }, new Date(r.startedAt).toLocaleString()),
       makeEl("td", null, [killBtn]),
     ]);
   });
@@ -691,7 +694,7 @@ async function loadHistory() {
       makePidCell(h.pid),
       makeEl("td", null, [makeEl("span", { className: `badge ${h.success ? "badge-ok" : "badge-fail"}` }, h.success ? "OK" : "FAIL")]),
       out,
-      makeEl("td", null, new Date(h.finishedAt).toLocaleString()),
+      makeEl("td", { className: "time-cell" }, new Date(h.finishedAt).toLocaleString()),
       makeEl("td"),
     ]);
   });
