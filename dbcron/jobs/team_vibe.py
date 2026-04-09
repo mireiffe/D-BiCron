@@ -96,6 +96,7 @@ class TeamVibeJob(Job):
     name = "team_vibe"
     label = "Team Vibe Check"
     description = "팀원들의 현재 상태를 랜덤으로 생성합니다"
+    default_args: dict = {}
 
     def run(self, **kwargs) -> JobResult:
         raw = os.getenv("TEAM_MEMBERS", "")

@@ -354,6 +354,44 @@
     .toast-err { border-color: var(--red); color: var(--red); background: var(--surface); box-shadow: 3px 3px 0 rgba(255, 51, 85, .2); }
     @keyframes toastIn { from{opacity:0;transform:translateY(8px)} to{opacity:1;transform:translateY(0)} }
 
+    .cron-help-btn {
+      background: none; border: 1.5px solid var(--text-dim); color: var(--text-dim);
+      border-radius: 50%; width: 18px; height: 18px; font-size: 11px; line-height: 14px;
+      text-align: center; cursor: pointer; transition: all .15s; padding: 0;
+      font-family: var(--font-display); font-weight: 700; flex-shrink: 0;
+    }
+    .cron-help-btn:hover { border-color: var(--cyan); color: var(--cyan); }
+
+    .cron-guide-box { border-color: var(--lime); box-shadow: 8px 8px 0 var(--lime-glow), 0 0 40px rgba(200, 255, 0, .08); }
+    .cron-guide h3 {
+      font-family: var(--font-display); font-size: 14px; font-weight: 700;
+      color: var(--lime); text-transform: uppercase; letter-spacing: 2px; margin: 0 0 12px;
+    }
+    .cron-guide h4 {
+      font-family: var(--font-display); font-size: 11px; font-weight: 700;
+      color: var(--cyan); text-transform: uppercase; letter-spacing: 1.5px; margin: 14px 0 6px;
+    }
+    .cron-guide p, .cron-guide li {
+      font-size: 12px; line-height: 1.7; color: var(--text);
+    }
+    .cron-guide code {
+      display: inline; background: var(--bg); color: var(--lime);
+      padding: 1px 6px; border-radius: 3px; border: 1px solid rgba(200, 255, 0, .2); font-size: 11px;
+    }
+    .cron-fields { display: flex; gap: 6px; justify-content: center; margin: 10px 0; }
+    .cron-field {
+      text-align: center; background: var(--bg); border: 1.5px solid rgba(200, 255, 0, .2);
+      border-radius: 3px; padding: 6px 8px; min-width: 52px;
+    }
+    .cron-field-val { font-family: var(--font-code); font-size: 14px; color: var(--lime); font-weight: 600; }
+    .cron-field-label { font-family: var(--font-display); font-size: 9px; color: var(--text-dim); text-transform: uppercase; letter-spacing: 1px; margin-top: 2px; }
+    .cron-ex-tbl { width: 100%; font-size: 12px; margin-top: 6px; }
+    .cron-ex-tbl td { padding: 4px 8px; border-bottom: 1px solid rgba(255,255,255,.05); }
+    .cron-ex-tbl td:first-child { white-space: nowrap; }
+    .cron-special { display: grid; grid-template-columns: auto 1fr; gap: 2px 12px; font-size: 12px; margin-top: 4px; }
+    .cron-special dt { color: var(--lime); font-weight: 600; }
+    .cron-special dd { color: var(--text); margin: 0; }
+
     ::-webkit-scrollbar { width: 6px; }
     ::-webkit-scrollbar-track { background: var(--bg); }
     ::-webkit-scrollbar-thumb { background: var(--surface-hi); border-radius: 3px; }
@@ -404,10 +442,10 @@
               <select id="sched-job"></select>
             </div>
             <div class="field">
-              <span class="field-label">Cron</span>
+              <span class="field-label" style="display:flex;align-items:center;gap:5px">Cron <button class="cron-help-btn" onclick="openCronGuide()" title="Cron syntax guide">?</button></span>
               <input id="sched-cron" type="text" placeholder="*/10 * * * *" value="*/10 * * * *" style="width:140px" />
             </div>
-            <div class="field">
+            <div class="field" id="sched-days-field">
               <span class="field-label">Days</span>
               <input id="sched-days" type="number" value="1" min="1" style="width:60px" />
             </div>
@@ -455,6 +493,50 @@
   </div>
 </div>
 
+<div class="modal-overlay" id="cron-guide-modal" style="display:none" onclick="if(event.target===this)closeCronGuide()">
+  <div class="modal-box cron-guide-box" style="max-width:560px">
+    <div class="modal-header" style="border-bottom-color:rgba(200,255,0,.2)">
+      <div class="modal-title" style="color:var(--lime)">Cron Expression Guide</div>
+      <button class="modal-close" onclick="closeCronGuide()">ESC</button>
+    </div>
+    <div class="modal-body cron-guide">
+      <h3>Cron 표현식이란?</h3>
+      <p>5개의 필드로 실행 시점을 지정합니다. 각 필드는 공백으로 구분합니다.</p>
+
+      <div class="cron-fields">
+        <div class="cron-field"><div class="cron-field-val">*</div><div class="cron-field-label">분</div></div>
+        <div class="cron-field"><div class="cron-field-val">*</div><div class="cron-field-label">시</div></div>
+        <div class="cron-field"><div class="cron-field-val">*</div><div class="cron-field-label">일</div></div>
+        <div class="cron-field"><div class="cron-field-val">*</div><div class="cron-field-label">월</div></div>
+        <div class="cron-field"><div class="cron-field-val">*</div><div class="cron-field-label">요일</div></div>
+      </div>
+
+      <h4>특수 문자</h4>
+      <dl class="cron-special">
+        <dt><code>*</code></dt><dd>모든 값 (매 분, 매 시, ...)</dd>
+        <dt><code>*/N</code></dt><dd>N 간격 (예: <code>*/10</code> → 10분마다)</dd>
+        <dt><code>N-M</code></dt><dd>범위 (예: <code>9-17</code> → 9시~17시)</dd>
+        <dt><code>N,M</code></dt><dd>목록 (예: <code>1,15</code> → 1일과 15일)</dd>
+      </dl>
+
+      <h4>요일 값</h4>
+      <p><code>0</code>=일, <code>1</code>=월, <code>2</code>=화, <code>3</code>=수, <code>4</code>=목, <code>5</code>=금, <code>6</code>=토</p>
+
+      <h4>자주 쓰는 예시</h4>
+      <table class="cron-ex-tbl">
+        <tr><td><code>*/10 * * * *</code></td><td>10분마다</td></tr>
+        <tr><td><code>0 * * * *</code></td><td>매 시 정각</td></tr>
+        <tr><td><code>30 9 * * *</code></td><td>매일 오전 9:30</td></tr>
+        <tr><td><code>0 9 * * 1-5</code></td><td>평일 오전 9시</td></tr>
+        <tr><td><code>0 0 * * *</code></td><td>매일 자정</td></tr>
+        <tr><td><code>0 9,18 * * *</code></td><td>매일 9시, 18시</td></tr>
+        <tr><td><code>0 0 1 * *</code></td><td>매월 1일 자정</td></tr>
+        <tr><td><code>0 0 * * 0</code></td><td>매주 일요일 자정</td></tr>
+      </table>
+    </div>
+  </div>
+</div>
+
 <div class="toast-container" id="toasts"></div>
 
 <script>
@@ -476,6 +558,17 @@ async function api(url, opts) {
 }
 let liveLogInterval = null;
 let liveRunId = null;
+let jobsCache = [];
+
+function openCronGuide() { document.getElementById("cron-guide-modal").style.display = ""; }
+function closeCronGuide() { document.getElementById("cron-guide-modal").style.display = "none"; }
+
+function updateSchedDaysField() {
+  const sel = document.getElementById("sched-job");
+  const field = document.getElementById("sched-days-field");
+  const j = jobsCache.find(j => j.name === sel.value);
+  field.style.display = (j && j.defaultArgs && "days" in j.defaultArgs) ? "" : "none";
+}
 
 function switchTab(name) {
   document.getElementById('tab-history').className = 'card mag-card tab-panel' + (name === 'history' ? ' tab-visible' : '');
@@ -560,7 +653,7 @@ function closeLogModal() {
   stopLiveLog();
   document.getElementById("log-modal").style.display = "none";
 }
-document.addEventListener("keydown", e => { if (e.key === "Escape") closeLogModal(); });
+document.addEventListener("keydown", e => { if (e.key === "Escape") { closeLogModal(); closeCronGuide(); } });
 
 function toast(msg, ok) {
   const t = makeEl("div", { className: `toast ${ok ? "toast-ok" : "toast-err"}` }, msg);
@@ -570,6 +663,7 @@ function toast(msg, ok) {
 
 async function loadJobs() {
   const jobs = await api("/api/jobs");
+  jobsCache = jobs;
   const el = document.getElementById("jobs-list");
   const sel = document.getElementById("sched-job");
   document.getElementById("job-count").textContent = jobs.length;
@@ -577,13 +671,15 @@ async function loadJobs() {
   if (!jobs.length) { el.appendChild(makeEl("div", { className: "empty" }, "No jobs registered")); return; }
   jobs.forEach(j => {
     sel.appendChild(makeEl("option", { value: j.name }, j.label));
-    const daysInput = makeEl("input", { type: "number", value: String(j.defaultArgs?.days ?? 1), min: "1" });
+    const hasDays = j.defaultArgs && "days" in j.defaultArgs;
+    const daysInput = hasDays ? makeEl("input", { type: "number", value: String(j.defaultArgs.days ?? 1), min: "1" }) : null;
     const runBtn = makeEl("button", {
       className: "btn btn-lime btn-sm",
       onClick: async () => {
         runBtn.disabled = true;
         try {
-          await api(`/api/jobs/${encodeURIComponent(j.name)}/run`, { method: "POST", body: JSON.stringify({ days: Number(daysInput.value) || 1 }) });
+          const body = hasDays ? { days: Number(daysInput.value) || 1 } : {};
+          await api(`/api/jobs/${encodeURIComponent(j.name)}/run`, { method: "POST", body: JSON.stringify(body) });
           toast(`${j.label} started`, true);
           switchTab('history');
           loadHistory();
@@ -591,15 +687,17 @@ async function loadJobs() {
         runBtn.disabled = false;
       },
     }, "RUN");
+    const actions = [];
+    if (hasDays) actions.push(makeEl("div", { className: "field-inline" }, [makeEl("label", null, "days"), daysInput]));
+    actions.push(runBtn);
     el.appendChild(makeEl("div", { className: "job-card" }, [
       makeEl("div", { className: "job-name" }, j.label),
       makeEl("div", { className: "job-desc" }, j.description),
-      makeEl("div", { className: "job-actions" }, [
-        makeEl("div", { className: "field-inline" }, [makeEl("label", null, "days"), daysInput]),
-        runBtn,
-      ]),
+      makeEl("div", { className: "job-actions" }, actions),
     ]));
   });
+  sel.addEventListener("change", updateSchedDaysField);
+  updateSchedDaysField();
 }
 
 async function loadSchedules() {
@@ -624,9 +722,13 @@ async function loadSchedules() {
 async function createSchedule() {
   const jobName = document.getElementById("sched-job").value;
   const cronExpr = document.getElementById("sched-cron").value;
-  const days = Number(document.getElementById("sched-days").value) || 1;
+  const j = jobsCache.find(j => j.name === jobName);
+  const args = {};
+  if (j && j.defaultArgs && "days" in j.defaultArgs) {
+    args.days = Number(document.getElementById("sched-days").value) || 1;
+  }
   try {
-    await api("/api/schedules", { method: "POST", body: JSON.stringify({ jobName, cronExpr, args: { days } }) });
+    await api("/api/schedules", { method: "POST", body: JSON.stringify({ jobName, cronExpr, args }) });
     toast("Schedule registered", true);
     switchTab('schedules');
   } catch { toast("Failed to register", false); }
