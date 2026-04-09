@@ -32,6 +32,7 @@ try {
 // -------------------------------------------------------------------
 const DATA_DIR = path.join(PROJECT_ROOT, "data");
 const SCHEDULES_FILE = path.join(DATA_DIR, "schedules.json");
+const RUNNING_FILE = path.join(DATA_DIR, "running.json");
 
 function loadSchedules() {
   try {
@@ -52,11 +53,58 @@ function saveSchedules() {
   fs.writeFileSync(SCHEDULES_FILE, data, "utf-8");
 }
 
+function loadRunning() {
+  try {
+    const raw = fs.readFileSync(RUNNING_FILE, "utf-8");
+    return JSON.parse(raw);
+  } catch {
+    return { nextRunId: 1, jobs: [] };
+  }
+}
+
+function saveRunning() {
+  const jobs = [];
+  for (const [, r] of runningJobs) {
+    jobs.push({ runId: r.runId, jobName: r.jobName, args: r.args, pid: r.pid, startedAt: r.startedAt });
+  }
+  fs.mkdirSync(DATA_DIR, { recursive: true });
+  fs.writeFileSync(RUNNING_FILE, JSON.stringify({ nextRunId, jobs }, null, 2), "utf-8");
+}
+
+function isProcessAlive(pid) {
+  try { process.kill(pid, 0); return true; } catch { return false; }
+}
+
 // Runtime state
 const scheduledTasks = new Map(); // id -> { cron, jobName, args, task, createdAt }
 const runningJobs = new Map();    // runId -> { jobName, args, startedAt, stdout, stderr }
 const runHistory = []; // last 100 results
-let nextRunId = 1;
+
+// Restore running jobs from previous session
+const persistedRunning = loadRunning();
+let nextRunId = persistedRunning.nextRunId;
+for (const r of persistedRunning.jobs) {
+  if (isProcessAlive(r.pid)) {
+    runningJobs.set(r.runId, {
+      runId: r.runId, jobName: r.jobName, args: r.args,
+      pid: r.pid, startedAt: r.startedAt,
+      stdout: "(recovered — logs unavailable)", stderr: "",
+      recovered: true,
+    });
+  } else {
+    runHistory.unshift({
+      runId: r.runId, jobName: r.jobName, args: r.args, pid: r.pid,
+      success: false, stdout: "", stderr: "(server restarted while job was running)",
+      finishedAt: new Date().toISOString(),
+    });
+  }
+}
+if (persistedRunning.jobs.length) {
+  const alive = [...runningJobs.values()].filter((r) => r.recovered).length;
+  const dead = persistedRunning.jobs.length - alive;
+  console.log(`Recovered running jobs: ${alive} alive, ${dead} finished`);
+  saveRunning();
+}
 
 // Restore persisted schedules
 const persisted = loadSchedules();
@@ -80,7 +128,19 @@ if (persisted.schedules.length) {
 // -------------------------------------------------------------------
 // Helpers
 // -------------------------------------------------------------------
+function isJobRunning(jobName) {
+  for (const [, r] of runningJobs) {
+    if (r.jobName === jobName) return true;
+  }
+  return false;
+}
+
 function startJob(jobName, args = {}) {
+  if (isJobRunning(jobName)) {
+    console.log(`Skipped ${jobName}: already running`);
+    return null;
+  }
+
   const runId = nextRunId++;
   const tracker = {
     runId,
@@ -104,9 +164,11 @@ function startJob(jobName, args = {}) {
   );
   tracker.pid = proc.pid;
   tracker.proc = proc;
+  saveRunning();
 
   proc.on("error", (err) => {
     runningJobs.delete(runId);
+    saveRunning();
     runHistory.unshift({
       runId, jobName, args, pid: proc.pid,
       success: false, stdout: "", stderr: err.message,
@@ -120,6 +182,7 @@ function startJob(jobName, args = {}) {
 
   proc.on("close", (code) => {
     runningJobs.delete(runId);
+    saveRunning();
     runHistory.unshift({
       runId, jobName, args, pid: proc.pid,
       success: code === 0,
@@ -149,6 +212,7 @@ app.post("/api/jobs/:name/run", (req, res) => {
 
   const args = { ...jobMeta.defaultArgs, ...req.body };
   const runId = startJob(req.params.name, args);
+  if (runId === null) return res.status(409).json({ error: "Job already running" });
   res.json({ runId });
 });
 
@@ -220,9 +284,16 @@ app.get("/api/running/:id", (req, res) => {
 app.delete("/api/running/:id", (req, res) => {
   const r = runningJobs.get(Number(req.params.id));
   if (!r) return res.status(404).json({ error: "Not running" });
-  r.proc.kill("SIGTERM");
-  // Give it 3s, then force kill
-  setTimeout(() => { try { r.proc.kill("SIGKILL"); } catch {} }, 3000);
+  if (r.proc) {
+    r.proc.kill("SIGTERM");
+    setTimeout(() => { try { r.proc.kill("SIGKILL"); } catch {} }, 3000);
+  } else {
+    // Recovered job — kill by PID directly
+    try { process.kill(r.pid, "SIGTERM"); } catch {}
+    setTimeout(() => { try { process.kill(r.pid, "SIGKILL"); } catch {} }, 3000);
+    runningJobs.delete(Number(req.params.id));
+    saveRunning();
+  }
   res.json({ killed: r.runId, pid: r.pid });
 });
 
