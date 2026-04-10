@@ -12,6 +12,11 @@ dependencies = [
     "boto3>=1.42.85",
 ]
 
+[project.optional-dependencies]
+mssql = ["pymssql>=2.2"]
+clickhouse = ["clickhouse-sqlalchemy>=0.3", "clickhouse-driver>=0.2"]
+all-drivers = ["pymssql>=2.2", "clickhouse-sqlalchemy>=0.3", "clickhouse-driver>=0.2"]
+
 [project.scripts]
 dbcron = "dbcron.main:main"
 

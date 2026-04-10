@@ -3,7 +3,7 @@
 <head>
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-  <title>D-BiCron // coredb scheduler</title>
+  <title>D-BiCron // data infrastructure dashboard</title>
   <link rel="preconnect" href="https://fonts.googleapis.com" />
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
   <link href="https://fonts.googleapis.com/css2?family=Rajdhani:wght@400;500;600;700&family=Fira+Code:wght@400;500;600&display=swap" rel="stylesheet" />
@@ -397,10 +397,155 @@
     ::-webkit-scrollbar-thumb { background: var(--surface-hi); border-radius: 3px; }
     ::-webkit-scrollbar-thumb:hover { background: var(--text-dim); }
 
+    /* ── Nav buttons ── */
+    .nav-btns { display: flex; gap: 4px; }
+    .nav-btn {
+      cursor: pointer; background: var(--bg); border: 2px solid rgba(255,255,255,.1);
+      border-radius: var(--radius); font-family: var(--font-display); font-weight: 700;
+      font-size: 11px; letter-spacing: 2px; text-transform: uppercase;
+      padding: 4px 16px; color: var(--text-dim); transition: all .15s;
+    }
+    .nav-btn:hover { color: var(--text); border-color: rgba(255,255,255,.25); }
+    .nav-btn.nav-active {
+      color: var(--cyan); border-color: var(--cyan);
+      background: var(--cyan-dim); box-shadow: 0 0 10px var(--cyan-glow);
+    }
+
+    /* ── View containers ── */
+    .view-container { height: calc(100vh - 52px); overflow: hidden; position: relative; }
+
+    /* ── Canvas view ── */
+    #pipeline-canvas { width: 100%; height: 100%; display: block; cursor: grab; }
+    #pipeline-canvas:active { cursor: grabbing; }
+
+    #canvas-toolbar {
+      position: absolute; top: 14px; left: 14px; z-index: 10;
+      display: flex; flex-direction: column; gap: 6px;
+    }
+    #canvas-toolbar .btn { min-width: 42px; justify-content: center; }
+
+    #canvas-snapshot-info {
+      position: absolute; bottom: 14px; left: 14px; z-index: 10;
+      font-family: var(--font-code); font-size: 10px; color: var(--text-dim);
+      background: rgba(18,18,42,.8); border: 1px solid rgba(255,255,255,.08);
+      border-radius: var(--radius); padding: 4px 10px;
+    }
+
+    #canvas-empty {
+      position: absolute; inset: 0; display: flex; flex-direction: column;
+      align-items: center; justify-content: center; gap: 14px; z-index: 5;
+    }
+    #canvas-empty .empty-msg {
+      font-family: var(--font-display); font-size: 16px; color: var(--text-dim);
+      letter-spacing: 2px; text-transform: uppercase;
+    }
+
+    #canvas-tooltip {
+      display: none; position: fixed; z-index: 100;
+      background: var(--surface); border: 2px solid var(--cyan);
+      border-radius: var(--radius); padding: 8px 12px;
+      box-shadow: 4px 4px 0 var(--cyan-glow);
+      font-family: var(--font-code); font-size: 11px; color: var(--text);
+      pointer-events: none; max-width: 300px;
+    }
+    #canvas-tooltip strong { color: var(--cyan); }
+    #canvas-tooltip .tt-rows { color: var(--lime); font-size: 10px; }
+    #canvas-tooltip .tt-pk { color: var(--yellow); font-size: 10px; }
+
+    /* ── Detail panel ── */
+    .detail-panel {
+      position: absolute; top: 0; right: 0; width: 380px; height: 100%;
+      background: rgba(30,30,66,.95); backdrop-filter: blur(10px);
+      border-left: var(--border-w) solid var(--cyan);
+      box-shadow: -6px 0 20px rgba(0,229,255,.08);
+      overflow-y: auto; z-index: 20;
+      transform: translateX(100%); transition: transform .25s ease;
+    }
+    .detail-panel.open { transform: translateX(0); }
+    .detail-header {
+      display: flex; align-items: center; gap: 8px; padding: 12px 16px;
+      background: var(--bg); border-bottom: 2px solid rgba(0,229,255,.2);
+      position: sticky; top: 0; z-index: 1;
+    }
+    .detail-db-tag {
+      font-family: var(--font-display); font-size: 10px; font-weight: 700;
+      padding: 2px 8px; border-radius: 2px; letter-spacing: 1px;
+      text-transform: uppercase; border: 2px solid;
+    }
+    .detail-table-name {
+      font-family: var(--font-display); font-size: 14px; font-weight: 700;
+      color: var(--text-bright); flex: 1;
+    }
+    .detail-row-count {
+      font-family: var(--font-code); font-size: 11px; color: var(--lime);
+    }
+    .detail-section { padding: 12px 16px; border-bottom: 1px solid rgba(255,255,255,.05); }
+    .detail-section h4 {
+      font-family: var(--font-display); font-size: 11px; font-weight: 700;
+      color: var(--cyan); text-transform: uppercase; letter-spacing: 1.5px;
+      margin-bottom: 8px;
+    }
+    .detail-tbl { width: 100%; font-size: 11px; border-collapse: collapse; }
+    .detail-tbl th {
+      text-align: left; font-family: var(--font-display); font-size: 9px;
+      font-weight: 700; text-transform: uppercase; letter-spacing: 1px;
+      color: var(--text-dim); padding: 4px 6px;
+      border-bottom: 1px solid rgba(255,255,255,.1);
+    }
+    .detail-tbl td { padding: 3px 6px; border-bottom: 1px solid rgba(255,255,255,.03); color: var(--text); }
+    .detail-tbl .pk-badge {
+      font-size: 8px; font-weight: 700; color: var(--yellow); border: 1px solid var(--yellow);
+      border-radius: 2px; padding: 0 4px; margin-left: 4px;
+    }
+    .detail-tbl .fk-badge {
+      font-size: 8px; font-weight: 700; color: var(--magenta); border: 1px solid var(--magenta);
+      border-radius: 2px; padding: 0 4px; margin-left: 4px;
+    }
+
+    /* ── Canvas legend ── */
+    #canvas-legend {
+      position: absolute; bottom: 14px; right: 14px; z-index: 10;
+      background: rgba(18,18,42,.85); border: 1px solid rgba(255,255,255,.1);
+      border-radius: var(--radius); padding: 10px 14px;
+      font-family: var(--font-code); font-size: 10px;
+    }
+    .legend-item { display: flex; align-items: center; gap: 8px; margin-bottom: 4px; }
+    .legend-item:last-child { margin-bottom: 0; }
+    .legend-line {
+      width: 28px; height: 2px; border-radius: 1px;
+    }
+    .legend-line.pipeline { background: #ffd000; }
+    .legend-line.entry { background: #ff2d8a; border-style: dashed; border-width: 1px 0 0 0; height: 0; border-color: #ff2d8a; }
+    .legend-line.fk { border-top: 1px dotted rgba(0,229,255,.4); height: 0; }
+
+    /* ── DB management modal ── */
+    .db-modal-body { padding: 16px; overflow-y: auto; flex: 1; }
+    .db-form { display: flex; flex-direction: column; gap: 10px; }
+    .db-form-row { display: flex; gap: 10px; }
+    .db-form-row .field { flex: 1; }
+    .db-form .field input { width: 100%; }
+    .db-form .field input[type="color"] {
+      width: 36px; height: 30px; padding: 2px; cursor: pointer;
+      background: var(--bg); border: 2px solid rgba(0,229,255,.25); border-radius: var(--radius);
+    }
+    .db-list { margin-bottom: 16px; }
+    .db-list-item {
+      display: flex; align-items: center; gap: 10px; padding: 8px 12px;
+      border: 1px solid rgba(255,255,255,.06); border-radius: var(--radius);
+      margin-bottom: 6px; background: var(--bg); transition: border-color .15s;
+    }
+    .db-list-item:hover { border-color: rgba(255,255,255,.15); }
+    .db-list-color { width: 10px; height: 10px; border-radius: 50%; flex-shrink: 0; }
+    .db-list-info { flex: 1; min-width: 0; }
+    .db-list-label { font-family: var(--font-display); font-size: 12px; font-weight: 700; color: var(--text-bright); }
+    .db-list-meta { font-size: 10px; color: var(--text-dim); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+    .db-list-actions { display: flex; gap: 4px; flex-shrink: 0; }
+
     @media (max-width: 900px) {
       .dashboard { grid-template-columns: 1fr; }
       .sidebar { border-right: none; border-bottom: var(--border-w) solid rgba(0, 229, 255, .2); }
       .sched-form { flex-direction: column; align-items: stretch; }
+      .detail-panel { width: 100%; }
     }
   </style>
 </head>
@@ -411,7 +556,11 @@
 <header class="header">
   <div class="header-left">
     <span class="logo">D-BiCron</span>
-    <span class="logo-sub">coredb scheduler</span>
+    <span class="logo-sub">data infra dashboard</span>
+  </div>
+  <div class="nav-btns">
+    <button class="nav-btn nav-active" id="nav-canvas" onclick="switchView('canvas')">Canvas</button>
+    <button class="nav-btn" id="nav-cron" onclick="switchView('cron')">Cron</button>
   </div>
   <div class="status-pill">
     <span class="status-dot"></span>
@@ -419,6 +568,58 @@
   </div>
 </header>
 
+<!-- Canvas View (default) -->
+<div class="view-container" id="canvas-view">
+  <div id="canvas-toolbar">
+    <button class="btn btn-cyan btn-sm" onclick="canvasZoomIn()" title="Zoom in">+</button>
+    <button class="btn btn-cyan btn-sm" onclick="canvasZoomOut()" title="Zoom out">&minus;</button>
+    <button class="btn btn-cyan btn-sm" onclick="canvasFit()" title="Fit to view">FIT</button>
+    <button class="btn btn-lime btn-sm" onclick="refreshMetadata()" title="Refresh metadata">REFRESH</button>
+    <button class="btn btn-lime btn-sm" onclick="openDbModal()" title="Manage databases" style="margin-top:8px">DB</button>
+  </div>
+
+  <svg id="pipeline-canvas">
+    <defs>
+      <marker id="arrow-pipeline" viewBox="0 0 10 6" refX="10" refY="3" markerWidth="8" markerHeight="6" orient="auto">
+        <path d="M0,0 L10,3 L0,6" fill="#ffd000" />
+      </marker>
+      <marker id="arrow-entry" viewBox="0 0 10 6" refX="10" refY="3" markerWidth="8" markerHeight="6" orient="auto">
+        <path d="M0,0 L10,3 L0,6" fill="#ff2d8a" />
+      </marker>
+      <marker id="arrow-fk" viewBox="0 0 10 6" refX="10" refY="3" markerWidth="6" markerHeight="4" orient="auto">
+        <path d="M0,0 L10,3 L0,6" fill="#00e5ff" opacity="0.4" />
+      </marker>
+    </defs>
+  </svg>
+
+  <div id="canvas-empty" style="display:none">
+    <div class="empty-msg">No metadata snapshot available</div>
+    <button class="btn btn-lime" onclick="refreshMetadata()">Run Metadata Snapshot</button>
+  </div>
+
+  <div id="canvas-snapshot-info" style="display:none"></div>
+
+  <div id="canvas-legend">
+    <div class="legend-item"><div class="legend-line pipeline"></div><span style="color:var(--text-dim)">Pipeline (sync)</span></div>
+    <div class="legend-item"><div class="legend-line entry"></div><span style="color:var(--text-dim)">Entry Point</span></div>
+    <div class="legend-item"><div class="legend-line fk"></div><span style="color:var(--text-dim)">Foreign Key</span></div>
+  </div>
+
+  <div class="detail-panel" id="detail-panel">
+    <div class="detail-header">
+      <span class="detail-db-tag" id="detail-db-tag"></span>
+      <span class="detail-table-name" id="detail-table-name"></span>
+      <span class="detail-row-count" id="detail-row-count"></span>
+      <button class="modal-close" onclick="closeDetailPanel()" style="margin-left:auto">X</button>
+    </div>
+    <div id="detail-content"></div>
+  </div>
+</div>
+
+<div id="canvas-tooltip"></div>
+
+<!-- Cron View (secondary) -->
+<div class="view-container" id="cron-view" style="display:none">
 <div class="dashboard">
   <aside class="sidebar">
     <div class="stitle">
@@ -480,6 +681,7 @@
     </div>
   </div>
 </div>
+</div><!-- /cron-view -->
 
 <div class="modal-overlay" id="log-modal" style="display:none" onclick="if(event.target===this)closeLogModal()">
   <div class="modal-box">
@@ -537,8 +739,51 @@
   </div>
 </div>
 
+<div class="modal-overlay" id="db-modal" style="display:none" onclick="if(event.target===this)closeDbModal()">
+  <div class="modal-box" style="max-width:560px">
+    <div class="modal-header" style="border-bottom-color:rgba(200,255,0,.2)">
+      <div class="modal-title" style="color:var(--lime)">Database Management</div>
+      <button class="modal-close" onclick="closeDbModal()">ESC</button>
+    </div>
+    <div class="db-modal-body">
+      <div class="db-list" id="db-list"></div>
+      <div class="stitle"><span class="stitle-tag lime">+</span> Add Database</div>
+      <div class="db-form" id="db-form">
+        <div class="db-form-row">
+          <div class="field"><span class="field-label">ID (key)</span><input id="db-id" type="text" placeholder="mydb" /></div>
+          <div class="field">
+            <span class="field-label">Type</span>
+            <select id="db-type" onchange="onDbTypeChange()">
+              <option value="postgresql">PostgreSQL</option>
+              <option value="mssql">MSSQL</option>
+              <option value="sqlite">SQLite</option>
+              <option value="clickhouse">ClickHouse</option>
+            </select>
+          </div>
+          <div class="field"><span class="field-label">Label</span><input id="db-label" type="text" placeholder="My Database" /></div>
+          <div class="field" style="flex:0 0 50px"><span class="field-label">Color</span><input id="db-color" type="color" value="#00e5ff" /></div>
+        </div>
+        <div class="db-form-row">
+          <div class="field"><span class="field-label" id="db-host-label">Host</span><input id="db-host" type="text" placeholder="localhost" /></div>
+          <div class="field" style="flex:0 0 80px" id="db-port-field"><span class="field-label">Port</span><input id="db-port" type="number" value="5432" /></div>
+          <div class="field"><span class="field-label">Database</span><input id="db-dbname" type="text" placeholder="mydb" /></div>
+        </div>
+        <div class="db-form-row">
+          <div class="field"><span class="field-label">User</span><input id="db-user" type="text" placeholder="reader" /></div>
+          <div class="field"><span class="field-label">Password</span><input id="db-pass" type="password" placeholder="password" /></div>
+        </div>
+        <div style="display:flex;gap:8px;justify-content:flex-end">
+          <button class="btn btn-lime" id="db-save-btn" onclick="saveDatabase()">+ Add</button>
+        </div>
+      </div>
+    </div>
+  </div>
+</div>
+
 <div class="toast-container" id="toasts"></div>
 
+<script src="https://d3js.org/d3.v7.min.js"></script>
+<script src="canvas.js"></script>
 <script>
 function clearEl(el) { while (el.firstChild) el.removeChild(el.firstChild); }
 function makeEl(tag, attrs, children) {
@@ -568,6 +813,14 @@ function updateSchedDaysField() {
   const field = document.getElementById("sched-days-field");
   const j = jobsCache.find(j => j.name === sel.value);
   field.style.display = (j && j.defaultArgs && "days" in j.defaultArgs) ? "" : "none";
+}
+
+function switchView(view) {
+  document.getElementById('canvas-view').style.display = view === 'canvas' ? '' : 'none';
+  document.getElementById('cron-view').style.display = view === 'cron' ? '' : 'none';
+  document.getElementById('nav-canvas').className = 'nav-btn' + (view === 'canvas' ? ' nav-active' : '');
+  document.getElementById('nav-cron').className = 'nav-btn' + (view === 'cron' ? ' nav-active' : '');
+  if (view === 'canvas' && typeof canvasResize === 'function') canvasResize();
 }
 
 function switchTab(name) {
@@ -653,7 +906,7 @@ function closeLogModal() {
   stopLiveLog();
   document.getElementById("log-modal").style.display = "none";
 }
-document.addEventListener("keydown", e => { if (e.key === "Escape") { closeLogModal(); closeCronGuide(); } });
+document.addEventListener("keydown", e => { if (e.key === "Escape") { closeLogModal(); closeCronGuide(); closeDbModal(); } });
 
 function toast(msg, ok) {
   const t = makeEl("div", { className: `toast ${ok ? "toast-ok" : "toast-err"}` }, msg);
@@ -807,7 +1060,126 @@ async function loadHistory() {
   ]));
 }
 
+// ── DB Management ──────────────────────────────────────────────
+let dbEditingId = null;
+
+function openDbModal() {
+  dbEditingId = null;
+  clearDbForm();
+  document.getElementById("db-save-btn").textContent = "+ Add";
+  document.getElementById("db-modal").style.display = "";
+  loadDbList();
+}
+function closeDbModal() { document.getElementById("db-modal").style.display = "none"; }
+
+const DB_PORT_DEFAULTS = { postgresql: 5432, mssql: 1433, clickhouse: 8123, sqlite: 0 };
+
+function clearDbForm() {
+  document.getElementById("db-id").value = "";
+  document.getElementById("db-id").disabled = false;
+  document.getElementById("db-type").value = "postgresql";
+  document.getElementById("db-label").value = "";
+  document.getElementById("db-color").value = "#00e5ff";
+  document.getElementById("db-host").value = "";
+  document.getElementById("db-port").value = "5432";
+  document.getElementById("db-dbname").value = "";
+  document.getElementById("db-user").value = "";
+  document.getElementById("db-pass").value = "";
+  onDbTypeChange();
+}
+
+function onDbTypeChange() {
+  const t = document.getElementById("db-type").value;
+  const portField = document.getElementById("db-port-field");
+  const hostLabel = document.getElementById("db-host-label");
+  if (t === "sqlite") {
+    hostLabel.textContent = "File Path";
+    document.getElementById("db-host").placeholder = "/data/my.db";
+    portField.style.display = "none";
+  } else {
+    hostLabel.textContent = "Host";
+    document.getElementById("db-host").placeholder = "localhost";
+    portField.style.display = "";
+    document.getElementById("db-port").value = DB_PORT_DEFAULTS[t] || 5432;
+  }
+}
+
+async function loadDbList() {
+  const dbs = await api("/api/databases");
+  const el = document.getElementById("db-list");
+  clearEl(el);
+  if (!dbs.length) { el.appendChild(makeEl("div", { className: "empty" }, "No databases registered")); return; }
+  dbs.forEach(d => {
+    const colorDot = makeEl("div", { className: "db-list-color" });
+    colorDot.style.background = d.color;
+    const typeBadge = makeEl("span", { style: "font-size:9px;color:var(--text-dim);background:var(--surface-hi);padding:1px 5px;border-radius:2px;margin-left:6px" }, (d.type || "postgresql").toUpperCase());
+    const labelEl = makeEl("div", { className: "db-list-label" }, [document.createTextNode(d.label), typeBadge]);
+    const info = makeEl("div", { className: "db-list-info" }, [
+      labelEl,
+      makeEl("div", { className: "db-list-meta" }, d.host + (d.type === "sqlite" ? "" : ":" + d.port) + "/" + d.dbname),
+    ]);
+    const editBtn = makeEl("button", { className: "btn btn-cyan btn-sm", onClick: () => editDatabase(d) }, "EDIT");
+    const delBtn = makeEl("button", { className: "btn btn-red btn-sm", onClick: () => deleteDatabase(d.id) }, "DEL");
+    el.appendChild(makeEl("div", { className: "db-list-item" }, [colorDot, info, makeEl("div", { className: "db-list-actions" }, [editBtn, delBtn])]));
+  });
+}
+
+function editDatabase(d) {
+  dbEditingId = d.id;
+  document.getElementById("db-id").value = d.id;
+  document.getElementById("db-id").disabled = true;
+  document.getElementById("db-type").value = d.type || "postgresql";
+  document.getElementById("db-label").value = d.label || "";
+  document.getElementById("db-color").value = d.color || "#00e5ff";
+  document.getElementById("db-host").value = d.host || "";
+  document.getElementById("db-port").value = d.port || 5432;
+  document.getElementById("db-dbname").value = d.dbname || "";
+  document.getElementById("db-user").value = d.user || "";
+  document.getElementById("db-pass").value = "";
+  document.getElementById("db-save-btn").textContent = "UPDATE";
+  onDbTypeChange();
+}
+
+async function saveDatabase() {
+  const dbType = document.getElementById("db-type").value;
+  const body = {
+    id: document.getElementById("db-id").value.trim(),
+    type: dbType,
+    label: document.getElementById("db-label").value.trim(),
+    color: document.getElementById("db-color").value,
+    host: document.getElementById("db-host").value.trim(),
+    port: Number(document.getElementById("db-port").value) || DB_PORT_DEFAULTS[dbType] || 5432,
+    dbname: document.getElementById("db-dbname").value.trim(),
+    user: document.getElementById("db-user").value.trim(),
+    password: document.getElementById("db-pass").value,
+  };
+  if (!body.id || !body.host || !body.dbname) { toast("ID, Host, Database are required", false); return; }
+  try {
+    if (dbEditingId) {
+      await api("/api/databases/" + encodeURIComponent(dbEditingId), { method: "PUT", body: JSON.stringify(body) });
+      toast("Database updated", true);
+    } else {
+      await api("/api/databases", { method: "POST", body: JSON.stringify(body) });
+      toast("Database registered", true);
+    }
+    dbEditingId = null;
+    clearDbForm();
+    document.getElementById("db-save-btn").textContent = "+ Add";
+    loadDbList();
+  } catch { toast("Failed to save database", false); }
+}
+
+async function deleteDatabase(id) {
+  try {
+    await api("/api/databases/" + encodeURIComponent(id), { method: "DELETE" });
+    toast("Database deleted", true);
+    loadDbList();
+  } catch { toast("Failed to delete database", false); }
+}
+
+// ── Init ───────────────────────────────────────────────────────
 loadJobs(); loadSchedules(); loadHistory();
+if (typeof canvasInit === 'function') canvasInit();
 async function pollHistory() {
   await loadHistory();
   const hasRunning = document.querySelector(".running-row");

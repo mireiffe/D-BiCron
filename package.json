@@ -4,7 +4,9 @@
   "private": true,
   "description": "coredb 주기적 관리용 cron job 플랫폼",
   "scripts": {
-    "start": "node dbcron/webui/server.js"
+    "start": "node dbcron/webui/server.js",
+    "seed": "uv run python scripts/seed.py",
+    "dev": "uv sync && npm install --silent && uv run python scripts/seed.py && node dbcron/webui/server.js"
   },
   "dependencies": {
     "express": "^5.2.1",
