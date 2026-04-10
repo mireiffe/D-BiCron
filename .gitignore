@@ -4,3 +4,7 @@ __pycache__/
 node_modules/
 .venv/
 data/
+.playwright-mcp/
+.claude/
+pipeline_config.json
+*.png
