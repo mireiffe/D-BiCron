@@ -4,18 +4,18 @@ version = "0.1.0"
 description = "coredb 주기적 관리용 cron job 플랫폼"
 requires-python = ">=3.11"
 dependencies = [
-    "sqlalchemy>=2.0",
-    "psycopg2-binary>=2.9",
-    "httpx>=0.27",
-    "apscheduler>=3.10",
-    "python-dotenv>=1.0",
-    "boto3>=1.42.85",
+    "sqlalchemy>=2.0,<3",
+    "psycopg2-binary>=2.9,<3",
+    "httpx>=0.27,<1",
+    "apscheduler>=3.10,<4",
+    "python-dotenv>=1.0,<2",
+    "boto3>=1.42,<2",
 ]
 
 [project.optional-dependencies]
-mssql = ["pymssql>=2.2"]
-clickhouse = ["clickhouse-sqlalchemy>=0.3", "clickhouse-driver>=0.2"]
-all-drivers = ["pymssql>=2.2", "clickhouse-sqlalchemy>=0.3", "clickhouse-driver>=0.2"]
+mssql = ["pymssql>=2.2,<3"]
+clickhouse = ["clickhouse-sqlalchemy>=0.3,<1", "clickhouse-driver>=0.2,<1"]
+all-drivers = ["pymssql>=2.2,<3", "clickhouse-sqlalchemy>=0.3,<1", "clickhouse-driver>=0.2,<1"]
 
 [project.scripts]
 dbcron = "dbcron.main:main"

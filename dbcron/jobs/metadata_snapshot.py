@@ -227,8 +227,14 @@ class MetadataSnapshotJob(Job):
 
     @staticmethod
     def _load_databases() -> list[dict]:
+        import base64
         db_file = DATA_DIR / "databases.json"
         if not db_file.exists():
             return []
         with open(db_file, encoding="utf-8") as f:
-            return json.load(f)
+            dbs = json.load(f)
+        # Decode obfuscated passwords
+        for d in dbs:
+            if d.get("_enc") == "b64" and d.get("password"):
+                d["password"] = base64.b64decode(d["password"]).decode()
+        return dbs

@@ -236,6 +236,7 @@ function startJob(jobName, args = {}, _retryCount = 0) {
     };
     runHistory.unshift(entry);
     saveHistory();
+    broadcastSSE("job_complete", { runId, jobName, success: entry.success });
 
     // Trigger dependent jobs on success
     if (entry.success) {
@@ -467,13 +468,35 @@ app.get("/api/history", (_req, res) => {
   res.json(runHistory);
 });
 
+// SSE: real-time event stream for job state changes
+const sseClients = new Set();
+app.get("/api/events", (req, res) => {
+  res.writeHead(200, {
+    "Content-Type": "text/event-stream",
+    "Cache-Control": "no-cache",
+    Connection: "keep-alive",
+  });
+  res.write("data: connected\n\n");
+  sseClients.add(res);
+  req.on("close", () => sseClients.delete(res));
+});
+function broadcastSSE(event, data) {
+  const msg = `event: ${event}\ndata: ${JSON.stringify(data)}\n\n`;
+  for (const c of sseClients) { try { c.write(msg); } catch {} }
+}
+
 // -------------------------------------------------------------------
 // Database registration (CRUD)
 // -------------------------------------------------------------------
 
 function loadDatabases() {
   try {
-    return JSON.parse(fs.readFileSync(DATABASES_FILE, "utf-8"));
+    const dbs = JSON.parse(fs.readFileSync(DATABASES_FILE, "utf-8"));
+    // Decode obfuscated passwords
+    return dbs.map((d) => ({
+      ...d,
+      password: d._enc === "b64" && d.password ? Buffer.from(d.password, "base64").toString() : (d.password || ""),
+    }));
   } catch {
     return [];
   }
@@ -481,7 +504,13 @@ function loadDatabases() {
 
 function saveDatabases(dbs) {
   fs.mkdirSync(DATA_DIR, { recursive: true });
-  fs.writeFileSync(DATABASES_FILE, JSON.stringify(dbs, null, 2), "utf-8");
+  // Obfuscate passwords (base64) to avoid plaintext on disk
+  const stored = dbs.map((d) => ({
+    ...d,
+    password: d.password ? Buffer.from(d.password).toString("base64") : "",
+    _enc: "b64",
+  }));
+  fs.writeFileSync(DATABASES_FILE, JSON.stringify(stored, null, 2), "utf-8");
 }
 
 app.get("/api/databases", (_req, res) => {
