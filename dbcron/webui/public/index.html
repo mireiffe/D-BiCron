@@ -597,7 +597,8 @@
     <button class="btn btn-cyan btn-sm" onclick="canvasZoomOut()" title="Zoom out">&minus;</button>
     <button class="btn btn-cyan btn-sm" onclick="canvasFit()" title="Fit to view">FIT</button>
     <button class="btn btn-lime btn-sm" onclick="refreshMetadata()" title="Refresh metadata">REFRESH</button>
-    <button class="btn btn-lime btn-sm" onclick="openDbModal()" title="Manage databases" style="margin-top:8px">DB</button>
+    <button class="btn btn-cyan btn-sm" onclick="exportCanvasSVG()" title="Export as SVG" style="margin-top:8px">SVG</button>
+    <button class="btn btn-lime btn-sm" onclick="openDbModal()" title="Manage databases" style="margin-top:2px">DB</button>
   </div>
 
   <div id="canvas-search">
@@ -952,9 +953,16 @@ function closeLogModal() {
 }
 document.addEventListener("keydown", e => {
   if (e.key === "Escape") { closeLogModal(); closeCronGuide(); closeDbModal(); closeCanvasSearch(); }
-  if ((e.ctrlKey || e.metaKey) && e.key === "f" && document.getElementById("canvas-view").style.display !== "none") {
+  const onCanvas = document.getElementById("canvas-view").style.display !== "none";
+  if ((e.ctrlKey || e.metaKey) && e.key === "f" && onCanvas) {
     e.preventDefault();
     openCanvasSearch();
+  }
+  // Canvas shortcuts (when not in an input)
+  if (onCanvas && !e.ctrlKey && !e.metaKey && document.activeElement.tagName !== "INPUT" && document.activeElement.tagName !== "SELECT") {
+    if (e.key === "f" || e.key === "F") { if (typeof canvasFit === "function") canvasFit(); }
+    if (e.key === "=" || e.key === "+") { if (typeof canvasZoomIn === "function") canvasZoomIn(); }
+    if (e.key === "-") { if (typeof canvasZoomOut === "function") canvasZoomOut(); }
   }
 });
 
@@ -1074,6 +1082,11 @@ async function loadJobs() {
   });
   sel.addEventListener("change", updateSchedDaysField);
   updateSchedDaysField();
+  // Populate depends-on selector
+  const depSel = document.getElementById("sched-depends");
+  clearEl(depSel);
+  depSel.appendChild(makeEl("option", { value: "" }, "None (cron)"));
+  jobs.forEach(j => depSel.appendChild(makeEl("option", { value: j.name }, "after " + j.label)));
 }
 
 async function loadSchedules() {
@@ -1142,7 +1155,8 @@ async function createSchedule() {
     args.days = Number(document.getElementById("sched-days").value) || 1;
   }
   try {
-    await api("/api/schedules", { method: "POST", body: JSON.stringify({ jobName, cronExpr, args }) });
+    const dependsOn = document.getElementById("sched-depends").value || undefined;
+    await api("/api/schedules", { method: "POST", body: JSON.stringify({ jobName, cronExpr: dependsOn ? "" : cronExpr, args, dependsOn }) });
     toast("Schedule registered", true);
     switchTab('schedules');
   } catch { toast("Failed to register", false); }

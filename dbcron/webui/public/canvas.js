@@ -49,7 +49,13 @@ function canvasInit() {
 
   zoomBehavior = d3.zoom()
     .scaleExtent([0.15, 3])
-    .on("zoom", (event) => gRoot.attr("transform", event.transform));
+    .on("zoom", (event) => {
+      gRoot.attr("transform", event.transform);
+      // A5: zoom-level label culling
+      const k = event.transform.k;
+      gRoot.selectAll("g.table-node .row-badge-g").style("display", k < 0.5 ? "none" : null);
+      gRoot.selectAll("text.conn-label").style("display", k < 0.4 ? "none" : null);
+    });
   svgEl.call(zoomBehavior);
 
   canvasResize();
@@ -323,11 +329,11 @@ function renderTableNodes(layer, nodes) {
     .attr("font-size", 11).attr("fill", "#e4e2f0")
     .text(d => d.label.length > 20 ? d.label.slice(0, 18) + ".." : d.label);
 
-  g.append("rect").attr("x", TABLE_W - 68).attr("y", (TABLE_H - 16) / 2)
+  const badge = g.append("g").attr("class", "row-badge-g");
+  badge.append("rect").attr("x", TABLE_W - 68).attr("y", (TABLE_H - 16) / 2)
     .attr("width", 58).attr("height", 16).attr("rx", 2)
     .attr("fill", "rgba(200,255,0,0.08)").attr("stroke", "rgba(200,255,0,0.25)").attr("stroke-width", 1);
-
-  g.append("text").attr("x", TABLE_W - 39).attr("y", TABLE_H / 2 + 1)
+  badge.append("text").attr("x", TABLE_W - 39).attr("y", TABLE_H / 2 + 1)
     .attr("dominant-baseline", "middle").attr("text-anchor", "middle")
     .attr("font-family", "'Fira Code', monospace").attr("font-size", 9).attr("fill", "#c8ff00")
     .text(d => formatCount(d.rowCount));
@@ -920,6 +926,21 @@ async function refreshMetadata() {
 }
 
 // ── Position persistence ───────────────────────────────────────
+
+// ── Export ─────────────────────────────────────────────────────
+
+function exportCanvasSVG() {
+  const svgNode = document.getElementById("pipeline-canvas");
+  const clone = svgNode.cloneNode(true);
+  clone.setAttribute("xmlns", "http://www.w3.org/2000/svg");
+  const blob = new Blob([clone.outerHTML], { type: "image/svg+xml" });
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement("a");
+  a.href = url;
+  a.download = "dbicron-canvas.svg";
+  a.click();
+  URL.revokeObjectURL(url);
+}
 
 // ── Layer toggles ──────────────────────────────────────────────
 
