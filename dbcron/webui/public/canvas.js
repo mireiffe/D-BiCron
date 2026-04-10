@@ -55,6 +55,7 @@ function canvasInit() {
       const k = event.transform.k;
       gRoot.selectAll("g.table-node .row-badge-g").style("display", k < 0.5 ? "none" : null);
       gRoot.selectAll("text.conn-label").style("display", k < 0.4 ? "none" : null);
+      updateMinimap(event.transform);
     });
   svgEl.call(zoomBehavior);
 
@@ -274,6 +275,7 @@ function renderCanvas() {
   renderTableNodes(nodeLayer, CS.layout.tableNodes);
   renderEntryPoints(epLayer, CS.layout.entryPoints);
   renderConnections(connLayer, CS.layout.connections);
+  renderMinimap();
 }
 
 function renderDBContainers(layer, containers) {
@@ -940,6 +942,47 @@ function exportCanvasSVG() {
   a.download = "dbicron-canvas.svg";
   a.click();
   URL.revokeObjectURL(url);
+}
+
+// ── Minimap ────────────────────────────────────────────────────
+
+function renderMinimap() {
+  if (!CS.layout) return;
+  const mmSvg = d3.select("#minimap-svg");
+  mmSvg.selectAll("*").remove();
+  const nodes = [...CS.layout.tableNodes, ...CS.layout.entryPoints, ...CS.layout.dbContainers];
+  if (!nodes.length) return;
+
+  let minX = Infinity, minY = Infinity, maxX = -Infinity, maxY = -Infinity;
+  for (const n of nodes) {
+    minX = Math.min(minX, n.x); minY = Math.min(minY, n.y);
+    maxX = Math.max(maxX, n.x + (n.w || 0)); maxY = Math.max(maxY, n.y + (n.h || 0));
+  }
+  const pad = 20;
+  const vbW = maxX - minX + pad * 2, vbH = maxY - minY + pad * 2;
+  mmSvg.attr("viewBox", `${minX - pad} ${minY - pad} ${vbW} ${vbH}`);
+
+  // DB containers
+  for (const c of CS.layout.dbContainers) {
+    mmSvg.append("rect").attr("x", c.x).attr("y", c.y).attr("width", c.w).attr("height", c.h)
+      .attr("fill", "none").attr("stroke", c.color).attr("stroke-width", 2).attr("opacity", 0.4);
+  }
+  // Table nodes as small dots
+  for (const n of CS.layout.tableNodes) {
+    mmSvg.append("rect").attr("x", n.x).attr("y", n.y).attr("width", n.w).attr("height", n.h)
+      .attr("fill", n.dbColor).attr("opacity", 0.5).attr("rx", 2);
+  }
+  // Viewport rect
+  mmSvg.append("rect").attr("class", "minimap-viewport").attr("x", 0).attr("y", 0).attr("width", 0).attr("height", 0);
+}
+
+function updateMinimap(transform) {
+  const vp = d3.select("#minimap-svg .minimap-viewport");
+  if (vp.empty()) return;
+  const cw = +svgEl.attr("width"), ch = +svgEl.attr("height");
+  const k = transform.k;
+  vp.attr("x", -transform.x / k).attr("y", -transform.y / k)
+    .attr("width", cw / k).attr("height", ch / k);
 }
 
 // ── Layer toggles ──────────────────────────────────────────────
