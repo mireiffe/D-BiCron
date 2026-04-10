@@ -680,6 +680,10 @@
               <input id="sched-days" type="number" value="1" min="1" style="width:60px" />
             </div>
             <div class="field">
+              <span class="field-label">Depends on</span>
+              <select id="sched-depends" style="width:120px"><option value="">None (cron)</option></select>
+            </div>
+            <div class="field">
               <span class="field-label">&nbsp;</span>
               <button class="btn btn-cyan" onclick="createSchedule()">+ Register</button>
             </div>
@@ -1079,18 +1083,29 @@ async function loadSchedules() {
   clearEl(el);
   if (!list.length) { el.appendChild(makeEl("div", { className: "empty" }, "No active schedules")); return; }
   el.appendChild(makeEl("table", { className: "tbl cyan-tbl" }, [
-    makeEl("thead", null, [makeEl("tr", null, [makeEl("th", null, "#"), makeEl("th", null, "Job"), makeEl("th", null, "Cron"), makeEl("th")])]),
-    makeEl("tbody", null, list.map(s =>
-      makeEl("tr", null, [
+    makeEl("thead", null, [makeEl("tr", null, [makeEl("th", null, "#"), makeEl("th", null, "Job"), makeEl("th", null, "Trigger"), makeEl("th")])]),
+    makeEl("tbody", null, list.map(s => {
+      const triggerText = s.dependsOn ? "after " + s.dependsOn : s.cron;
+      const pauseBtn = !s.dependsOn ? makeEl("button", {
+        className: "btn btn-sm " + (s.paused ? "btn-lime" : "btn-cyan"),
+        onClick: async () => {
+          await api("/api/schedules/" + s.id + "/" + (s.paused ? "resume" : "pause"), { method: "PUT" });
+          toast(s.paused ? "Resumed" : "Paused", true);
+          loadSchedules();
+        },
+        style: "margin-right:4px",
+      }, s.paused ? "RESUME" : "PAUSE") : null;
+      return makeEl("tr", { style: s.paused ? "opacity:0.5" : "" }, [
         makeEl("td", null, String(s.id)),
         makeEl("td", null, s.jobName),
-        makeEl("td", null, [makeEl("code", null, s.cron)]),
+        makeEl("td", null, [makeEl("code", null, triggerText)]),
         makeEl("td", null, [
+          pauseBtn,
           makeEl("button", { className: "btn btn-cyan btn-sm", onClick: () => editSchedule(s), style: "margin-right:4px" }, "EDIT"),
           makeEl("button", { className: "btn btn-red btn-sm", onClick: () => deleteSchedule(s.id) }, "DEL"),
-        ]),
-      ])
-    )),
+        ].filter(Boolean)),
+      ]);
+    })),
   ]));
 }
 

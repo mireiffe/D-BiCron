@@ -237,6 +237,16 @@ function startJob(jobName, args = {}, _retryCount = 0) {
     runHistory.unshift(entry);
     saveHistory();
 
+    // Trigger dependent jobs on success
+    if (entry.success) {
+      for (const [, s] of scheduledTasks) {
+        if (s.dependsOn === jobName) {
+          console.log(`Triggering dependent job: ${s.jobName} (depends on ${jobName})`);
+          startJob(s.jobName, s.args);
+        }
+      }
+    }
+
     // Retry on failure
     if (!entry.success && _retryCount < JOB_MAX_RETRIES) {
       const delay = Math.min(5000 * 2 ** _retryCount, 60000); // exponential backoff, max 60s
@@ -322,37 +332,62 @@ app.post("/api/jobs/:name/run", (req, res) => {
 app.get("/api/schedules", (_req, res) => {
   const list = [];
   for (const [id, s] of scheduledTasks) {
-    list.push({ id, jobName: s.jobName, cron: s.cron, args: s.args, createdAt: s.createdAt });
+    list.push({ id, jobName: s.jobName, cron: s.cron, args: s.args, createdAt: s.createdAt, paused: !!s.paused, dependsOn: s.dependsOn || null });
   }
   res.json(list);
 });
 
 // Create a schedule
 app.post("/api/schedules", (req, res) => {
-  const { jobName, cronExpr, args } = req.body;
+  const { jobName, cronExpr, args, dependsOn } = req.body;
 
   if (!AVAILABLE_JOBS.find((j) => j.name === jobName)) {
     return res.status(400).json({ error: "Unknown job" });
   }
-  if (!cron.validate(cronExpr)) {
+  if (!dependsOn && !cron.validate(cronExpr)) {
     return res.status(400).json({ error: "Invalid cron expression" });
   }
 
   const id = nextId++;
-  const task = cron.schedule(cronExpr, () => {
-    startJob(jobName, args);
-  });
+  let task = null;
+  if (!dependsOn) {
+    task = cron.schedule(cronExpr, () => {
+      startJob(jobName, args);
+    });
+  }
 
   scheduledTasks.set(id, {
-    cron: cronExpr,
+    cron: cronExpr || "",
     jobName,
     args: args || {},
     task,
+    dependsOn: dependsOn || null,
     createdAt: new Date().toISOString(),
   });
   saveSchedules();
 
-  res.status(201).json({ id, jobName, cron: cronExpr });
+  res.status(201).json({ id, jobName, cron: cronExpr, dependsOn });
+});
+
+// Pause/resume a schedule
+app.put("/api/schedules/:id/pause", (req, res) => {
+  const id = Number(req.params.id);
+  const entry = scheduledTasks.get(id);
+  if (!entry) return res.status(404).json({ error: "Schedule not found" });
+  if (entry.task) entry.task.stop();
+  entry.paused = true;
+  saveSchedules();
+  res.json({ id, paused: true });
+});
+
+app.put("/api/schedules/:id/resume", (req, res) => {
+  const id = Number(req.params.id);
+  const entry = scheduledTasks.get(id);
+  if (!entry) return res.status(404).json({ error: "Schedule not found" });
+  if (entry.task) entry.task.start();
+  entry.paused = false;
+  saveSchedules();
+  res.json({ id, paused: false });
 });
 
 // Update a schedule
@@ -653,6 +688,29 @@ app.get("/api/timeline", (_req, res) => {
 
   events.sort((a, b) => new Date(b.ts) - new Date(a.ts));
   res.json(events.slice(0, 200));
+});
+
+// Annotations: owner, notes, runbook per table/job
+const ANNOTATIONS_FILE = path.join(DATA_DIR, "annotations.json");
+
+function loadAnnotations() {
+  try { return JSON.parse(fs.readFileSync(ANNOTATIONS_FILE, "utf-8")); } catch { return {}; }
+}
+function saveAnnotations(data) {
+  fs.mkdirSync(DATA_DIR, { recursive: true });
+  fs.writeFileSync(ANNOTATIONS_FILE, JSON.stringify(data, null, 2), "utf-8");
+}
+
+app.get("/api/annotations", (_req, res) => res.json(loadAnnotations()));
+app.get("/api/annotations/:key", (req, res) => {
+  const data = loadAnnotations();
+  res.json(data[req.params.key] || {});
+});
+app.put("/api/annotations/:key", (req, res) => {
+  const data = loadAnnotations();
+  data[req.params.key] = { ...data[req.params.key], ...req.body, updatedAt: new Date().toISOString() };
+  saveAnnotations(data);
+  res.json(data[req.params.key]);
 });
 
 // Lineage: upstream/downstream dependencies for a table

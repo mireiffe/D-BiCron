@@ -691,6 +691,33 @@ function openDetailPanel(node) {
     }
   }
 
+  // Owner/notes annotations (async load + inline edit)
+  const annoKey = node.key;
+  const annoSec = _makeSection("Owner / Notes");
+  const annoWrap = _el("div", { style: { fontSize: "11px" } });
+  annoSec.appendChild(annoWrap);
+  content.appendChild(annoSec);
+  fetch("/api/annotations/" + encodeURIComponent(annoKey))
+    .then(r => r.json())
+    .then(anno => {
+      while (annoWrap.firstChild) annoWrap.removeChild(annoWrap.firstChild);
+      const ownerInput = _el("input", { type: "text", value: anno.owner || "", placeholder: "Owner / Team", style: { width: "100%", background: "#12122a", border: "1px solid rgba(0,229,255,.2)", borderRadius: "3px", color: "#e4e2f0", fontFamily: "'Fira Code', monospace", fontSize: "11px", padding: "4px 6px", marginBottom: "6px" } });
+      const notesInput = _el("input", { type: "text", value: anno.notes || "", placeholder: "Notes / Runbook URL", style: { width: "100%", background: "#12122a", border: "1px solid rgba(0,229,255,.2)", borderRadius: "3px", color: "#e4e2f0", fontFamily: "'Fira Code', monospace", fontSize: "11px", padding: "4px 6px" } });
+      const save = () => {
+        fetch("/api/annotations/" + encodeURIComponent(annoKey), {
+          method: "PUT", headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ owner: ownerInput.value, notes: notesInput.value }),
+        });
+      };
+      ownerInput.addEventListener("change", save);
+      notesInput.addEventListener("change", save);
+      annoWrap.appendChild(_el("div", { style: { color: "#7b7898", fontSize: "9px", marginBottom: "4px" } }, "OWNER"));
+      annoWrap.appendChild(ownerInput);
+      annoWrap.appendChild(_el("div", { style: { color: "#7b7898", fontSize: "9px", marginBottom: "4px", marginTop: "6px" } }, "NOTES / RUNBOOK"));
+      annoWrap.appendChild(notesInput);
+    })
+    .catch(() => { annoWrap.textContent = "Failed to load"; });
+
   // Row count trend (async load)
   const trendSec = _makeSection("Row Count Trend");
   const trendWrap = _el("div", { style: { fontSize: "11px", color: "#7b7898" } }, "Loading...");
