@@ -966,10 +966,37 @@ async function loadSchedules() {
         makeEl("td", null, String(s.id)),
         makeEl("td", null, s.jobName),
         makeEl("td", null, [makeEl("code", null, s.cron)]),
-        makeEl("td", null, [makeEl("button", { className: "btn btn-red btn-sm", onClick: () => deleteSchedule(s.id) }, "DEL")]),
+        makeEl("td", null, [
+          makeEl("button", { className: "btn btn-cyan btn-sm", onClick: () => editSchedule(s), style: "margin-right:4px" }, "EDIT"),
+          makeEl("button", { className: "btn btn-red btn-sm", onClick: () => deleteSchedule(s.id) }, "DEL"),
+        ]),
       ])
     )),
   ]));
+}
+
+function editSchedule(s) {
+  document.getElementById("sched-job").value = s.jobName;
+  document.getElementById("sched-cron").value = s.cron;
+  updateSchedDaysField();
+  if (s.args && "days" in s.args) document.getElementById("sched-days").value = s.args.days;
+  // Switch to editing mode
+  const btn = document.querySelector(".sched-form .btn-cyan");
+  btn.textContent = "UPDATE #" + s.id;
+  btn.onclick = async () => {
+    const cronExpr = document.getElementById("sched-cron").value;
+    const j = jobsCache.find(j => j.name === s.jobName);
+    const args = {};
+    if (j && j.defaultArgs && "days" in j.defaultArgs) args.days = Number(document.getElementById("sched-days").value) || 1;
+    try {
+      await api("/api/schedules/" + encodeURIComponent(s.id), { method: "PUT", body: JSON.stringify({ cronExpr, args }) });
+      toast("Schedule updated", true);
+    } catch { toast("Failed to update", false); }
+    btn.textContent = "+ Register";
+    btn.onclick = createSchedule;
+    loadSchedules();
+  };
+  switchTab("schedules");
 }
 
 async function createSchedule() {

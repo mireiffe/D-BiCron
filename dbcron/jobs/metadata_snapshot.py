@@ -194,6 +194,15 @@ class MetadataSnapshotJob(Job):
 
         os.makedirs(DATA_DIR, exist_ok=True)
         out_path = DATA_DIR / "metadata_snapshot.json"
+        prev_path = DATA_DIR / "metadata_snapshot_prev.json"
+
+        # 이전 스냅샷 보존 (drift 비교용)
+        if out_path.exists():
+            try:
+                out_path.rename(prev_path)
+            except OSError:
+                pass
+
         with open(out_path, "w", encoding="utf-8") as f:
             json.dump(snapshot, f, ensure_ascii=False, indent=2)
 

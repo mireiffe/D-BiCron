@@ -77,6 +77,7 @@ async function loadCanvasData() {
   CS.metadata = metaRes.status === "fulfilled" ? metaRes.value : null;
   CS.pipelineConfig = pipeRes.status === "fulfilled" ? pipeRes.value : null;
   CS.databases = dbRes.status === "fulfilled" ? dbRes.value : [];
+  CS.drift = null;
 
   if (!CS.metadata) {
     const emptyEl = document.getElementById("canvas-empty");
@@ -103,6 +104,12 @@ async function loadCanvasData() {
   const info = document.getElementById("canvas-snapshot-info");
   info.style.display = "";
   info.textContent = "Snapshot: " + new Date(CS.metadata.snapshot_at).toLocaleString();
+
+  // Load drift data
+  try {
+    const driftRes = await fetch("/api/metadata/drift").then(r => r.ok ? r.json() : null);
+    CS.drift = driftRes;
+  } catch { CS.drift = null; }
 
   CS.layout = computeLayout();
   renderCanvas();
@@ -324,6 +331,31 @@ function renderTableNodes(layer, nodes) {
     .attr("dominant-baseline", "middle").attr("text-anchor", "middle")
     .attr("font-family", "'Fira Code', monospace").attr("font-size", 9).attr("fill", "#c8ff00")
     .text(d => formatCount(d.rowCount));
+
+  // Drift badges
+  if (CS.drift && CS.drift.drift && CS.drift.drift.length) {
+    const driftByTable = {};
+    for (const d of CS.drift.drift) {
+      if (d.table) {
+        const k = `${d.db}:${d.table}`;
+        if (!driftByTable[k]) driftByTable[k] = { count: 0, breaking: false };
+        driftByTable[k].count++;
+        if (d.breaking) driftByTable[k].breaking = true;
+      }
+    }
+    g.each(function (d) {
+      const info = driftByTable[d.key];
+      if (!info) return;
+      const el = d3.select(this);
+      const color = info.breaking ? "#ff3355" : "#ffd000";
+      el.append("circle").attr("cx", TABLE_W - 4).attr("cy", 4).attr("r", 7)
+        .attr("fill", color).attr("stroke", "#12122a").attr("stroke-width", 1.5);
+      el.append("text").attr("x", TABLE_W - 4).attr("y", 5)
+        .attr("text-anchor", "middle").attr("dominant-baseline", "middle")
+        .attr("font-family", "'Fira Code', monospace").attr("font-size", 8).attr("font-weight", 700)
+        .attr("fill", "#12122a").text(info.count > 9 ? "!" : info.count);
+    });
+  }
 }
 
 function renderEntryPoints(layer, entryPoints) {
@@ -631,6 +663,32 @@ function openDetailPanel(node) {
     }
     sec.appendChild(wrap);
     content.appendChild(sec);
+  }
+
+  // Drift section
+  if (CS.drift && CS.drift.drift) {
+    const tableDrift = CS.drift.drift.filter(d => d.db === node.dbKey && d.table === node.tKey);
+    if (tableDrift.length) {
+      const sec = _makeSection("Schema Changes");
+      const wrap = _el("div", { style: { fontSize: "11px" } });
+      for (const d of tableDrift) {
+        const div = _el("div", { style: { padding: "3px 0", borderBottom: "1px solid rgba(255,255,255,.03)" } });
+        const color = d.breaking ? "#ff3355" : "#ffd000";
+        const tag = _el("span", { style: { color, fontWeight: "700", fontSize: "9px", marginRight: "6px" } }, d.breaking ? "BREAKING" : "CHANGE");
+        const desc = _el("span", { style: { color: "#e4e2f0" } });
+        if (d.type === "column_added") desc.textContent = "Column added: " + d.column;
+        else if (d.type === "column_removed") desc.textContent = "Column removed: " + d.column;
+        else if (d.type === "type_changed") desc.textContent = d.column + ": " + d.from + " \u2192 " + d.to;
+        else if (d.type === "nullable_changed") desc.textContent = d.column + " nullable: " + d.from + " \u2192 " + d.to;
+        else if (d.type === "pk_changed") desc.textContent = "Primary key changed";
+        else desc.textContent = d.type;
+        div.appendChild(tag);
+        div.appendChild(desc);
+        wrap.appendChild(div);
+      }
+      sec.appendChild(wrap);
+      content.appendChild(sec);
+    }
   }
 
   panel.classList.add("open");

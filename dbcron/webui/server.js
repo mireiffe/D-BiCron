@@ -10,6 +10,9 @@ app.use(express.static(path.join(__dirname, "public")));
 
 const PORT = process.env.PORT || 3999;
 const PROJECT_ROOT = path.resolve(__dirname, "../..");
+const WEBHOOK_URL = process.env.WEBHOOK_URL || "";
+const JOB_TIMEOUT_MS = Number(process.env.JOB_TIMEOUT_MS) || 30 * 60_000; // 30min default
+const JOB_MAX_RETRIES = Number(process.env.JOB_MAX_RETRIES) || 0; // 0 = no retry
 
 // -------------------------------------------------------------------
 // Available jobs — add new entries when you create a new Job subclass
@@ -164,7 +167,7 @@ function isJobRunning(jobName) {
   return false;
 }
 
-function startJob(jobName, args = {}) {
+function startJob(jobName, args = {}, _retryCount = 0) {
   if (isJobRunning(jobName)) {
     console.log(`Skipped ${jobName}: already running`);
     return null;
@@ -178,6 +181,7 @@ function startJob(jobName, args = {}) {
     startedAt: new Date().toISOString(),
     stdout: "",
     stderr: "",
+    retryCount: _retryCount,
   };
   runningJobs.set(runId, tracker);
 
@@ -195,7 +199,16 @@ function startJob(jobName, args = {}) {
   tracker.proc = proc;
   saveRunning();
 
+  // Timeout kill
+  const timeoutId = setTimeout(() => {
+    console.log(`Timeout: killing ${jobName} (PID ${proc.pid}) after ${JOB_TIMEOUT_MS}ms`);
+    tracker.stderr += `\n[TIMEOUT] Job killed after ${Math.round(JOB_TIMEOUT_MS / 1000)}s`;
+    proc.kill("SIGTERM");
+    setTimeout(() => { try { proc.kill("SIGKILL"); } catch {} }, 3000);
+  }, JOB_TIMEOUT_MS);
+
   proc.on("error", (err) => {
+    clearTimeout(timeoutId);
     runningJobs.delete(runId);
     saveRunning();
     runHistory.unshift({
@@ -210,16 +223,45 @@ function startJob(jobName, args = {}) {
   proc.stderr.on("data", (d) => (tracker.stderr += d));
 
   proc.on("close", (code) => {
+    clearTimeout(timeoutId);
     runningJobs.delete(runId);
     saveRunning();
-    runHistory.unshift({
+    const entry = {
       runId, jobName, args, pid: proc.pid,
       success: code === 0,
       stdout: tracker.stdout.trim(),
       stderr: tracker.stderr.trim(),
       finishedAt: new Date().toISOString(),
-    });
+      retryCount: _retryCount,
+    };
+    runHistory.unshift(entry);
     saveHistory();
+
+    // Retry on failure
+    if (!entry.success && _retryCount < JOB_MAX_RETRIES) {
+      const delay = Math.min(5000 * 2 ** _retryCount, 60000); // exponential backoff, max 60s
+      console.log(`Retry ${_retryCount + 1}/${JOB_MAX_RETRIES} for ${jobName} in ${delay}ms`);
+      setTimeout(() => startJob(jobName, args, _retryCount + 1), delay);
+    }
+
+    // Webhook notification on final failure (after all retries exhausted)
+    if (!entry.success && _retryCount >= JOB_MAX_RETRIES && WEBHOOK_URL) {
+      const payload = JSON.stringify({
+        event: "job_failed",
+        job: jobName,
+        runId,
+        pid: proc.pid,
+        exitCode: code,
+        error: entry.stderr.slice(0, 500) || entry.stdout.slice(0, 500),
+        finishedAt: entry.finishedAt,
+        retries: _retryCount,
+      });
+      fetch(WEBHOOK_URL, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: payload,
+      }).catch((err) => console.error("Webhook failed:", err.message));
+    }
   });
 
   return runId;
@@ -280,6 +322,34 @@ app.post("/api/schedules", (req, res) => {
   saveSchedules();
 
   res.status(201).json({ id, jobName, cron: cronExpr });
+});
+
+// Update a schedule
+app.put("/api/schedules/:id", (req, res) => {
+  const id = Number(req.params.id);
+  const entry = scheduledTasks.get(id);
+  if (!entry) return res.status(404).json({ error: "Schedule not found" });
+
+  const { cronExpr, args } = req.body;
+  if (cronExpr && !cron.validate(cronExpr)) {
+    return res.status(400).json({ error: "Invalid cron expression" });
+  }
+
+  entry.task.stop();
+  const newCron = cronExpr || entry.cron;
+  const newArgs = args !== undefined ? args : entry.args;
+  const task = cron.schedule(newCron, () => {
+    startJob(entry.jobName, newArgs);
+  });
+  scheduledTasks.set(id, {
+    cron: newCron,
+    jobName: entry.jobName,
+    args: newArgs,
+    task,
+    createdAt: entry.createdAt,
+  });
+  saveSchedules();
+  res.json({ id, jobName: entry.jobName, cron: newCron });
 });
 
 // Delete a schedule
@@ -419,6 +489,98 @@ app.get("/api/metadata", (_req, res) => {
     res.status(404).json({
       error: "No metadata snapshot available. Run the metadata_snapshot job first.",
     });
+  }
+});
+
+// Schema drift: compare current vs previous snapshot
+app.get("/api/metadata/drift", (_req, res) => {
+  const curPath = path.join(DATA_DIR, "metadata_snapshot.json");
+  const prevPath = path.join(DATA_DIR, "metadata_snapshot_prev.json");
+  let cur, prev;
+  try {
+    cur = JSON.parse(fs.readFileSync(curPath, "utf-8"));
+  } catch {
+    return res.status(404).json({ error: "No current snapshot" });
+  }
+  try {
+    prev = JSON.parse(fs.readFileSync(prevPath, "utf-8"));
+  } catch {
+    return res.json({ drift: [], prev_snapshot_at: null, cur_snapshot_at: cur.snapshot_at });
+  }
+
+  const drift = [];
+  for (const [dbId, dbCur] of Object.entries(cur.databases || {})) {
+    const dbPrev = (prev.databases || {})[dbId];
+    if (!dbPrev) {
+      drift.push({ db: dbId, type: "db_added", detail: `Database added` });
+      continue;
+    }
+    const curTables = dbCur.tables || {};
+    const prevTables = dbPrev.tables || {};
+
+    // Added tables
+    for (const tKey of Object.keys(curTables)) {
+      if (!prevTables[tKey]) {
+        drift.push({ db: dbId, table: tKey, type: "table_added", breaking: false });
+      }
+    }
+    // Removed tables
+    for (const tKey of Object.keys(prevTables)) {
+      if (!curTables[tKey]) {
+        drift.push({ db: dbId, table: tKey, type: "table_removed", breaking: true });
+      }
+    }
+    // Changed tables
+    for (const [tKey, tCur] of Object.entries(curTables)) {
+      const tPrev = prevTables[tKey];
+      if (!tPrev) continue;
+      const curCols = Object.fromEntries((tCur.columns || []).map((c) => [c.name, c]));
+      const prevCols = Object.fromEntries((tPrev.columns || []).map((c) => [c.name, c]));
+
+      for (const [cName, cCur] of Object.entries(curCols)) {
+        if (!prevCols[cName]) {
+          drift.push({ db: dbId, table: tKey, column: cName, type: "column_added", breaking: false });
+        } else {
+          const cPrev = prevCols[cName];
+          if (cCur.type !== cPrev.type) {
+            drift.push({ db: dbId, table: tKey, column: cName, type: "type_changed", from: cPrev.type, to: cCur.type, breaking: true });
+          }
+          if (cCur.nullable !== cPrev.nullable) {
+            drift.push({ db: dbId, table: tKey, column: cName, type: "nullable_changed", from: cPrev.nullable, to: cCur.nullable, breaking: !cCur.nullable });
+          }
+        }
+      }
+      for (const cName of Object.keys(prevCols)) {
+        if (!curCols[cName]) {
+          drift.push({ db: dbId, table: tKey, column: cName, type: "column_removed", breaking: true });
+        }
+      }
+
+      // PK changes
+      const curPk = JSON.stringify(tCur.primary_key);
+      const prevPk = JSON.stringify(tPrev.primary_key);
+      if (curPk !== prevPk) {
+        drift.push({ db: dbId, table: tKey, type: "pk_changed", breaking: true });
+      }
+    }
+  }
+  // Removed DBs
+  for (const dbId of Object.keys(prev.databases || {})) {
+    if (!(cur.databases || {})[dbId]) {
+      drift.push({ db: dbId, type: "db_removed", breaking: true });
+    }
+  }
+
+  res.json({ drift, prev_snapshot_at: prev.snapshot_at, cur_snapshot_at: cur.snapshot_at });
+});
+
+// Serve connection test results
+app.get("/api/connection-test", (_req, res) => {
+  const p = path.join(DATA_DIR, "connection_test.json");
+  try {
+    res.json(JSON.parse(fs.readFileSync(p, "utf-8")));
+  } catch {
+    res.status(404).json({ error: "No connection test results. Run the connection_test job first." });
   }
 });
 
