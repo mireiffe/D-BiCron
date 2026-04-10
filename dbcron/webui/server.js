@@ -605,6 +605,116 @@ app.get("/api/metadata/drift", (_req, res) => {
   res.json({ drift, prev_snapshot_at: prev.snapshot_at, cur_snapshot_at: cur.snapshot_at });
 });
 
+// Timeline: merged history + drift events
+app.get("/api/timeline", (_req, res) => {
+  const events = [];
+  // Job runs
+  for (const h of runHistory) {
+    events.push({
+      type: "job_run",
+      ts: h.finishedAt,
+      job: h.jobName,
+      success: h.success,
+      message: h.success ? (h.stdout || "").slice(0, 100) : (h.stderr || "").slice(0, 100),
+    });
+  }
+  // Schema drift
+  const prevPath = path.join(DATA_DIR, "metadata_snapshot_prev.json");
+  const curPath = path.join(DATA_DIR, "metadata_snapshot.json");
+  try {
+    const cur = JSON.parse(fs.readFileSync(curPath, "utf-8"));
+    const prev = JSON.parse(fs.readFileSync(prevPath, "utf-8"));
+    if (prev.snapshot_at && cur.snapshot_at) {
+      // Count drift changes
+      let driftCount = 0, breaking = 0;
+      for (const [dbId, dbCur] of Object.entries(cur.databases || {})) {
+        const dbPrev = (prev.databases || {})[dbId];
+        if (!dbPrev) { driftCount++; continue; }
+        for (const [tKey, tCur] of Object.entries(dbCur.tables || {})) {
+          const tPrev = (dbPrev.tables || {})[tKey];
+          if (!tPrev) { driftCount++; continue; }
+          const curCols = new Set((tCur.columns || []).map(c => c.name + ":" + c.type));
+          const prevCols = new Set((tPrev.columns || []).map(c => c.name + ":" + c.type));
+          for (const c of curCols) { if (!prevCols.has(c)) { driftCount++; } }
+          for (const c of prevCols) { if (!curCols.has(c)) { driftCount++; breaking++; } }
+        }
+      }
+      if (driftCount > 0) {
+        events.push({
+          type: "schema_drift",
+          ts: cur.snapshot_at,
+          changes: driftCount,
+          breaking,
+          message: `${driftCount} schema change(s)${breaking ? `, ${breaking} breaking` : ""}`,
+        });
+      }
+    }
+  } catch {}
+
+  events.sort((a, b) => new Date(b.ts) - new Date(a.ts));
+  res.json(events.slice(0, 200));
+});
+
+// Lineage: upstream/downstream dependencies for a table
+app.get("/api/lineage/:db/:table", (req, res) => {
+  const cfgPath = path.join(PROJECT_ROOT, process.env.PIPELINE_CONFIG || "pipeline_config.json");
+  let cfg = { entry_points: [], pipelines: [] };
+  try { cfg = { ...cfg, ...JSON.parse(fs.readFileSync(cfgPath, "utf-8")) }; } catch {}
+
+  // Resolve auto connections
+  const syncCfgPath = path.join(PROJECT_ROOT, process.env.SYNC_CONFIG || "sync_config.json");
+  let syncCfg = null;
+  try { syncCfg = JSON.parse(fs.readFileSync(syncCfgPath, "utf-8")); } catch {}
+  const allConns = [];
+  for (const p of cfg.pipelines || []) {
+    if (p.connections === "auto" && syncCfg?.tables) {
+      for (const t of syncCfg.tables) {
+        allConns.push({ from: `${t.source_schema || "public"}.${t.table}`, fromDb: "susdb", to: `${t.target_schema || "public"}.${t.table}`, toDb: "coredb", label: p.description || "" });
+      }
+    } else if (Array.isArray(p.connections)) {
+      for (const c of p.connections) {
+        allConns.push({ from: `${c.from.schema}.${c.from.table}`, fromDb: c.from.db, to: `${c.to.schema}.${c.to.table}`, toDb: c.to.db, label: c.label || "" });
+      }
+    }
+  }
+
+  const targetDb = req.params.db;
+  const targetTable = req.params.table;
+
+  const upstream = [];
+  const downstream = [];
+  for (const c of allConns) {
+    if (c.toDb === targetDb && c.to === targetTable) upstream.push({ db: c.fromDb, table: c.from, label: c.label });
+    if (c.fromDb === targetDb && c.from === targetTable) downstream.push({ db: c.toDb, table: c.to, label: c.label });
+  }
+  // Entry points
+  const entryUpstream = [];
+  for (const ep of cfg.entry_points || []) {
+    for (const t of ep.targets || []) {
+      if (t.db === targetDb && `${t.schema}.${t.table}` === targetTable) {
+        entryUpstream.push({ name: ep.name, type: ep.type, description: ep.description || "" });
+      }
+    }
+  }
+
+  res.json({ upstream, downstream, entryPoints: entryUpstream });
+});
+
+// Freshness log: row count history per table
+app.get("/api/freshness", (req, res) => {
+  const p = path.join(DATA_DIR, "freshness_log.jsonl");
+  try {
+    const lines = fs.readFileSync(p, "utf-8").trim().split("\n").filter(Boolean);
+    const entries = lines.map((l) => JSON.parse(l));
+    // Optional filter by db/table
+    const { db, table } = req.query;
+    const filtered = entries.filter((e) => (!db || e.db === db) && (!table || e.table === table));
+    res.json(filtered.slice(-500)); // Last 500 entries
+  } catch {
+    res.json([]);
+  }
+});
+
 // Serve connection test results
 app.get("/api/connection-test", (_req, res) => {
   const p = path.join(DATA_DIR, "connection_test.json");

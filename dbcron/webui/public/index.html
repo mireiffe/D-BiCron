@@ -696,6 +696,9 @@
         <button class="tab-btn" id="tab-btn-schedules" onclick="switchTab('schedules')">
           Schedules <span class="tab-count" id="sched-count">0</span>
         </button>
+        <button class="tab-btn" id="tab-btn-timeline" onclick="switchTab('timeline')">
+          Timeline
+        </button>
       </div>
       <div class="card mag-card tab-panel tab-visible" id="tab-history">
         <div class="card-body">
@@ -705,6 +708,11 @@
       <div class="card tab-panel" id="tab-schedules">
         <div class="card-body">
           <div id="schedules-list"></div>
+        </div>
+      </div>
+      <div class="card tab-panel" id="tab-timeline">
+        <div class="card-body">
+          <div id="timeline-list"></div>
         </div>
       </div>
     </div>
@@ -855,8 +863,11 @@ function switchView(view) {
 function switchTab(name) {
   document.getElementById('tab-history').className = 'card mag-card tab-panel' + (name === 'history' ? ' tab-visible' : '');
   document.getElementById('tab-schedules').className = 'card tab-panel' + (name === 'schedules' ? ' tab-visible' : '');
+  document.getElementById('tab-timeline').className = 'card tab-panel' + (name === 'timeline' ? ' tab-visible' : '');
   document.getElementById('tab-btn-history').className = 'tab-btn' + (name === 'history' ? ' tab-active' : '');
   document.getElementById('tab-btn-schedules').className = 'tab-btn' + (name === 'schedules' ? ' tab-active' : '');
+  document.getElementById('tab-btn-timeline').className = 'tab-btn' + (name === 'timeline' ? ' tab-active' : '');
+  if (name === 'timeline') loadTimeline();
 }
 
 function openLogModal(h) {
@@ -1193,6 +1204,29 @@ async function loadHistory() {
     makeEl("thead", null, [makeEl("tr", null, [makeEl("th", null, "Job"), makeEl("th", null, "PID"), makeEl("th", null, "Status"), makeEl("th", null, "Output"), makeEl("th", null, "Time"), makeEl("th")])]),
     makeEl("tbody", null, [...runningRows, ...historyRows]),
   ]));
+}
+
+async function loadTimeline() {
+  const events = await api("/api/timeline").catch(() => []);
+  const el = document.getElementById("timeline-list");
+  clearEl(el);
+  if (!events.length) { el.appendChild(makeEl("div", { className: "empty" }, "No events yet")); return; }
+  for (const ev of events) {
+    const ts = makeEl("span", { style: "color:var(--text-dim);font-size:10px;min-width:130px" }, new Date(ev.ts).toLocaleString());
+    let badge, msg;
+    if (ev.type === "job_run") {
+      badge = makeEl("span", { className: "badge " + (ev.success ? "badge-ok" : "badge-fail"), style: "font-size:8px" }, ev.success ? "OK" : "FAIL");
+      msg = makeEl("span", null, ev.job + (ev.message ? " — " + ev.message : ""));
+    } else if (ev.type === "schema_drift") {
+      badge = makeEl("span", { className: "badge", style: "font-size:8px;border-color:var(--yellow);color:var(--yellow);background:var(--yellow-dim)" }, "DRIFT");
+      msg = makeEl("span", null, ev.message);
+    } else {
+      badge = makeEl("span", { className: "badge", style: "font-size:8px;border-color:var(--text-dim);color:var(--text-dim)" }, ev.type);
+      msg = makeEl("span", null, ev.message || "");
+    }
+    const row = makeEl("div", { style: "display:flex;align-items:center;gap:10px;padding:6px 0;border-bottom:1px solid rgba(255,255,255,.04);font-size:12px" }, [ts, badge, msg]);
+    el.appendChild(row);
+  }
 }
 
 // ── DB Management ──────────────────────────────────────────────

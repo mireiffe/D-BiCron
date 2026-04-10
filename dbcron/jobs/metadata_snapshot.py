@@ -206,6 +206,15 @@ class MetadataSnapshotJob(Job):
         with open(out_path, "w", encoding="utf-8") as f:
             json.dump(snapshot, f, ensure_ascii=False, indent=2)
 
+        # Append freshness log (row count tracking over time)
+        freshness_path = DATA_DIR / "freshness_log.jsonl"
+        ts = snapshot["snapshot_at"]
+        with open(freshness_path, "a", encoding="utf-8") as f:
+            for db_id, db_info in snapshot["databases"].items():
+                for tbl_key, tbl in db_info.get("tables", {}).items():
+                    entry = {"ts": ts, "db": db_id, "table": tbl_key, "rows": tbl["estimated_row_count"]}
+                    f.write(json.dumps(entry, ensure_ascii=False) + "\n")
+
         if errors:
             msg = f"{total_tables}개 테이블 수집, {len(errors)}개 오류: {'; '.join(errors)}"
             return JobResult(success=False, message=msg, rows_affected=total_tables)

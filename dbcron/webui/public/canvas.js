@@ -691,6 +691,25 @@ function openDetailPanel(node) {
     }
   }
 
+  // Row count trend (async load)
+  const trendSec = _makeSection("Row Count Trend");
+  const trendWrap = _el("div", { style: { fontSize: "11px", color: "#7b7898" } }, "Loading...");
+  trendSec.appendChild(trendWrap);
+  content.appendChild(trendSec);
+  fetch(`/api/freshness?db=${encodeURIComponent(node.dbKey)}&table=${encodeURIComponent(node.tKey)}`)
+    .then(r => r.json())
+    .then(data => {
+      while (trendWrap.firstChild) trendWrap.removeChild(trendWrap.firstChild);
+      if (!data.length) { trendWrap.textContent = "No history yet"; return; }
+      for (const d of data.slice(-10)) {
+        const row = _el("div", { style: { display: "flex", justifyContent: "space-between", padding: "2px 0", borderBottom: "1px solid rgba(255,255,255,.03)" } });
+        row.appendChild(_el("span", { style: { color: "#7b7898", fontSize: "10px" } }, new Date(d.ts).toLocaleString()));
+        row.appendChild(_el("span", { style: { color: "#c8ff00" } }, formatCount(d.rows)));
+        trendWrap.appendChild(row);
+      }
+    })
+    .catch(() => { trendWrap.textContent = "Failed to load"; });
+
   panel.classList.add("open");
 
   // Path highlighting: find connected nodes
