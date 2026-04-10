@@ -1,0 +1,42 @@
+- generic [active] [ref=e1]:
+  - banner [ref=e3]:
+    - generic [ref=e4]:
+      - generic [ref=e5]: D-BiCron
+      - generic [ref=e6]: coredb scheduler
+    - generic [ref=e7]: Online
+  - generic [ref=e9]:
+    - complementary [ref=e10]:
+      - generic [ref=e11]:
+        - generic [ref=e12]: ">_"
+        - text: Jobs
+        - generic [ref=e13]: "0"
+      - generic [ref=e15]: No jobs registered
+    - generic [ref=e16]:
+      - generic [ref=e17]:
+        - generic [ref=e18]:
+          - generic [ref=e19]: +
+          - text: Create Schedule
+        - generic [ref=e22]:
+          - generic [ref=e23]:
+            - generic [ref=e24]: Job
+            - combobox [ref=e25] [cursor=pointer]
+          - generic [ref=e26]:
+            - generic [ref=e27]: Cron
+            - textbox "*/10 * * * *" [ref=e28]
+          - generic [ref=e29]:
+            - generic [ref=e30]: Days
+            - spinbutton [ref=e31]: "1"
+          - button "+ Register" [ref=e34] [cursor=pointer]
+      - generic [ref=e35]:
+        - generic [ref=e37]:
+          - generic [ref=e38]:
+            - generic [ref=e39]: ☰
+            - text: Active Schedules
+            - generic [ref=e40]: "0"
+          - generic [ref=e42]: No active schedules
+        - generic [ref=e44]:
+          - generic [ref=e45]:
+            - generic [ref=e46]: ▸
+            - text: Run History
+            - generic [ref=e47]: "0"
+          - generic [ref=e49]: No runs yet

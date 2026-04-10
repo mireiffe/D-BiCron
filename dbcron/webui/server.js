@@ -276,6 +276,37 @@ app.get("/api/jobs", (_req, res) => {
   res.json(AVAILABLE_JOBS);
 });
 
+// Job statistics derived from history
+app.get("/api/jobs/stats", (_req, res) => {
+  const stats = {};
+  for (const h of runHistory) {
+    if (!stats[h.jobName]) {
+      stats[h.jobName] = { lastSuccess: null, lastFailure: null, failStreak: 0, durations: [] };
+    }
+    const s = stats[h.jobName];
+    if (h.success) {
+      if (!s.lastSuccess) s.lastSuccess = h.finishedAt;
+    } else {
+      if (!s.lastFailure) s.lastFailure = h.finishedAt;
+    }
+  }
+  // Calculate fail streaks (consecutive failures from most recent)
+  for (const jobName of Object.keys(stats)) {
+    let streak = 0;
+    for (const h of runHistory) {
+      if (h.jobName !== jobName) continue;
+      if (!h.success) streak++;
+      else break;
+    }
+    stats[jobName].failStreak = streak;
+  }
+  // Next run times from schedules
+  for (const [, s] of scheduledTasks) {
+    if (!stats[s.jobName]) stats[s.jobName] = { lastSuccess: null, lastFailure: null, failStreak: 0 };
+  }
+  res.json(stats);
+});
+
 // Run a job immediately (fire-and-forget)
 app.post("/api/jobs/:name/run", (req, res) => {
   const jobMeta = AVAILABLE_JOBS.find((j) => j.name === req.params.name);

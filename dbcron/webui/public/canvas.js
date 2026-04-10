@@ -693,14 +693,36 @@ function openDetailPanel(node) {
 
   panel.classList.add("open");
 
-  gRoot.selectAll("g.table-node rect:first-child")
-    .attr("stroke-width", d => d.key === node.key ? 3 : 2);
+  // Path highlighting: find connected nodes
+  const connectedKeys = new Set([node.key]);
+  const connectedEdges = new Set();
+  for (const c of CS.layout?.connections || []) {
+    if (c.source.key === node.key || c.target.key === node.key) {
+      connectedKeys.add(c.source.key);
+      connectedKeys.add(c.target.key);
+      connectedEdges.add(c.key);
+    }
+  }
+
+  gRoot.selectAll("g.table-node")
+    .attr("opacity", d => connectedKeys.has(d.key) ? 1 : 0.2)
+    .select("rect:first-child")
+    .attr("stroke-width", d => d.key === node.key ? 3 : connectedKeys.has(d.key) ? 2.5 : 2);
+  gRoot.selectAll("g.entry-point")
+    .attr("opacity", d => connectedKeys.has(d.key) ? 1 : 0.2);
+  gRoot.selectAll("path.connection")
+    .attr("opacity", d => connectedEdges.has(d.key) ? 1 : 0.08);
 }
 
 function closeDetailPanel() {
   document.getElementById("detail-panel").classList.remove("open");
   CS.selectedTable = null;
-  gRoot.selectAll("g.table-node rect:first-child").attr("stroke-width", 2);
+  // Restore full opacity
+  gRoot.selectAll("g.table-node").attr("opacity", 1)
+    .select("rect:first-child").attr("stroke-width", 2);
+  gRoot.selectAll("g.entry-point").attr("opacity", 1);
+  gRoot.selectAll("path.connection")
+    .attr("opacity", d => d.type === "fk" ? 0.4 : 0.85);
 }
 
 // ── Connection (arrow) detail panel ────────────────────────────
@@ -849,6 +871,46 @@ async function refreshMetadata() {
     if (typeof toast === "function") toast("Failed to refresh", false);
     if (btn) { btn.disabled = false; btn.textContent = "REFRESH"; }
   }
+}
+
+// ── Position persistence ───────────────────────────────────────
+
+// ── Layer toggles ──────────────────────────────────────────────
+
+function toggleLayer(type, visible) {
+  gRoot.selectAll(`path.conn-${type}`).style("display", visible ? null : "none");
+  gRoot.selectAll("path.conn-hit").filter(d => d.type === type).style("display", visible ? null : "none");
+  gRoot.selectAll("text.conn-label").filter(d => d.type === type).style("display", visible ? null : "none");
+  if (type === "entry") {
+    gRoot.selectAll("g.entry-point").style("display", visible ? null : "none");
+  }
+}
+
+// ── Search ─────────────────────────────────────────────────────
+
+function canvasSearch(query) {
+  const q = (query || "").toLowerCase().trim();
+  const countEl = document.getElementById("canvas-search-count");
+
+  if (!q) {
+    gRoot.selectAll("g.table-node").attr("opacity", 1);
+    gRoot.selectAll("g.db-container").attr("opacity", 1);
+    gRoot.selectAll("g.entry-point").attr("opacity", 1);
+    gRoot.selectAll("path.connection").attr("opacity", d => d.type === "fk" ? 0.4 : 0.85);
+    if (countEl) countEl.textContent = "";
+    return;
+  }
+
+  let matchCount = 0;
+  gRoot.selectAll("g.table-node").attr("opacity", function (d) {
+    const match = d.label.toLowerCase().includes(q) || d.tKey.toLowerCase().includes(q) || d.dbKey.toLowerCase().includes(q);
+    if (match) matchCount++;
+    return match ? 1 : 0.15;
+  });
+  gRoot.selectAll("g.entry-point").attr("opacity", d =>
+    d.name.toLowerCase().includes(q) ? 1 : 0.15);
+  gRoot.selectAll("path.connection").attr("opacity", 0.1);
+  if (countEl) countEl.textContent = matchCount ? matchCount + " found" : "no results";
 }
 
 // ── Position persistence ───────────────────────────────────────

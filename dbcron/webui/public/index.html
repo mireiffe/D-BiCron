@@ -518,6 +518,28 @@
     .legend-line.entry { background: #ff2d8a; border-style: dashed; border-width: 1px 0 0 0; height: 0; border-color: #ff2d8a; }
     .legend-line.fk { border-top: 1px dotted rgba(0,229,255,.4); height: 0; }
 
+    /* ── Canvas search bar ── */
+    #canvas-search {
+      position: absolute; top: 14px; left: 50%; transform: translateX(-50%); z-index: 10;
+      display: none; align-items: center; gap: 6px;
+      background: rgba(18,18,42,.9); border: 2px solid var(--cyan);
+      border-radius: var(--radius); padding: 4px 10px;
+      box-shadow: 0 0 15px var(--cyan-glow);
+    }
+    #canvas-search.open { display: flex; }
+    #canvas-search input {
+      background: transparent; border: none; color: var(--text);
+      font-family: var(--font-code); font-size: 12px; outline: none; width: 220px;
+    }
+    #canvas-search .search-count {
+      font-family: var(--font-code); font-size: 10px; color: var(--text-dim); white-space: nowrap;
+    }
+    #canvas-search .search-close {
+      background: none; border: none; color: var(--text-dim); cursor: pointer;
+      font-size: 14px; line-height: 1; padding: 0 2px;
+    }
+    #canvas-search .search-close:hover { color: var(--red); }
+
     /* ── DB management modal ── */
     .db-modal-body { padding: 16px; overflow-y: auto; flex: 1; }
     .db-form { display: flex; flex-direction: column; gap: 10px; }
@@ -578,6 +600,12 @@
     <button class="btn btn-lime btn-sm" onclick="openDbModal()" title="Manage databases" style="margin-top:8px">DB</button>
   </div>
 
+  <div id="canvas-search">
+    <input id="canvas-search-input" type="text" placeholder="Search tables..." oninput="canvasSearch(this.value)" />
+    <span class="search-count" id="canvas-search-count"></span>
+    <button class="search-close" onclick="closeCanvasSearch()">&times;</button>
+  </div>
+
   <svg id="pipeline-canvas">
     <defs>
       <marker id="arrow-pipeline" viewBox="0 0 10 6" refX="10" refY="3" markerWidth="8" markerHeight="6" orient="auto">
@@ -600,9 +628,9 @@
   <div id="canvas-snapshot-info" style="display:none"></div>
 
   <div id="canvas-legend">
-    <div class="legend-item"><div class="legend-line pipeline"></div><span style="color:var(--text-dim)">Pipeline (sync)</span></div>
-    <div class="legend-item"><div class="legend-line entry"></div><span style="color:var(--text-dim)">Entry Point</span></div>
-    <div class="legend-item"><div class="legend-line fk"></div><span style="color:var(--text-dim)">Foreign Key</span></div>
+    <label class="legend-item" style="cursor:pointer"><input type="checkbox" checked onchange="toggleLayer('pipeline',this.checked)" style="accent-color:#ffd000;margin:0"><div class="legend-line pipeline"></div><span style="color:var(--text-dim)">Pipeline</span></label>
+    <label class="legend-item" style="cursor:pointer"><input type="checkbox" checked onchange="toggleLayer('entry',this.checked)" style="accent-color:#ff2d8a;margin:0"><div class="legend-line entry"></div><span style="color:var(--text-dim)">Entry Point</span></label>
+    <label class="legend-item" style="cursor:pointer"><input type="checkbox" checked onchange="toggleLayer('fk',this.checked)" style="accent-color:#00e5ff;margin:0"><div class="legend-line fk"></div><span style="color:var(--text-dim)">Foreign Key</span></label>
   </div>
 
   <div class="detail-panel" id="detail-panel">
@@ -644,7 +672,8 @@
             </div>
             <div class="field">
               <span class="field-label" style="display:flex;align-items:center;gap:5px">Cron <button class="cron-help-btn" onclick="openCronGuide()" title="Cron syntax guide">?</button></span>
-              <input id="sched-cron" type="text" placeholder="*/10 * * * *" value="*/10 * * * *" style="width:140px" />
+              <input id="sched-cron" type="text" placeholder="*/10 * * * *" value="*/10 * * * *" style="width:140px" oninput="updateCronPreview()" />
+              <div id="cron-preview" style="font-size:9px;color:var(--text-dim);margin-top:4px;line-height:1.5"></div>
             </div>
             <div class="field" id="sched-days-field">
               <span class="field-label">Days</span>
@@ -906,7 +935,76 @@ function closeLogModal() {
   stopLiveLog();
   document.getElementById("log-modal").style.display = "none";
 }
-document.addEventListener("keydown", e => { if (e.key === "Escape") { closeLogModal(); closeCronGuide(); closeDbModal(); } });
+document.addEventListener("keydown", e => {
+  if (e.key === "Escape") { closeLogModal(); closeCronGuide(); closeDbModal(); closeCanvasSearch(); }
+  if ((e.ctrlKey || e.metaKey) && e.key === "f" && document.getElementById("canvas-view").style.display !== "none") {
+    e.preventDefault();
+    openCanvasSearch();
+  }
+});
+
+function updateCronPreview() {
+  const expr = document.getElementById("sched-cron").value.trim();
+  const el = document.getElementById("cron-preview");
+  if (!el) return;
+  const parts = expr.split(/\s+/);
+  if (parts.length !== 5) { el.textContent = ""; return; }
+  try {
+    const times = getNextCronTimes(parts, 5);
+    el.textContent = times.map(t => t.toLocaleString(undefined, { month:"short", day:"numeric", hour:"2-digit", minute:"2-digit" })).join(" | ");
+  } catch { el.textContent = ""; }
+}
+
+function getNextCronTimes(parts, count) {
+  const [minF, hourF, domF, monF, dowF] = parts;
+  const results = [];
+  const now = new Date();
+  const d = new Date(now.getFullYear(), now.getMonth(), now.getDate(), now.getHours(), now.getMinutes() + 1, 0, 0);
+  const MAX_ITER = 60 * 24 * 32; // ~32 days of minutes
+  for (let i = 0; i < MAX_ITER && results.length < count; i++) {
+    if (cronFieldMatch(d.getMinutes(), minF) &&
+        cronFieldMatch(d.getHours(), hourF) &&
+        cronFieldMatch(d.getDate(), domF) &&
+        cronFieldMatch(d.getMonth() + 1, monF) &&
+        cronFieldMatch(d.getDay(), dowF)) {
+      results.push(new Date(d));
+    }
+    d.setMinutes(d.getMinutes() + 1);
+  }
+  return results;
+}
+
+function cronFieldMatch(val, field) {
+  if (field === "*") return true;
+  for (const part of field.split(",")) {
+    if (part.includes("/")) {
+      const [range, step] = part.split("/");
+      const s = parseInt(step);
+      if (range === "*") { if (val % s === 0) return true; }
+      else {
+        const [lo] = range.split("-").map(Number);
+        if ((val - lo) >= 0 && (val - lo) % s === 0) return true;
+      }
+    } else if (part.includes("-")) {
+      const [lo, hi] = part.split("-").map(Number);
+      if (val >= lo && val <= hi) return true;
+    } else {
+      if (val === parseInt(part)) return true;
+    }
+  }
+  return false;
+}
+
+function openCanvasSearch() {
+  const bar = document.getElementById("canvas-search");
+  bar.classList.add("open");
+  document.getElementById("canvas-search-input").focus();
+}
+function closeCanvasSearch() {
+  document.getElementById("canvas-search").classList.remove("open");
+  document.getElementById("canvas-search-input").value = "";
+  if (typeof canvasSearch === "function") canvasSearch("");
+}
 
 function toast(msg, ok) {
   const t = makeEl("div", { className: `toast ${ok ? "toast-ok" : "toast-err"}` }, msg);
@@ -915,7 +1013,7 @@ function toast(msg, ok) {
 }
 
 async function loadJobs() {
-  const jobs = await api("/api/jobs");
+  const [jobs, jobStats] = await Promise.all([api("/api/jobs"), api("/api/jobs/stats").catch(() => ({}))]);
   jobsCache = jobs;
   const el = document.getElementById("jobs-list");
   const sel = document.getElementById("sched-job");
@@ -943,11 +1041,21 @@ async function loadJobs() {
     const actions = [];
     if (hasDays) actions.push(makeEl("div", { className: "field-inline" }, [makeEl("label", null, "days"), daysInput]));
     actions.push(runBtn);
-    el.appendChild(makeEl("div", { className: "job-card" }, [
-      makeEl("div", { className: "job-name" }, j.label),
-      makeEl("div", { className: "job-desc" }, j.description),
-      makeEl("div", { className: "job-actions" }, actions),
-    ]));
+    // Stats line
+    const st = jobStats[j.name];
+    let statsEl = null;
+    if (st) {
+      const parts = [];
+      if (st.lastSuccess) parts.push(makeEl("span", { style: "color:var(--green)" }, "OK " + new Date(st.lastSuccess).toLocaleDateString()));
+      if (st.failStreak > 0) parts.push(makeEl("span", { style: "color:var(--red)" }, st.failStreak + "x FAIL"));
+      if (parts.length) {
+        statsEl = makeEl("div", { style: "font-size:10px;margin-bottom:6px;display:flex;gap:10px" }, parts);
+      }
+    }
+    const children = [makeEl("div", { className: "job-name" }, j.label), makeEl("div", { className: "job-desc" }, j.description)];
+    if (statsEl) children.push(statsEl);
+    children.push(makeEl("div", { className: "job-actions" }, actions));
+    el.appendChild(makeEl("div", { className: "job-card" }, children));
   });
   sel.addEventListener("change", updateSchedDaysField);
   updateSchedDaysField();
