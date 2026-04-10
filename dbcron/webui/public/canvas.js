@@ -310,7 +310,7 @@ function renderTableNodes(layer, nodes) {
     .attr("class", "table-node")
     .attr("transform", d => `translate(${d.x},${d.y})`)
     .call(drag).style("cursor", "pointer")
-    .on("click", (_e, d) => openDetailPanel(d))
+    .on("click", (e, d) => e.shiftKey && CS.selectedTable ? openComparePanel(d) : openDetailPanel(d))
     .on("mouseenter", (event, d) => showTooltip(event, d))
     .on("mouseleave", hideTooltip);
 
@@ -777,6 +777,94 @@ function closeDetailPanel() {
   gRoot.selectAll("g.entry-point").attr("opacity", 1);
   gRoot.selectAll("path.connection")
     .attr("opacity", d => d.type === "fk" ? 0.4 : 0.85);
+}
+
+// ── Compare panel (Shift+click second table) ──────────────────
+
+function openComparePanel(nodeB) {
+  // Find currently selected node
+  const nodeA = CS.layout?.tableNodes.find(n => n.key === CS.selectedTable);
+  if (!nodeA || nodeA.key === nodeB.key) { openDetailPanel(nodeB); return; }
+
+  const panel = document.getElementById("detail-panel");
+  const dbTag = document.getElementById("detail-db-tag");
+  const tblName = document.getElementById("detail-table-name");
+  const rowCount = document.getElementById("detail-row-count");
+  const content = document.getElementById("detail-content");
+
+  dbTag.textContent = "COMPARE";
+  dbTag.style.borderColor = "#ffd000";
+  dbTag.style.color = "#ffd000";
+  dbTag.style.background = "rgba(255,208,0,.1)";
+  tblName.textContent = nodeA.label + " vs " + nodeB.label;
+  rowCount.textContent = "";
+
+  while (content.firstChild) content.removeChild(content.firstChild);
+
+  // Side-by-side summary
+  const summSec = _makeSection("Summary");
+  const tbl = _el("table", { className: "detail-tbl" });
+  const thead = _el("thead");
+  thead.appendChild(_el("tr", null, [_el("th"), _el("th", null, nodeA.label), _el("th", null, nodeB.label)]));
+  tbl.appendChild(thead);
+  const tbody = _el("tbody");
+  tbody.appendChild(_el("tr", null, [
+    _el("td", { style: { color: "#7b7898" } }, "Database"),
+    _el("td", null, nodeA.dbKey),
+    _el("td", null, nodeB.dbKey),
+  ]));
+  tbody.appendChild(_el("tr", null, [
+    _el("td", { style: { color: "#7b7898" } }, "Rows"),
+    _el("td", { style: { color: "#c8ff00" } }, formatCount(nodeA.rowCount)),
+    _el("td", { style: { color: "#c8ff00" } }, formatCount(nodeB.rowCount)),
+  ]));
+  tbody.appendChild(_el("tr", null, [
+    _el("td", { style: { color: "#7b7898" } }, "Columns"),
+    _el("td", null, String(nodeA.data.columns?.length || 0)),
+    _el("td", null, String(nodeB.data.columns?.length || 0)),
+  ]));
+  tbody.appendChild(_el("tr", null, [
+    _el("td", { style: { color: "#7b7898" } }, "PK"),
+    _el("td", null, nodeA.data.primary_key?.columns.join(", ") || "-"),
+    _el("td", null, nodeB.data.primary_key?.columns.join(", ") || "-"),
+  ]));
+  tbl.appendChild(tbody);
+  summSec.appendChild(tbl);
+  content.appendChild(summSec);
+
+  // Column diff
+  const colSec = _makeSection("Column Comparison");
+  const colsA = new Map((nodeA.data.columns || []).map(c => [c.name, c]));
+  const colsB = new Map((nodeB.data.columns || []).map(c => [c.name, c]));
+  const allNames = new Set([...colsA.keys(), ...colsB.keys()]);
+
+  const ctbl = _el("table", { className: "detail-tbl" });
+  const cthead = _el("thead");
+  cthead.appendChild(_el("tr", null, [_el("th", null, "Column"), _el("th", null, nodeA.label), _el("th", null, nodeB.label)]));
+  ctbl.appendChild(cthead);
+  const ctbody = _el("tbody");
+  for (const name of allNames) {
+    const a = colsA.get(name);
+    const b = colsB.get(name);
+    const match = a && b && a.type === b.type;
+    const color = !a || !b ? "#ff2d8a" : match ? "" : "#ffd000";
+    ctbody.appendChild(_el("tr", null, [
+      _el("td", { style: { color: color || "#e4e2f0" } }, name),
+      _el("td", { style: { color: "#7b7898" } }, a ? a.type : "-"),
+      _el("td", { style: { color: "#7b7898" } }, b ? b.type : "-"),
+    ]));
+  }
+  ctbl.appendChild(ctbody);
+  colSec.appendChild(ctbl);
+  content.appendChild(colSec);
+
+  panel.classList.add("open");
+
+  // Highlight both nodes
+  gRoot.selectAll("g.table-node")
+    .attr("opacity", d => (d.key === nodeA.key || d.key === nodeB.key) ? 1 : 0.2)
+    .select("rect:first-child")
+    .attr("stroke-width", d => (d.key === nodeA.key || d.key === nodeB.key) ? 3 : 2);
 }
 
 // ── Connection (arrow) detail panel ────────────────────────────
