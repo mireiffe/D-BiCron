@@ -2,7 +2,7 @@
   "name": "db-manager",
   "version": "1.0.0",
   "private": true,
-  "description": "coredb 주기적 관리용 cron job 플랫폼",
+  "description": "DB 주기적 관리용 cron job 플랫폼",
   "scripts": {
     "start": "node dbcron/webui/server.js",
     "seed": "uv run python scripts/seed.py",

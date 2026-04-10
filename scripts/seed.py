@@ -259,17 +259,15 @@ def write_sample_schedules():
 # ── 5. 메타데이터 스냅샷 수집 ──────────────────────────────────
 
 def run_metadata_snapshot():
-    from dbcron.jobs.metadata_snapshot import collect_db_metadata, DATA_DIR
-    from sqlalchemy import create_engine
+    from dbcron.db import create_engine_for
+    from dbcron.jobs.metadata_snapshot import collect_db_metadata
 
     dbs = json.loads((DATA / "databases.json").read_text())
-    from dbcron.jobs.metadata_snapshot import URL_BUILDERS
 
     snapshot = {"snapshot_at": "", "databases": {}}
     total = 0
     for db_cfg in dbs:
-        url = URL_BUILDERS[db_cfg["type"]](db_cfg)
-        engine = create_engine(url)
+        engine = create_engine_for(db_cfg)
         tables = collect_db_metadata(engine, db_cfg["type"])
         engine.dispose()
         snapshot["databases"][db_cfg["id"]] = {

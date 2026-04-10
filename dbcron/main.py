@@ -17,7 +17,7 @@ logging.basicConfig(
 
 def main():
     parser = argparse.ArgumentParser(
-        description="coredb batch job runner",
+        description="dbcron — DB management job runner",
     )
     parser.add_argument(
         "job",

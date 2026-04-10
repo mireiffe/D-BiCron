@@ -7,7 +7,7 @@ from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
 from datetime import datetime
 
-from ..config import InfraConfig
+from ..config import AppConfig
 
 logger = logging.getLogger(__name__)
 
@@ -38,7 +38,7 @@ class Job(ABC):
     description: str = ""
     default_args: dict = {"days": 1}
 
-    def __init__(self, config: InfraConfig):
+    def __init__(self, config: AppConfig | None = None):
         self.config = config
         self.logger = logging.getLogger(f"job.{self.name}")
 

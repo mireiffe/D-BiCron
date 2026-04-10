@@ -7,11 +7,9 @@
 from __future__ import annotations
 
 import json
-from pathlib import Path
 
+from ..db import DATA_DIR
 from .base import Job, JobResult
-
-DATA_DIR = Path(__file__).resolve().parent.parent.parent / "data"
 
 
 class FreshnessCheckJob(Job):

@@ -1,8 +1,4 @@
 {
-  "databases": {
-    "susdb": { "label": "SUS DB (Source)", "color": "#00e5ff" },
-    "coredb": { "label": "Core DB (Target)", "color": "#c8ff00" }
-  },
   "entry_points": [
     {
       "id": "ep_sensor_api",
@@ -10,7 +6,7 @@
       "description": "IoT sensor data ingestion endpoint",
       "type": "api",
       "targets": [
-        { "db": "susdb", "schema": "public", "table": "sensor_readings" }
+        { "db": "source_db", "schema": "public", "table": "sensor_readings" }
       ]
     },
     {
@@ -19,7 +15,7 @@
       "description": "Device registration and master data service",
       "type": "service",
       "targets": [
-        { "db": "susdb", "schema": "public", "table": "device_master" }
+        { "db": "source_db", "schema": "public", "table": "device_master" }
       ]
     }
   ],
@@ -36,8 +32,8 @@
       "description": "Manual ETL process",
       "connections": [
         {
-          "from": { "db": "susdb", "schema": "public", "table": "raw_events" },
-          "to": { "db": "coredb", "schema": "public", "table": "processed_events" },
+          "from": { "db": "source_db", "schema": "public", "table": "raw_events" },
+          "to": { "db": "target_db", "schema": "public", "table": "processed_events" },
           "label": "ETL transform"
         }
       ]

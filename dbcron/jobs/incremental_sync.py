@@ -1,4 +1,4 @@
-"""Incremental sync: upsert rows from susdb -> coredb.
+"""Incremental sync: source DB -> target DB upsert.
 
 증분 동기화 Job.
 Source DB 에서 timestamp 기준으로 delta 행을 읽어서 Target DB 에 upsert 합니다.
@@ -13,6 +13,7 @@ Source DB 에서 timestamp 기준으로 delta 행을 읽어서 Target DB 에 ups
 
 설정:
   SYNC_CONFIG 환경변수로 JSON 설정 파일 경로 지정 (기본: sync_config.json)
+  source / target 은 databases.json 의 DB ID(문자열) 또는 인라인 접속 정보(dict)
 """
 
 from __future__ import annotations
@@ -24,7 +25,7 @@ from datetime import datetime, timedelta
 
 from sqlalchemy import create_engine, text
 
-from ..db import create_coredb_engine, create_susdb_engine
+from ..db import create_engine_by_id, create_engine_for
 from .base import Job, JobResult
 
 
@@ -38,8 +39,8 @@ class IncrementalSyncJob(Job):
         sync_cfg = self._load_sync_config()
         tables = sync_cfg["tables"]
 
-        src_engine = self._build_engine(sync_cfg, "source", create_susdb_engine)
-        tgt_engine = self._build_engine(sync_cfg, "target", create_coredb_engine)
+        src_engine = self._build_engine(sync_cfg, "source")
+        tgt_engine = self._build_engine(sync_cfg, "target")
 
         total = 0
         errors: list[str] = []
@@ -73,17 +74,28 @@ class IncrementalSyncJob(Job):
         with open(path) as f:
             return json.load(f)
 
-    def _build_engine(self, sync_cfg: dict, key: str, fallback_factory):
-        """sync_config 에 DB 접속 정보가 있으면 사용, 없으면 기존 susdb/coredb fallback."""
-        db = sync_cfg.get(key)
-        if db:
-            url = (
-                f"postgresql://{db['user']}:{db['password']}"
-                f"@{db['host']}:{db.get('port', 5432)}/{db['database']}"
+    def _build_engine(self, sync_cfg: dict, key: str):
+        """sync_config 의 source/target 설정으로 엔진을 생성한다.
+
+        값이 문자열이면 databases.json 의 DB ID 로 조회,
+        dict 이면 인라인 접속 정보로 직접 엔진 생성.
+        """
+        ref = sync_cfg.get(key)
+        if ref is None:
+            raise ValueError(
+                f"sync_config.json 에 '{key}' 설정이 필요합니다. "
+                f"databases.json 의 DB ID(문자열) 또는 인라인 접속 정보(dict)를 지정하세요."
             )
-            self.logger.info("%s DB: %s@%s/%s", key, db["user"], db["host"], db["database"])
-            return create_engine(url, pool_pre_ping=True)
-        return fallback_factory(self.config)
+        if isinstance(ref, str):
+            self.logger.info("%s DB: databases.json ID '%s'", key, ref)
+            return create_engine_by_id(ref)
+        # inline connection info (dict)
+        url = (
+            f"postgresql://{ref['user']}:{ref['password']}"
+            f"@{ref['host']}:{ref.get('port', 5432)}/{ref['database']}"
+        )
+        self.logger.info("%s DB: %s@%s/%s", key, ref["user"], ref["host"], ref["database"])
+        return create_engine(url, pool_pre_ping=True)
 
     # ── per-table sync ────────────────────────────────────────────────
 

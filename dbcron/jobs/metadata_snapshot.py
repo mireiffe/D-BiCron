@@ -11,40 +11,20 @@ import json
 import logging
 import os
 from datetime import datetime
-from pathlib import Path
 
-from sqlalchemy import create_engine, inspect, text
+from sqlalchemy import inspect, text
 
+from ..db import (
+    DATA_DIR,
+    ROW_COUNT_SQL,
+    SYSTEM_SCHEMAS,
+    URL_BUILDERS,
+    create_engine_for,
+    load_databases,
+)
 from .base import Job, JobResult
 
 logger = logging.getLogger(__name__)
-
-DATA_DIR = Path(__file__).resolve().parent.parent.parent / "data"
-
-# ── DB 타입별 설정 ──────────────────────────────────────────────
-
-URL_BUILDERS: dict[str, callable] = {
-    "postgresql": lambda c: f"postgresql+psycopg2://{c.get('user','')}:{c.get('password','')}@{c['host']}:{c.get('port',5432)}/{c['dbname']}",
-    "mssql": lambda c: f"mssql+pymssql://{c.get('user','')}:{c.get('password','')}@{c['host']}:{c.get('port',1433)}/{c['dbname']}",
-    "sqlite": lambda c: f"sqlite:///{c['host']}",
-    "clickhouse": lambda c: f"clickhouse+http://{c.get('user','')}:{c.get('password','')}@{c['host']}:{c.get('port',8123)}/{c['dbname']}",
-}
-
-SYSTEM_SCHEMAS: dict[str, set[str]] = {
-    "postgresql": {"pg_catalog", "information_schema"},
-    "mssql": {"sys", "INFORMATION_SCHEMA", "guest", "db_owner", "db_accessadmin", "db_securityadmin", "db_ddladmin", "db_backupoperator", "db_datareader", "db_datawriter", "db_denydatareader", "db_denydatawriter"},
-    "sqlite": set(),
-    "clickhouse": {"system", "INFORMATION_SCHEMA", "information_schema"},
-}
-
-# row count 추정 쿼리 (inspect 에 없는 유일한 항목)
-ROW_COUNT_SQL: dict[str, str] = {
-    "postgresql": "SELECT COALESCE(n_live_tup,0) FROM pg_stat_user_tables WHERE schemaname=:s AND relname=:t",
-    "mssql": "SELECT SUM(p.rows) FROM sys.partitions p JOIN sys.tables t ON p.object_id=t.object_id JOIN sys.schemas s ON t.schema_id=s.schema_id WHERE s.name=:s AND t.name=:t AND p.index_id<2",
-    "clickhouse": "SELECT total_rows FROM system.tables WHERE database=:s AND name=:t",
-}
-
-SUPPORTED_TYPES = list(URL_BUILDERS.keys())
 
 
 def _estimate_row_count(conn, db_type: str, schema: str, table: str) -> int:
@@ -153,7 +133,7 @@ class MetadataSnapshotJob(Job):
     default_args: dict = {}
 
     def run(self, **kwargs) -> JobResult:
-        databases = self._load_databases()
+        databases = load_databases()
         if not databases:
             return JobResult(
                 success=False,
@@ -171,12 +151,11 @@ class MetadataSnapshotJob(Job):
             db_id = db_cfg["id"]
             db_type = db_cfg.get("type", "postgresql")
 
-            builder = URL_BUILDERS.get(db_type)
-            if builder is None:
+            if db_type not in URL_BUILDERS:
                 errors.append(f"{db_id}: unsupported type '{db_type}'")
                 continue
 
-            engine = create_engine(builder(db_cfg), pool_pre_ping=True)
+            engine = create_engine_for(db_cfg)
             try:
                 tables = collect_db_metadata(engine, db_type)
                 snapshot["databases"][db_id] = {
@@ -224,17 +203,3 @@ class MetadataSnapshotJob(Job):
             message=f"{len(databases)}개 DB, {total_tables}개 테이블 메타데이터 수집 완료",
             rows_affected=total_tables,
         )
-
-    @staticmethod
-    def _load_databases() -> list[dict]:
-        import base64
-        db_file = DATA_DIR / "databases.json"
-        if not db_file.exists():
-            return []
-        with open(db_file, encoding="utf-8") as f:
-            dbs = json.load(f)
-        # Decode obfuscated passwords
-        for d in dbs:
-            if d.get("_enc") == "b64" and d.get("password"):
-                d["password"] = base64.b64decode(d["password"]).decode()
-        return dbs

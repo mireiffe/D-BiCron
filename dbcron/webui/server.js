@@ -755,8 +755,12 @@ app.get("/api/lineage/:db/:table", (req, res) => {
   const allConns = [];
   for (const p of cfg.pipelines || []) {
     if (p.connections === "auto" && syncCfg?.tables) {
+      const srcDb = syncCfg.source || "unknown";
+      const tgtDb = syncCfg.target || "unknown";
+      const fromDb = typeof srcDb === "string" ? srcDb : srcDb.database || "source";
+      const toDb = typeof tgtDb === "string" ? tgtDb : tgtDb.database || "target";
       for (const t of syncCfg.tables) {
-        allConns.push({ from: `${t.source_schema || "public"}.${t.table}`, fromDb: "susdb", to: `${t.target_schema || "public"}.${t.table}`, toDb: "coredb", label: p.description || "" });
+        allConns.push({ from: `${t.source_schema || "public"}.${t.table}`, fromDb, to: `${t.target_schema || "public"}.${t.table}`, toDb, label: p.description || "" });
       }
     } else if (Array.isArray(p.connections)) {
       for (const c of p.connections) {
@@ -845,14 +849,18 @@ app.get("/api/pipeline-config", (_req, res) => {
   if (syncCfg && cfg.pipelines) {
     for (const p of cfg.pipelines) {
       if (p.connections === "auto" && syncCfg.tables) {
+        const srcDb = syncCfg.source || "unknown";
+        const tgtDb = syncCfg.target || "unknown";
+        const fromDb = typeof srcDb === "string" ? srcDb : srcDb.database || "source";
+        const toDb = typeof tgtDb === "string" ? tgtDb : tgtDb.database || "target";
         p.connections = syncCfg.tables.map((t) => ({
           from: {
-            db: "susdb",
+            db: fromDb,
             schema: t.source_schema || "public",
             table: t.table,
           },
           to: {
-            db: "coredb",
+            db: toDb,
             schema: t.target_schema || "public",
             table: t.table,
           },

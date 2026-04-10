@@ -9,12 +9,11 @@ from __future__ import annotations
 import json
 import os
 from datetime import datetime
-from pathlib import Path
 
-from sqlalchemy import create_engine, text
+from sqlalchemy import text
 
+from ..db import DATA_DIR, URL_BUILDERS, create_engine_for, load_databases
 from .base import Job, JobResult
-from .metadata_snapshot import DATA_DIR, URL_BUILDERS
 
 
 class TableProfilerJob(Job):
@@ -25,13 +24,11 @@ class TableProfilerJob(Job):
 
     def run(self, **kwargs) -> JobResult:
         snapshot_path = DATA_DIR / "metadata_snapshot.json"
-        db_file = DATA_DIR / "databases.json"
-        if not snapshot_path.exists() or not db_file.exists():
-            return JobResult(success=False, message="스냅샷 또는 DB 설정이 없습니다.")
+        if not snapshot_path.exists():
+            return JobResult(success=False, message="스냅샷이 없습니다. metadata_snapshot을 먼저 실행하세요.")
 
         snapshot = json.loads(snapshot_path.read_text(encoding="utf-8"))
-        databases = json.loads(db_file.read_text(encoding="utf-8"))
-        db_map = {d["id"]: d for d in databases}
+        db_map = {d["id"]: d for d in load_databases()}
 
         profiles = {}
         total = 0
@@ -41,11 +38,10 @@ class TableProfilerJob(Job):
             if not db_cfg:
                 continue
             db_type = db_cfg.get("type", "postgresql")
-            builder = URL_BUILDERS.get(db_type)
-            if not builder:
+            if db_type not in URL_BUILDERS:
                 continue
 
-            engine = create_engine(builder(db_cfg), pool_pre_ping=True)
+            engine = create_engine_for(db_cfg)
             try:
                 with engine.connect() as conn:
                     for tbl_key, tbl in db_info.get("tables", {}).items():

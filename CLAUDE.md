@@ -1,6 +1,8 @@
 # db_manager
 
-coredb 주기적 관리용 cron job 플랫폼. 상세 내용은 `README.md` 참조.
+다중 DB 주기적 관리용 cron job 플랫폼. 상세 내용은 `README.md` 참조.
+
+DB 접속 정보는 `data/databases.json` 에서 관리 (WebUI 또는 직접 편집).
 
 ## Quick ref
 

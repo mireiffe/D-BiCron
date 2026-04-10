@@ -1,19 +1,7 @@
 {
-  "_comment": "source/target 생략 시 .env 의 SUSDB_*/COREDB_* 사용",
-  "source": {
-    "host": "source-db.example.com",
-    "port": 5432,
-    "database": "production",
-    "user": "reader",
-    "password": "secret"
-  },
-  "target": {
-    "host": "target-db.example.com",
-    "port": 5432,
-    "database": "analytics",
-    "user": "writer",
-    "password": "secret"
-  },
+  "_comment": "source/target 에 databases.json 의 DB ID(문자열) 또는 인라인 접속 정보(dict) 지정",
+  "source": "source_db_id",
+  "target": "target_db_id",
   "tables": [
     {
       "table": "device_master",

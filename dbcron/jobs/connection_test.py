@@ -10,12 +10,10 @@ import json
 import os
 import time
 from datetime import datetime
-from pathlib import Path
+from sqlalchemy import text
 
-from sqlalchemy import create_engine, text
-
+from ..db import DATA_DIR, URL_BUILDERS, create_engine_for, load_databases
 from .base import Job, JobResult
-from .metadata_snapshot import DATA_DIR, URL_BUILDERS
 
 
 class ConnectionTestJob(Job):
@@ -25,7 +23,7 @@ class ConnectionTestJob(Job):
     default_args: dict = {}
 
     def run(self, **kwargs) -> JobResult:
-        databases = self._load_databases()
+        databases = load_databases()
         if not databases:
             return JobResult(success=False, message="등록된 DB가 없습니다.")
 
@@ -52,7 +50,7 @@ class ConnectionTestJob(Job):
                 results.append(entry)
                 continue
 
-            engine = create_engine(builder(db_cfg), pool_pre_ping=True)
+            engine = create_engine_for(db_cfg)
             try:
                 t0 = time.monotonic()
                 with engine.connect() as conn:
@@ -97,10 +95,3 @@ class ConnectionTestJob(Job):
             rows_affected=ok_count,
         )
 
-    @staticmethod
-    def _load_databases() -> list[dict]:
-        db_file = DATA_DIR / "databases.json"
-        if not db_file.exists():
-            return []
-        with open(db_file, encoding="utf-8") as f:
-            return json.load(f)
