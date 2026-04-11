@@ -12,7 +12,7 @@ from datetime import datetime
 
 from sqlalchemy import text
 
-from ..db import DATA_DIR, URL_BUILDERS, create_engine_for, load_databases
+from ..db import DATA_DIR, URL_BUILDERS, create_engine_for, load_databases, should_include_table
 from .base import Job, JobResult
 
 
@@ -46,6 +46,8 @@ class TableProfilerJob(Job):
                 with engine.connect() as conn:
                     for tbl_key, tbl in db_info.get("tables", {}).items():
                         schema, table = tbl["schema"], tbl["table"]
+                        if not should_include_table(table, db_cfg):
+                            continue
                         cols = tbl.get("columns", [])[:10]  # first 10 columns only
                         profile = {"columns": {}}
 

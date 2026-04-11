@@ -10,7 +10,7 @@ import json
 
 from sqlalchemy import text
 
-from ..db import DATA_DIR, URL_BUILDERS, create_engine_for, load_databases
+from ..db import DATA_DIR, URL_BUILDERS, create_engine_for, load_databases, should_include_table
 from .base import Job, JobResult
 
 
@@ -43,6 +43,8 @@ class FKIntegrityJob(Job):
             try:
                 with engine.connect() as conn:
                     for tbl_key, tbl in db_info.get("tables", {}).items():
+                        if not should_include_table(tbl["table"], db_cfg):
+                            continue
                         for fk in tbl.get("foreign_keys", []):
                             ref_parts = fk["ref_table"].split(".")
                             if len(ref_parts) != 2:

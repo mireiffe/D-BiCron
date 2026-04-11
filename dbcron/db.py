@@ -8,6 +8,7 @@ URL_BUILDERS / SYSTEM_SCHEMAS / ROW_COUNT_SQL 등 DB 타입별 설정도
 from __future__ import annotations
 
 import base64
+import fnmatch
 import json
 import logging
 from pathlib import Path
@@ -110,6 +111,30 @@ def create_engine_for(db_cfg: dict) -> Engine:
     if builder is None:
         raise ValueError(f"Unsupported DB type: {db_type}")
     return create_engine(builder(db_cfg), pool_pre_ping=True)
+
+
+# ── 테이블 필터 ──────────────────────────────────────────────────
+
+def should_include_table(table_name: str, db_cfg: dict) -> bool:
+    """db_cfg 의 include_tables / exclude_tables 설정에 따라 테이블 포함 여부를 판단한다.
+
+    - include_tables 가 설정되면 매칭되는 테이블만 포함 (whitelist)
+    - exclude_tables 가 설정되면 매칭되는 테이블을 제외 (blacklist)
+    - 둘 다 설정되면 include 먼저 적용 후 exclude 로 제외
+    - 패턴은 fnmatch glob (*, ?) 지원
+    """
+    includes = db_cfg.get("include_tables") or []
+    excludes = db_cfg.get("exclude_tables") or []
+
+    if includes:
+        if not any(fnmatch.fnmatch(table_name, pat) for pat in includes):
+            return False
+
+    if excludes:
+        if any(fnmatch.fnmatch(table_name, pat) for pat in excludes):
+            return False
+
+    return True
 
 
 def create_engine_by_id(db_id: str) -> Engine:

@@ -21,6 +21,7 @@ from ..db import (
     URL_BUILDERS,
     create_engine_for,
     load_databases,
+    should_include_table,
 )
 from .base import Job, JobResult
 
@@ -42,8 +43,11 @@ def _estimate_row_count(conn, db_type: str, schema: str, table: str) -> int:
         return 0
 
 
-def collect_db_metadata(engine, db_type: str) -> dict[str, dict]:
-    """SQLAlchemy inspect() 로 메타데이터 수집. DB 종류 무관."""
+def collect_db_metadata(engine, db_type: str, db_cfg: dict | None = None) -> dict[str, dict]:
+    """SQLAlchemy inspect() 로 메타데이터 수집. DB 종류 무관.
+
+    db_cfg 를 전달하면 include_tables / exclude_tables 필터를 적용한다.
+    """
     insp = inspect(engine)
     skip = SYSTEM_SCHEMAS.get(db_type, set())
     tables: dict[str, dict] = {}
@@ -53,6 +57,8 @@ def collect_db_metadata(engine, db_type: str) -> dict[str, dict]:
     with engine.connect() as conn:
         for schema in schemas:
             for tbl_name in insp.get_table_names(schema=schema):
+                if db_cfg and not should_include_table(tbl_name, db_cfg):
+                    continue
                 key = f"{schema}.{tbl_name}"
 
                 # columns
@@ -157,7 +163,7 @@ class MetadataSnapshotJob(Job):
 
             engine = create_engine_for(db_cfg)
             try:
-                tables = collect_db_metadata(engine, db_type)
+                tables = collect_db_metadata(engine, db_type, db_cfg)
                 snapshot["databases"][db_id] = {
                     "host": db_cfg.get("host", ""),
                     "database": db_cfg.get("dbname", ""),

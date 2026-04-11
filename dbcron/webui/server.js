@@ -520,7 +520,7 @@ app.get("/api/databases", (_req, res) => {
 });
 
 app.post("/api/databases", (req, res) => {
-  const { id, type, label, color, host, port, dbname, user, password } = req.body;
+  const { id, type, label, color, host, port, dbname, user, password, include_tables, exclude_tables } = req.body;
   if (!id || !host || !dbname) {
     return res.status(400).json({ error: "id, host, dbname are required" });
   }
@@ -530,7 +530,7 @@ app.post("/api/databases", (req, res) => {
   }
   const DEFAULTS = { postgresql: 5432, mssql: 1433, clickhouse: 8123, sqlite: 0 };
   const dbType = type || "postgresql";
-  dbs.push({
+  const entry = {
     id,
     type: dbType,
     label: label || id,
@@ -540,7 +540,10 @@ app.post("/api/databases", (req, res) => {
     dbname,
     user: user || "",
     password: password || "",
-  });
+  };
+  if (include_tables?.length) entry.include_tables = include_tables;
+  if (exclude_tables?.length) entry.exclude_tables = exclude_tables;
+  dbs.push(entry);
   saveDatabases(dbs);
   res.status(201).json({ id });
 });
@@ -549,7 +552,7 @@ app.put("/api/databases/:id", (req, res) => {
   const dbs = loadDatabases();
   const idx = dbs.findIndex((d) => d.id === req.params.id);
   if (idx === -1) return res.status(404).json({ error: "Not found" });
-  const { type, label, color, host, port, dbname, user, password } = req.body;
+  const { type, label, color, host, port, dbname, user, password, include_tables, exclude_tables } = req.body;
   if (type !== undefined) dbs[idx].type = type;
   if (label !== undefined) dbs[idx].label = label;
   if (color !== undefined) dbs[idx].color = color;
@@ -558,6 +561,14 @@ app.put("/api/databases/:id", (req, res) => {
   if (dbname !== undefined) dbs[idx].dbname = dbname;
   if (user !== undefined) dbs[idx].user = user;
   if (password !== undefined) dbs[idx].password = password;
+  if (include_tables !== undefined) {
+    if (include_tables.length) dbs[idx].include_tables = include_tables;
+    else delete dbs[idx].include_tables;
+  }
+  if (exclude_tables !== undefined) {
+    if (exclude_tables.length) dbs[idx].exclude_tables = exclude_tables;
+    else delete dbs[idx].exclude_tables;
+  }
   saveDatabases(dbs);
   res.json({ id: req.params.id });
 });

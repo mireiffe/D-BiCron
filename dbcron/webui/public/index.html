@@ -555,7 +555,14 @@
     .db-form { display: flex; flex-direction: column; gap: 10px; }
     .db-form-row { display: flex; gap: 10px; }
     .db-form-row .field { flex: 1; }
-    .db-form .field input { width: 100%; }
+    .db-form .field input, .db-form .field textarea { width: 100%; }
+    .db-form .field textarea {
+      background: var(--surface); color: var(--text); border: 2px solid rgba(0,229,255,.15);
+      border-radius: var(--radius); padding: 6px 8px; font: inherit; font-size: 12px;
+      resize: vertical; min-height: 32px;
+    }
+    .db-form .field textarea:focus { border-color: var(--cyan); outline: none; }
+    .db-form .field .field-hint { font-size: 10px; color: var(--text-dim); margin-top: 2px; }
     .db-form .field input[type="color"] {
       width: 36px; height: 30px; padding: 2px; cursor: pointer;
       background: var(--bg); border: 2px solid rgba(0,229,255,.25); border-radius: var(--radius);
@@ -825,6 +832,18 @@
         <div class="db-form-row">
           <div class="field"><span class="field-label">User</span><input id="db-user" type="text" placeholder="reader" /></div>
           <div class="field"><span class="field-label">Password</span><input id="db-pass" type="password" placeholder="password" /></div>
+        </div>
+        <div class="db-form-row">
+          <div class="field">
+            <span class="field-label">Include Tables</span>
+            <textarea id="db-include-tables" rows="2" placeholder="users, orders, products_*"></textarea>
+            <div class="field-hint">Whitelist: comma-separated, glob patterns (*, ?) OK. Empty = all.</div>
+          </div>
+          <div class="field">
+            <span class="field-label">Exclude Tables</span>
+            <textarea id="db-exclude-tables" rows="2" placeholder="_tmp_*, log_*"></textarea>
+            <div class="field-hint">Blacklist: comma-separated, glob patterns (*, ?) OK.</div>
+          </div>
         </div>
         <div style="display:flex;gap:8px;justify-content:flex-end">
           <button class="btn btn-lime" id="db-save-btn" onclick="saveDatabase()">+ Add</button>
@@ -1295,6 +1314,8 @@ function clearDbForm() {
   document.getElementById("db-dbname").value = "";
   document.getElementById("db-user").value = "";
   document.getElementById("db-pass").value = "";
+  document.getElementById("db-include-tables").value = "";
+  document.getElementById("db-exclude-tables").value = "";
   onDbTypeChange();
 }
 
@@ -1324,9 +1345,14 @@ async function loadDbList() {
     colorDot.style.background = d.color;
     const typeBadge = makeEl("span", { style: "font-size:9px;color:var(--text-dim);background:var(--surface-hi);padding:1px 5px;border-radius:2px;margin-left:6px" }, (d.type || "postgresql").toUpperCase());
     const labelEl = makeEl("div", { className: "db-list-label" }, [document.createTextNode(d.label), typeBadge]);
+    const metaParts = [d.host + (d.type === "sqlite" ? "" : ":" + d.port) + "/" + d.dbname];
+    const filterParts = [];
+    if (d.include_tables?.length) filterParts.push("include:" + d.include_tables.length);
+    if (d.exclude_tables?.length) filterParts.push("exclude:" + d.exclude_tables.length);
+    if (filterParts.length) metaParts.push(" [" + filterParts.join(", ") + "]");
     const info = makeEl("div", { className: "db-list-info" }, [
       labelEl,
-      makeEl("div", { className: "db-list-meta" }, d.host + (d.type === "sqlite" ? "" : ":" + d.port) + "/" + d.dbname),
+      makeEl("div", { className: "db-list-meta" }, metaParts.join("")),
     ]);
     const editBtn = makeEl("button", { className: "btn btn-cyan btn-sm", onClick: () => editDatabase(d) }, "EDIT");
     const delBtn = makeEl("button", { className: "btn btn-red btn-sm", onClick: () => deleteDatabase(d.id) }, "DEL");
@@ -1346,10 +1372,15 @@ function editDatabase(d) {
   document.getElementById("db-dbname").value = d.dbname || "";
   document.getElementById("db-user").value = d.user || "";
   document.getElementById("db-pass").value = "";
+  document.getElementById("db-include-tables").value = (d.include_tables || []).join(", ");
+  document.getElementById("db-exclude-tables").value = (d.exclude_tables || []).join(", ");
   document.getElementById("db-save-btn").textContent = "UPDATE";
   onDbTypeChange();
 }
 
+function parseTableList(raw) {
+  return raw.split(",").map(s => s.trim()).filter(Boolean);
+}
 async function saveDatabase() {
   const dbType = document.getElementById("db-type").value;
   const body = {
@@ -1362,6 +1393,8 @@ async function saveDatabase() {
     dbname: document.getElementById("db-dbname").value.trim(),
     user: document.getElementById("db-user").value.trim(),
     password: document.getElementById("db-pass").value,
+    include_tables: parseTableList(document.getElementById("db-include-tables").value),
+    exclude_tables: parseTableList(document.getElementById("db-exclude-tables").value),
   };
   if (!body.id || !body.host || !body.dbname) { toast("ID, Host, Database are required", false); return; }
   try {
