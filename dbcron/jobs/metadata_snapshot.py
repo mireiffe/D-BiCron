@@ -137,6 +137,7 @@ class MetadataSnapshotJob(Job):
     label = "DB 메타데이터 스냅샷"
     description = "등록된 DB들의 테이블/컬럼/인덱스/FK/PK 메타데이터를 수집하여 캐시"
     default_args: dict = {}
+    scope = "all_tables"
 
     def run(self, **kwargs) -> JobResult:
         databases = load_databases()

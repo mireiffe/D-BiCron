@@ -21,6 +21,7 @@ class TableProfilerJob(Job):
     label = "테이블 프로파일러"
     description = "테이블별 null 비율, 카디널리티, min/max 샘플링"
     default_args: dict = {}
+    scope = "all_tables"
 
     def run(self, **kwargs) -> JobResult:
         snapshot_path = DATA_DIR / "metadata_snapshot.json"

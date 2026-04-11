@@ -21,6 +21,7 @@ class ConnectionTestJob(Job):
     label = "DB 연결 테스트"
     description = "등록된 모든 DB의 연결/인증 상태를 점검"
     default_args: dict = {}
+    scope = "all_dbs"
 
     def run(self, **kwargs) -> JobResult:
         databases = load_databases()

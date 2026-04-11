@@ -34,6 +34,7 @@ class IncrementalSyncJob(Job):
     label = "증분 동기화"
     description = "Source DB delta 행을 Target DB 로 증분 동기화 (upsert)"
     default_args = {"days": 1}
+    scope = "pipeline"
 
     def run(self, *, days: int = 1, **kwargs) -> JobResult:
         sync_cfg = self._load_sync_config()

@@ -8,6 +8,8 @@ const CS = {
   layout: null,
   selectedTable: null,
   nodePositions: {},
+  scheduleStatus: null,
+  jobOverlayVisible: true,
 };
 
 // Layout constants
@@ -76,15 +78,17 @@ function canvasResize() {
 // ── Data loading ───────────────────────────────────────────────
 
 async function loadCanvasData() {
-  const [metaRes, pipeRes, dbRes] = await Promise.allSettled([
+  const [metaRes, pipeRes, dbRes, schedRes] = await Promise.allSettled([
     fetch("/api/metadata").then(r => r.ok ? r.json() : null),
     fetch("/api/pipeline-config").then(r => r.ok ? r.json() : null),
     fetch("/api/databases").then(r => r.ok ? r.json() : []),
+    fetch("/api/schedule-status").then(r => r.ok ? r.json() : []),
   ]);
 
   CS.metadata = metaRes.status === "fulfilled" ? metaRes.value : null;
   CS.pipelineConfig = pipeRes.status === "fulfilled" ? pipeRes.value : null;
   CS.databases = dbRes.status === "fulfilled" ? dbRes.value : [];
+  CS.scheduleStatus = schedRes.status === "fulfilled" ? schedRes.value : [];
   CS.drift = null;
 
   if (!CS.metadata) {
@@ -121,6 +125,8 @@ async function loadCanvasData() {
 
   CS.layout = computeLayout();
   renderCanvas();
+  renderJobOverlay();
+  initJobSSE();
   requestAnimationFrame(() => canvasFit());
 }
 
@@ -1156,4 +1162,228 @@ function savePositions() {
 }
 function loadSavedPositions() {
   try { const r = localStorage.getItem("dbicron-canvas-positions"); if (r) CS.nodePositions = JSON.parse(r); } catch {}
+}
+
+// ── Job status overlay ────────────────────────────────────────
+
+const JOB_COLORS = { scheduled: "#a78bfa", running: "#34d399", failed: "#ff3355" };
+const JOB_ICONS = {
+  scheduled: "M3,1 L7,4 L3,7 Z",          // play triangle
+  running:   "",                             // animated ring (no path icon)
+  failed:    "M1,1 L7,7 M7,1 L1,7",        // X mark
+};
+
+function buildJobTargetIndex(statuses) {
+  // Returns { byTable: Map<nodeKey, [{state, jobLabel, jobName}]>, byDb: Map<dbId, [{state, jobLabel, jobName}]> }
+  const byTable = new Map();
+  const byDb = new Map();
+
+  for (const s of statuses) {
+    if (s.paused) continue;
+    const info = { state: s.state, jobLabel: s.jobLabel, jobName: s.jobName, scheduleId: s.scheduleId };
+
+    if (s.scope === "all_dbs") {
+      // DB-level indicator only
+      for (const t of s.targets) {
+        const arr = byDb.get(t.db) || [];
+        arr.push(info);
+        byDb.set(t.db, arr);
+      }
+    } else if (s.scope === "all_tables") {
+      // DB-level indicator (avoid cluttering every table)
+      const dbSet = new Set();
+      for (const t of s.targets) {
+        if (!dbSet.has(t.db)) {
+          dbSet.add(t.db);
+          const arr = byDb.get(t.db) || [];
+          arr.push(info);
+          byDb.set(t.db, arr);
+        }
+      }
+    } else if (s.scope === "pipeline") {
+      // Table-level indicators
+      for (const t of s.targets) {
+        const key = `${t.db}:${t.schema}.${t.table}`;
+        const arr = byTable.get(key) || [];
+        arr.push(info);
+        byTable.set(key, arr);
+      }
+    }
+  }
+  return { byTable, byDb };
+}
+
+function resolveWorstState(jobs) {
+  // running > failed > scheduled
+  if (jobs.some(j => j.state === "running")) return "running";
+  if (jobs.some(j => j.state === "failed")) return "failed";
+  return "scheduled";
+}
+
+function renderJobOverlay() {
+  // Remove previous overlay
+  gRoot.selectAll(".layer-job-overlay").remove();
+  if (!CS.scheduleStatus || !CS.scheduleStatus.length || !CS.layout || !CS.jobOverlayVisible) return;
+
+  const overlay = gRoot.append("g").attr("class", "layer-job-overlay");
+  const { byTable, byDb } = buildJobTargetIndex(CS.scheduleStatus);
+
+  // ── DB container badges (positioned right of header text) ──
+  for (const container of CS.layout.dbContainers) {
+    const jobs = byDb.get(container.key);
+    if (!jobs || !jobs.length) continue;
+
+    const uniqueJobs = [...new Map(jobs.map(j => [j.jobName, j])).values()];
+    const pillW = uniqueJobs.length * 14 + 12;
+    const pillH = 16;
+    // Position: right side of container header
+    const gx = container.x + container.w - pillW - 6;
+    const gy = container.y + 14;
+
+    const g = overlay.append("g")
+      .attr("class", "job-status-icon")
+      .attr("transform", `translate(${gx}, ${gy})`);
+
+    // Background pill
+    g.append("rect")
+      .attr("x", 0).attr("y", -pillH / 2)
+      .attr("width", pillW).attr("height", pillH).attr("rx", pillH / 2)
+      .attr("fill", "rgba(18,18,42,0.85)").attr("stroke", "rgba(255,255,255,0.12)").attr("stroke-width", 1);
+
+    // Dots per unique job
+    uniqueJobs.forEach((j, i) => {
+      const jColor = JOB_COLORS[j.state];
+      const cx = 10 + i * 14;
+      const dot = g.append("circle")
+        .attr("cx", cx).attr("cy", 0).attr("r", 4)
+        .attr("fill", jColor);
+      if (j.state === "running") dot.attr("class", "job-running-ring");
+
+      // Outer ring for running
+      if (j.state === "running") {
+        g.append("circle")
+          .attr("cx", cx).attr("cy", 0).attr("r", 6)
+          .attr("fill", "none").attr("stroke", jColor).attr("stroke-width", 1.5)
+          .attr("stroke-dasharray", "3,3").attr("class", "job-running-dash");
+      }
+    });
+
+    // Tooltip on hover
+    g.style("cursor", "default")
+      .append("title")
+      .text(jobs.map(j => `${j.jobLabel} (${j.state})`).join("\n"));
+  }
+
+  // ── Table node badges (pipeline scope only) ──
+  for (const node of CS.layout.tableNodes) {
+    const jobs = byTable.get(node.key);
+    if (!jobs || !jobs.length) continue;
+    const worst = resolveWorstState(jobs);
+    const color = JOB_COLORS[worst];
+
+    const g = overlay.append("g")
+      .attr("class", "job-status-icon")
+      .attr("transform", `translate(${node.x + node.w + 4}, ${node.y + TABLE_H / 2})`);
+
+    if (worst === "running") {
+      // Animated ring
+      g.append("circle")
+        .attr("cx", 0).attr("cy", 0).attr("r", 7)
+        .attr("fill", "none").attr("stroke", color).attr("stroke-width", 2)
+        .attr("stroke-dasharray", "4,4")
+        .attr("class", "job-running-dash");
+      g.append("circle")
+        .attr("cx", 0).attr("cy", 0).attr("r", 3)
+        .attr("fill", color).attr("class", "job-running-ring");
+    } else if (worst === "failed") {
+      // Red warning circle with X
+      g.append("circle")
+        .attr("cx", 0).attr("cy", 0).attr("r", 7)
+        .attr("fill", color + "25").attr("stroke", color).attr("stroke-width", 1.5);
+      g.append("text")
+        .attr("x", 0).attr("y", 1)
+        .attr("text-anchor", "middle").attr("dominant-baseline", "middle")
+        .attr("font-family", "'Fira Code', monospace").attr("font-size", 9).attr("font-weight", 700)
+        .attr("fill", color).text("!");
+    } else {
+      // Scheduled: subtle play triangle
+      g.append("circle")
+        .attr("cx", 0).attr("cy", 0).attr("r", 7)
+        .attr("fill", color + "15").attr("stroke", color).attr("stroke-width", 1).attr("opacity", 0.7);
+      g.append("path")
+        .attr("d", "M-2,-3.5 L3,0 L-2,3.5 Z")
+        .attr("fill", color).attr("opacity", 0.7);
+    }
+
+    // Tooltip
+    g.style("cursor", "default")
+      .append("title")
+      .text(jobs.map(j => `${j.jobLabel} (${j.state})`).join("\n"));
+  }
+
+  // ── Pipeline connection line status ──
+  // Annotate pipeline connection lines with running/failed state
+  for (const conn of CS.layout.connections) {
+    if (conn.type !== "pipeline" || !conn.jobName) continue;
+    const sched = CS.scheduleStatus.find(s => s.jobName === conn.jobName && !s.paused);
+    if (!sched || sched.state === "scheduled") continue;
+
+    const color = JOB_COLORS[sched.state];
+    const sx = conn.source.x + conn.source.w, sy = conn.source.y + conn.source.h / 2;
+    const tx = conn.target.x, ty = conn.target.y + conn.target.h / 2;
+    const mx = (sx + tx) / 2, my = (sy + ty) / 2;
+
+    if (sched.state === "running") {
+      // Overlay animated dashed line on top of the pipeline
+      overlay.append("path")
+        .attr("d", arrowPath(conn))
+        .attr("fill", "none").attr("stroke", color).attr("stroke-width", 3)
+        .attr("stroke-dasharray", "8,6").attr("opacity", 0.7)
+        .attr("class", "job-running-dash")
+        .style("pointer-events", "none");
+    }
+
+    // State badge on midpoint
+    const badge = overlay.append("g")
+      .attr("class", "job-status-icon")
+      .attr("transform", `translate(${mx}, ${my + 10})`);
+    badge.append("rect")
+      .attr("x", -20).attr("y", -7).attr("width", 40).attr("height", 14).attr("rx", 7)
+      .attr("fill", color + "20").attr("stroke", color).attr("stroke-width", 1);
+    badge.append("text")
+      .attr("x", 0).attr("y", 1)
+      .attr("text-anchor", "middle").attr("dominant-baseline", "middle")
+      .attr("font-family", "'Fira Code', monospace").attr("font-size", 8).attr("font-weight", 700)
+      .attr("fill", color)
+      .text(sched.state === "running" ? "SYNC" : "FAIL");
+  }
+}
+
+function toggleJobOverlay(visible) {
+  CS.jobOverlayVisible = visible;
+  if (visible) {
+    renderJobOverlay();
+  } else {
+    gRoot.selectAll(".layer-job-overlay").remove();
+  }
+}
+
+// ── SSE listener for real-time job state updates ──────────────
+
+let _jobSSESource = null;
+function initJobSSE() {
+  if (_jobSSESource) return; // already connected
+  _jobSSESource = new EventSource("/api/events");
+  _jobSSESource.addEventListener("job_start", () => refreshJobOverlay());
+  _jobSSESource.addEventListener("job_complete", () => refreshJobOverlay());
+}
+
+async function refreshJobOverlay() {
+  try {
+    const res = await fetch("/api/schedule-status");
+    if (res.ok) {
+      CS.scheduleStatus = await res.json();
+      renderJobOverlay();
+    }
+  } catch {}
 }

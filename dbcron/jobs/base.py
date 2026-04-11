@@ -37,6 +37,12 @@ class Job(ABC):
     label: str = ""
     description: str = ""
     default_args: dict = {"days": 1}
+    # scope: "all_dbs" | "all_tables" | "pipeline" | "none"
+    #   all_dbs    — DB 컨테이너 수준 (모든 DB 대상)
+    #   all_tables — 모든 DB의 모든 테이블 대상
+    #   pipeline   — pipeline_config 의 특정 source/target 테이블
+    #   none       — DB 접근 없음
+    scope: str = "none"
 
     def __init__(self, config: AppConfig | None = None):
         self.config = config

@@ -17,6 +17,7 @@ class SchemaDriftJob(Job):
     label = "스키마 변경 감지"
     description = "이전 스냅샷과 비교하여 테이블/컬럼/PK 변경사항 리포트"
     default_args: dict = {}
+    scope = "all_tables"
 
     def run(self, **kwargs) -> JobResult:
         cur_path = DATA_DIR / "metadata_snapshot.json"

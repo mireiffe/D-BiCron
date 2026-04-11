@@ -534,6 +534,22 @@
     .legend-line.entry { background: #ff2d8a; border-style: dashed; border-width: 1px 0 0 0; height: 0; border-color: #ff2d8a; }
     .legend-line.fk { border-top: 1px dotted rgba(0,229,255,.4); height: 0; }
 
+    /* ── Job status overlay animations ── */
+    @keyframes job-pulse {
+      0%, 100% { opacity: 0.6; }
+      50% { opacity: 1; }
+    }
+    @keyframes job-dash-flow {
+      to { stroke-dashoffset: -16; }
+    }
+    .job-status-icon { pointer-events: none; }
+    .job-running-ring {
+      animation: job-pulse 1.5s ease-in-out infinite;
+    }
+    .job-running-dash {
+      animation: job-dash-flow 0.8s linear infinite;
+    }
+
     /* ── Canvas search bar ── */
     #canvas-search {
       position: absolute; top: 14px; left: 50%; transform: translateX(-50%); z-index: 10;
@@ -657,6 +673,13 @@
     <label class="legend-item" style="cursor:pointer"><input type="checkbox" checked onchange="toggleLayer('pipeline',this.checked)" style="accent-color:#ffd000;margin:0"><div class="legend-line pipeline"></div><span style="color:var(--text-dim)">Pipeline</span></label>
     <label class="legend-item" style="cursor:pointer"><input type="checkbox" checked onchange="toggleLayer('entry',this.checked)" style="accent-color:#ff2d8a;margin:0"><div class="legend-line entry"></div><span style="color:var(--text-dim)">Entry Point</span></label>
     <label class="legend-item" style="cursor:pointer"><input type="checkbox" checked onchange="toggleLayer('fk',this.checked)" style="accent-color:#00e5ff;margin:0"><div class="legend-line fk"></div><span style="color:var(--text-dim)">Foreign Key</span></label>
+    <div style="border-top:1px solid rgba(255,255,255,.08);margin:6px 0 4px"></div>
+    <label class="legend-item" style="cursor:pointer"><input type="checkbox" checked onchange="toggleJobOverlay(this.checked)" style="accent-color:#a78bfa;margin:0" id="legend-job-toggle"><span style="color:#a78bfa;font-size:9px;letter-spacing:1px">&#9654;</span><span style="color:var(--text-dim)">Job Status</span></label>
+    <div id="legend-job-states" style="margin-left:20px;font-size:9px;line-height:1.8">
+      <span style="color:#a78bfa">&#9632;</span> <span style="color:var(--text-dim)">Scheduled</span><br>
+      <span style="color:#34d399">&#9632;</span> <span style="color:var(--text-dim)">Running</span><br>
+      <span style="color:#ff3355">&#9632;</span> <span style="color:var(--text-dim)">Failed</span>
+    </div>
   </div>
 
   <div class="detail-panel" id="detail-panel">

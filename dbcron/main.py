@@ -53,6 +53,7 @@ def main():
                 "label": getattr(cls, "label", "") or name,
                 "description": getattr(cls, "description", ""),
                 "defaultArgs": getattr(cls, "default_args", {"days": 1}),
+                "scope": getattr(cls, "scope", "none"),
             })
         print(json.dumps(jobs))
         sys.exit(0)

@@ -142,8 +142,9 @@ console.log(`Loaded ${runHistory.length} history entry(ies), retention ${process
 const persisted = loadSchedules();
 let nextId = persisted.nextId;
 for (const s of persisted.schedules) {
+  const schedId = s.id;
   const task = cron.schedule(s.cron, () => {
-    startJob(s.jobName, s.args);
+    startJob(s.jobName, s.args, 0, schedId);
   });
   scheduledTasks.set(s.id, {
     cron: s.cron,
@@ -167,7 +168,7 @@ function isJobRunning(jobName) {
   return false;
 }
 
-function startJob(jobName, args = {}, _retryCount = 0) {
+function startJob(jobName, args = {}, _retryCount = 0, _scheduleId = null) {
   if (isJobRunning(jobName)) {
     console.log(`Skipped ${jobName}: already running`);
     return null;
@@ -178,12 +179,14 @@ function startJob(jobName, args = {}, _retryCount = 0) {
     runId,
     jobName,
     args,
+    scheduleId: _scheduleId,
     startedAt: new Date().toISOString(),
     stdout: "",
     stderr: "",
     retryCount: _retryCount,
   };
   runningJobs.set(runId, tracker);
+  broadcastSSE("job_start", { runId, jobName, scheduleId: _scheduleId });
 
   const cliArgs = ["-u", "-m", "dbcron.main", jobName];
   for (const [k, v] of Object.entries(args)) {
@@ -228,6 +231,7 @@ function startJob(jobName, args = {}, _retryCount = 0) {
     saveRunning();
     const entry = {
       runId, jobName, args, pid: proc.pid,
+      scheduleId: _scheduleId,
       success: code === 0,
       stdout: tracker.stdout.trim(),
       stderr: tracker.stderr.trim(),
@@ -236,7 +240,7 @@ function startJob(jobName, args = {}, _retryCount = 0) {
     };
     runHistory.unshift(entry);
     saveHistory();
-    broadcastSSE("job_complete", { runId, jobName, success: entry.success });
+    broadcastSSE("job_complete", { runId, jobName, scheduleId: _scheduleId, success: entry.success });
 
     // Trigger dependent jobs on success
     if (entry.success) {
@@ -252,7 +256,7 @@ function startJob(jobName, args = {}, _retryCount = 0) {
     if (!entry.success && _retryCount < JOB_MAX_RETRIES) {
       const delay = Math.min(5000 * 2 ** _retryCount, 60000); // exponential backoff, max 60s
       console.log(`Retry ${_retryCount + 1}/${JOB_MAX_RETRIES} for ${jobName} in ${delay}ms`);
-      setTimeout(() => startJob(jobName, args, _retryCount + 1), delay);
+      setTimeout(() => startJob(jobName, args, _retryCount + 1, _scheduleId), delay);
     }
 
     // Webhook notification on final failure (after all retries exhausted)
@@ -353,7 +357,7 @@ app.post("/api/schedules", (req, res) => {
   let task = null;
   if (!dependsOn) {
     task = cron.schedule(cronExpr, () => {
-      startJob(jobName, args);
+      startJob(jobName, args, 0, id);
     });
   }
 
@@ -406,7 +410,7 @@ app.put("/api/schedules/:id", (req, res) => {
   const newCron = cronExpr || entry.cron;
   const newArgs = args !== undefined ? args : entry.args;
   const task = cron.schedule(newCron, () => {
-    startJob(entry.jobName, newArgs);
+    startJob(entry.jobName, newArgs, 0, id);
   });
   scheduledTasks.set(id, {
     cron: newCron,
@@ -435,7 +439,7 @@ app.delete("/api/schedules/:id", (req, res) => {
 app.get("/api/running", (_req, res) => {
   const list = [];
   for (const [, r] of runningJobs) {
-    list.push({ runId: r.runId, jobName: r.jobName, args: r.args, pid: r.pid, startedAt: r.startedAt, stdout: r.stdout, stderr: r.stderr });
+    list.push({ runId: r.runId, jobName: r.jobName, args: r.args, pid: r.pid, startedAt: r.startedAt, scheduleId: r.scheduleId || null, stdout: r.stdout, stderr: r.stderr });
   }
   res.json(list);
 });
@@ -443,7 +447,7 @@ app.get("/api/running", (_req, res) => {
 app.get("/api/running/:id", (req, res) => {
   const r = runningJobs.get(Number(req.params.id));
   if (!r) return res.status(404).json({ error: "Not running" });
-  res.json({ runId: r.runId, jobName: r.jobName, args: r.args, pid: r.pid, startedAt: r.startedAt, stdout: r.stdout, stderr: r.stderr });
+  res.json({ runId: r.runId, jobName: r.jobName, args: r.args, pid: r.pid, startedAt: r.startedAt, scheduleId: r.scheduleId || null, stdout: r.stdout, stderr: r.stderr });
 });
 
 // Kill a running job
@@ -881,6 +885,116 @@ app.get("/api/pipeline-config", (_req, res) => {
   }
 
   res.json(cfg);
+});
+
+// -------------------------------------------------------------------
+// Schedule status for canvas overlay
+// Resolves each schedule's target DB/tables and current state
+// -------------------------------------------------------------------
+app.get("/api/schedule-status", (_req, res) => {
+  // Build job scope lookup from AVAILABLE_JOBS
+  const jobScopeMap = {};
+  for (const j of AVAILABLE_JOBS) {
+    jobScopeMap[j.name] = j.scope || "none";
+  }
+
+  // Load pipeline config for resolving "pipeline" scope targets
+  let pipelineCfg = { pipelines: [] };
+  try {
+    const cfgPath = path.join(PROJECT_ROOT, process.env.PIPELINE_CONFIG || "pipeline_config.json");
+    pipelineCfg = JSON.parse(fs.readFileSync(cfgPath, "utf-8"));
+  } catch {}
+
+  // Load metadata snapshot for resolving "all_tables" scope
+  let metadata = null;
+  try {
+    metadata = JSON.parse(fs.readFileSync(path.join(DATA_DIR, "metadata_snapshot.json"), "utf-8"));
+  } catch {}
+
+  // Load databases for resolving "all_dbs" scope
+  const databases = loadDatabases();
+
+  // Helper: get pipeline targets for a given jobName
+  function getPipelineTargets(jobName) {
+    const targets = [];
+    for (const p of pipelineCfg.pipelines || []) {
+      if (p.source_job !== jobName) continue;
+      for (const c of p.connections || []) {
+        if (c.to) targets.push({ db: c.to.db, schema: c.to.schema, table: c.to.table });
+        if (c.from) targets.push({ db: c.from.db, schema: c.from.schema, table: c.from.table });
+      }
+    }
+    return targets;
+  }
+
+  // Helper: get all table targets from metadata
+  function getAllTableTargets() {
+    if (!metadata || !metadata.databases) return [];
+    const targets = [];
+    for (const [dbId, db] of Object.entries(metadata.databases)) {
+      for (const [tKey, tData] of Object.entries(db.tables || {})) {
+        targets.push({ db: dbId, schema: tData.schema, table: tData.table });
+      }
+    }
+    return targets;
+  }
+
+  // Helper: get all db targets
+  function getAllDbTargets() {
+    return databases.map(d => ({ db: d.id }));
+  }
+
+  // Build running jobs index by jobName
+  const runningByJob = {};
+  for (const [, r] of runningJobs) {
+    runningByJob[r.jobName] = { runId: r.runId, startedAt: r.startedAt, scheduleId: r.scheduleId };
+  }
+
+  // Build last run result index by jobName (most recent from history)
+  const lastRunByJob = {};
+  for (const h of runHistory) {
+    if (!lastRunByJob[h.jobName]) {
+      lastRunByJob[h.jobName] = { success: h.success, finishedAt: h.finishedAt, scheduleId: h.scheduleId || null };
+    }
+  }
+
+  const result = [];
+  for (const [id, s] of scheduledTasks) {
+    const scope = jobScopeMap[s.jobName] || "none";
+    let targets = [];
+
+    if (scope === "pipeline") {
+      targets = getPipelineTargets(s.jobName);
+    } else if (scope === "all_tables") {
+      targets = getAllTableTargets();
+    } else if (scope === "all_dbs") {
+      targets = getAllDbTargets();
+    }
+    // scope === "none" → empty targets
+
+    // Determine state: running > failed > scheduled
+    let state = "scheduled";
+    if (runningByJob[s.jobName]) {
+      state = "running";
+    } else if (lastRunByJob[s.jobName] && !lastRunByJob[s.jobName].success) {
+      state = "failed";
+    }
+
+    result.push({
+      scheduleId: id,
+      jobName: s.jobName,
+      jobLabel: AVAILABLE_JOBS.find(j => j.name === s.jobName)?.label || s.jobName,
+      cron: s.cron,
+      scope,
+      state,
+      targets,
+      lastRun: lastRunByJob[s.jobName] || null,
+      running: runningByJob[s.jobName] || null,
+      paused: !!s.paused,
+    });
+  }
+
+  res.json(result);
 });
 
 // Prune expired history entries every hour
