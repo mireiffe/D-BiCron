@@ -38,6 +38,12 @@ def main():
         help='Cron expression for repeated execution (e.g. "*/10 * * * *")',
     )
     parser.add_argument(
+        "--targets",
+        type=str,
+        default=None,
+        help='Target DB/tables as JSON (e.g. \'[{"db":"shop_db","table":"orders"}]\')',
+    )
+    parser.add_argument(
         "--list-jobs",
         action="store_true",
         help="Print available jobs as JSON and exit",
@@ -62,6 +68,14 @@ def main():
         parser.error("job is required (or use --list-jobs)")
 
     job_kwargs = {"days": args.days}
+
+    if args.targets:
+        import json as _json
+
+        try:
+            job_kwargs["targets"] = _json.loads(args.targets)
+        except _json.JSONDecodeError:
+            parser.error("--targets must be valid JSON")
 
     try:
         config = load_config()

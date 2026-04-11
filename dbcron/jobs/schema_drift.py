@@ -31,17 +31,26 @@ class SchemaDriftJob(Job):
         cur = json.loads(cur_path.read_text(encoding="utf-8"))
         prev = json.loads(prev_path.read_text(encoding="utf-8"))
 
+        # targets로 DB/table 범위 필터
+        databases, table_filter = self.resolve_databases()
+        target_db_ids = {d["id"] for d in databases} if databases else None
+
         changes = []
         breaking = 0
 
         for db_id, db_cur in cur.get("databases", {}).items():
+            if target_db_ids and db_id not in target_db_ids:
+                continue
             db_prev = prev.get("databases", {}).get(db_id)
             if not db_prev:
                 changes.append(f"[NEW DB] {db_id}")
                 continue
 
-            cur_tables = db_cur.get("tables", {})
-            prev_tables = db_prev.get("tables", {})
+            cur_tables = {k: v for k, v in db_cur.get("tables", {}).items()
+                          if table_filter(db_id, v.get("table", k), {})}
+            prev_tables_raw = db_prev.get("tables", {})
+            prev_tables = {k: v for k, v in prev_tables_raw.items()
+                           if table_filter(db_id, v.get("table", k), {})}
 
             for tkey in cur_tables:
                 if tkey not in prev_tables:

@@ -20,8 +20,6 @@ from ..db import (
     SYSTEM_SCHEMAS,
     URL_BUILDERS,
     create_engine_for,
-    load_databases,
-    should_include_table,
 )
 from .base import Job, JobResult
 
@@ -43,10 +41,16 @@ def _estimate_row_count(conn, db_type: str, schema: str, table: str) -> int:
         return 0
 
 
-def collect_db_metadata(engine, db_type: str, db_cfg: dict | None = None) -> dict[str, dict]:
+def collect_db_metadata(
+    engine,
+    db_type: str,
+    db_id: str = "",
+    db_cfg: dict | None = None,
+    table_filter=None,
+) -> dict[str, dict]:
     """SQLAlchemy inspect() 로 메타데이터 수집. DB 종류 무관.
 
-    db_cfg 를 전달하면 include_tables / exclude_tables 필터를 적용한다.
+    table_filter(db_id, table_name, db_cfg) 함수로 테이블 필터링.
     """
     insp = inspect(engine)
     skip = SYSTEM_SCHEMAS.get(db_type, set())
@@ -57,7 +61,7 @@ def collect_db_metadata(engine, db_type: str, db_cfg: dict | None = None) -> dic
     with engine.connect() as conn:
         for schema in schemas:
             for tbl_name in insp.get_table_names(schema=schema):
-                if db_cfg and not should_include_table(tbl_name, db_cfg):
+                if table_filter and not table_filter(db_id, tbl_name, db_cfg or {}):
                     continue
                 key = f"{schema}.{tbl_name}"
 
@@ -140,7 +144,7 @@ class MetadataSnapshotJob(Job):
     scope = "all_tables"
 
     def run(self, **kwargs) -> JobResult:
-        databases = load_databases()
+        databases, table_filter = self.resolve_databases()
         if not databases:
             return JobResult(
                 success=False,
@@ -164,7 +168,10 @@ class MetadataSnapshotJob(Job):
 
             engine = create_engine_for(db_cfg)
             try:
-                tables = collect_db_metadata(engine, db_type, db_cfg)
+                tables = collect_db_metadata(
+                    engine, db_type, db_id=db_id, db_cfg=db_cfg,
+                    table_filter=table_filter,
+                )
                 snapshot["databases"][db_id] = {
                     "host": db_cfg.get("host", ""),
                     "database": db_cfg.get("dbname", ""),

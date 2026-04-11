@@ -29,15 +29,23 @@ class FreshnessCheckJob(Job):
         cur = json.loads(cur_path.read_text(encoding="utf-8"))
         prev = json.loads(prev_path.read_text(encoding="utf-8"))
 
+        # targets로 DB/table 범위 필터
+        databases, table_filter = self.resolve_databases()
+        target_db_ids = {d["id"] for d in databases} if databases else None
+
         stale = []
         total_checked = 0
 
         for db_id, db_cur in cur.get("databases", {}).items():
+            if target_db_ids and db_id not in target_db_ids:
+                continue
             db_prev = prev.get("databases", {}).get(db_id)
             if not db_prev:
                 continue
 
             for tkey, t_cur in db_cur.get("tables", {}).items():
+                if not table_filter(db_id, t_cur.get("table", tkey), {}):
+                    continue
                 t_prev = db_prev.get("tables", {}).get(tkey)
                 if not t_prev:
                     continue

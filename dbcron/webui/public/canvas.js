@@ -1200,13 +1200,20 @@ function buildJobTargetIndex(statuses) {
           byDb.set(t.db, arr);
         }
       }
-    } else if (s.scope === "pipeline") {
-      // Table-level indicators
+    } else if (s.scope === "pipeline" || s.scope === "targets") {
+      // Table-level indicators for pipeline jobs or explicit targets
       for (const t of s.targets) {
-        const key = `${t.db}:${t.schema}.${t.table}`;
-        const arr = byTable.get(key) || [];
-        arr.push(info);
-        byTable.set(key, arr);
+        if (t.table) {
+          const key = `${t.db}:${t.schema || "main"}.${t.table}`;
+          const arr = byTable.get(key) || [];
+          arr.push(info);
+          byTable.set(key, arr);
+        } else {
+          // DB-only target → DB-level
+          const arr = byDb.get(t.db) || [];
+          arr.push(info);
+          byDb.set(t.db, arr);
+        }
       }
     }
   }

@@ -12,7 +12,7 @@ import time
 from datetime import datetime
 from sqlalchemy import text
 
-from ..db import DATA_DIR, URL_BUILDERS, create_engine_for, load_databases
+from ..db import DATA_DIR, URL_BUILDERS, create_engine_for
 from .base import Job, JobResult
 
 
@@ -24,7 +24,7 @@ class ConnectionTestJob(Job):
     scope = "all_dbs"
 
     def run(self, **kwargs) -> JobResult:
-        databases = load_databases()
+        databases, _ = self.resolve_databases()
         if not databases:
             return JobResult(success=False, message="등록된 DB가 없습니다.")
 

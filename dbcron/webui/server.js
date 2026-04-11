@@ -53,7 +53,7 @@ function loadSchedules() {
 function saveSchedules() {
   const entries = [];
   for (const [id, s] of scheduledTasks) {
-    entries.push({ id, jobName: s.jobName, cron: s.cron, args: s.args, createdAt: s.createdAt });
+    entries.push({ id, jobName: s.jobName, cron: s.cron, args: s.args, targets: s.targets || null, createdAt: s.createdAt });
   }
   fs.mkdirSync(DATA_DIR, { recursive: true });
   const data = JSON.stringify({ nextId, schedules: entries }, null, 2);
@@ -143,13 +143,15 @@ const persisted = loadSchedules();
 let nextId = persisted.nextId;
 for (const s of persisted.schedules) {
   const schedId = s.id;
+  const schedTargets = s.targets || null;
   const task = cron.schedule(s.cron, () => {
-    startJob(s.jobName, s.args, 0, schedId);
+    startJob(s.jobName, s.args, 0, schedId, schedTargets);
   });
   scheduledTasks.set(s.id, {
     cron: s.cron,
     jobName: s.jobName,
     args: s.args || {},
+    targets: schedTargets,
     task,
     createdAt: s.createdAt,
   });
@@ -168,7 +170,7 @@ function isJobRunning(jobName) {
   return false;
 }
 
-function startJob(jobName, args = {}, _retryCount = 0, _scheduleId = null) {
+function startJob(jobName, args = {}, _retryCount = 0, _scheduleId = null, _targets = null) {
   if (isJobRunning(jobName)) {
     console.log(`Skipped ${jobName}: already running`);
     return null;
@@ -180,6 +182,7 @@ function startJob(jobName, args = {}, _retryCount = 0, _scheduleId = null) {
     jobName,
     args,
     scheduleId: _scheduleId,
+    targets: _targets,
     startedAt: new Date().toISOString(),
     stdout: "",
     stderr: "",
@@ -191,6 +194,9 @@ function startJob(jobName, args = {}, _retryCount = 0, _scheduleId = null) {
   const cliArgs = ["-u", "-m", "dbcron.main", jobName];
   for (const [k, v] of Object.entries(args)) {
     cliArgs.push(`--${k}`, String(v));
+  }
+  if (_targets && _targets.length) {
+    cliArgs.push("--targets", JSON.stringify(_targets));
   }
 
   const proc = spawn(
@@ -256,7 +262,7 @@ function startJob(jobName, args = {}, _retryCount = 0, _scheduleId = null) {
     if (!entry.success && _retryCount < JOB_MAX_RETRIES) {
       const delay = Math.min(5000 * 2 ** _retryCount, 60000); // exponential backoff, max 60s
       console.log(`Retry ${_retryCount + 1}/${JOB_MAX_RETRIES} for ${jobName} in ${delay}ms`);
-      setTimeout(() => startJob(jobName, args, _retryCount + 1, _scheduleId), delay);
+      setTimeout(() => startJob(jobName, args, _retryCount + 1, _scheduleId, _targets), delay);
     }
 
     // Webhook notification on final failure (after all retries exhausted)
@@ -337,14 +343,14 @@ app.post("/api/jobs/:name/run", (req, res) => {
 app.get("/api/schedules", (_req, res) => {
   const list = [];
   for (const [id, s] of scheduledTasks) {
-    list.push({ id, jobName: s.jobName, cron: s.cron, args: s.args, createdAt: s.createdAt, paused: !!s.paused, dependsOn: s.dependsOn || null });
+    list.push({ id, jobName: s.jobName, cron: s.cron, args: s.args, targets: s.targets || null, createdAt: s.createdAt, paused: !!s.paused, dependsOn: s.dependsOn || null });
   }
   res.json(list);
 });
 
 // Create a schedule
 app.post("/api/schedules", (req, res) => {
-  const { jobName, cronExpr, args, dependsOn } = req.body;
+  const { jobName, cronExpr, args, dependsOn, targets } = req.body;
 
   if (!AVAILABLE_JOBS.find((j) => j.name === jobName)) {
     return res.status(400).json({ error: "Unknown job" });
@@ -353,11 +359,16 @@ app.post("/api/schedules", (req, res) => {
     return res.status(400).json({ error: "Invalid cron expression" });
   }
 
+  // Validate targets: each must have at least db
+  const validTargets = Array.isArray(targets) && targets.length
+    ? targets.filter((t) => t && t.db)
+    : null;
+
   const id = nextId++;
   let task = null;
   if (!dependsOn) {
     task = cron.schedule(cronExpr, () => {
-      startJob(jobName, args, 0, id);
+      startJob(jobName, args, 0, id, validTargets);
     });
   }
 
@@ -365,13 +376,14 @@ app.post("/api/schedules", (req, res) => {
     cron: cronExpr || "",
     jobName,
     args: args || {},
+    targets: validTargets,
     task,
     dependsOn: dependsOn || null,
     createdAt: new Date().toISOString(),
   });
   saveSchedules();
 
-  res.status(201).json({ id, jobName, cron: cronExpr, dependsOn });
+  res.status(201).json({ id, jobName, cron: cronExpr, targets: validTargets, dependsOn });
 });
 
 // Pause/resume a schedule
@@ -401,7 +413,7 @@ app.put("/api/schedules/:id", (req, res) => {
   const entry = scheduledTasks.get(id);
   if (!entry) return res.status(404).json({ error: "Schedule not found" });
 
-  const { cronExpr, args } = req.body;
+  const { cronExpr, args, targets } = req.body;
   if (cronExpr && !cron.validate(cronExpr)) {
     return res.status(400).json({ error: "Invalid cron expression" });
   }
@@ -409,13 +421,17 @@ app.put("/api/schedules/:id", (req, res) => {
   entry.task.stop();
   const newCron = cronExpr || entry.cron;
   const newArgs = args !== undefined ? args : entry.args;
+  const newTargets = targets !== undefined
+    ? (Array.isArray(targets) && targets.length ? targets.filter((t) => t && t.db) : null)
+    : entry.targets || null;
   const task = cron.schedule(newCron, () => {
-    startJob(entry.jobName, newArgs, 0, id);
+    startJob(entry.jobName, newArgs, 0, id, newTargets);
   });
   scheduledTasks.set(id, {
     cron: newCron,
     jobName: entry.jobName,
     args: newArgs,
+    targets: newTargets,
     task,
     createdAt: entry.createdAt,
   });
@@ -963,7 +979,10 @@ app.get("/api/schedule-status", (_req, res) => {
     const scope = jobScopeMap[s.jobName] || "none";
     let targets = [];
 
-    if (scope === "pipeline") {
+    // 명시적 targets가 있으면 scope 추론 대신 사용
+    if (s.targets && s.targets.length) {
+      targets = s.targets;
+    } else if (scope === "pipeline") {
       targets = getPipelineTargets(s.jobName);
     } else if (scope === "all_tables") {
       targets = getAllTableTargets();
@@ -980,12 +999,16 @@ app.get("/api/schedule-status", (_req, res) => {
       state = "failed";
     }
 
+    // effectiveScope: explicit targets → table-level display
+    const hasExplicitTargets = s.targets && s.targets.length > 0;
+    const effectiveScope = hasExplicitTargets ? "targets" : scope;
+
     result.push({
       scheduleId: id,
       jobName: s.jobName,
       jobLabel: AVAILABLE_JOBS.find(j => j.name === s.jobName)?.label || s.jobName,
       cron: s.cron,
-      scope,
+      scope: effectiveScope,
       state,
       targets,
       lastRun: lastRunByJob[s.jobName] || null,

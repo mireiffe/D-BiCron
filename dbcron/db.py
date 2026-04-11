@@ -137,6 +137,57 @@ def should_include_table(table_name: str, db_cfg: dict) -> bool:
     return True
 
 
+# ── targets 기반 필터링 ─────────────────────────────────────────
+
+def resolve_targets(
+    targets: list[dict] | None,
+) -> tuple[list[dict], "Callable[[str, str], bool]"]:
+    """Schedule targets 를 기반으로 (필터된 DB 목록, 테이블 필터 함수)를 반환한다.
+
+    targets 형식:
+      [{"db": "shop_db"}, {"db": "shop_db", "table": "orders"}, ...]
+      - db만 지정: 해당 DB의 모든 테이블
+      - db+table 지정: 해당 테이블만
+
+    targets 가 None 이거나 비어 있으면 전체 DB + 기존 include/exclude 필터 사용.
+    """
+    all_dbs = load_databases()
+
+    if not targets:
+        # 전체 DB, 기존 per-DB include/exclude 필터만 적용
+        return all_dbs, lambda db_id, tbl, db_cfg: should_include_table(tbl, db_cfg)
+
+    # targets에서 DB별 테이블 셋 구축
+    db_tables: dict[str, set[str] | None] = {}  # None = 해당 DB 전체
+    for t in targets:
+        db_id = t.get("db")
+        if not db_id:
+            continue
+        table = t.get("table")
+        if db_id not in db_tables:
+            db_tables[db_id] = set() if table else None
+        if db_tables[db_id] is None:
+            continue  # 이미 전체 DB 지정됨
+        if table:
+            db_tables[db_id].add(table)
+        else:
+            db_tables[db_id] = None  # DB 전체로 승격
+
+    # DB 필터
+    filtered_dbs = [d for d in all_dbs if d["id"] in db_tables]
+
+    def table_filter(db_id: str, table_name: str, db_cfg: dict) -> bool:
+        # 기존 per-DB 필터 먼저
+        if not should_include_table(table_name, db_cfg):
+            return False
+        allowed = db_tables.get(db_id)
+        if allowed is None:
+            return True  # DB 전체 지정
+        return table_name in allowed
+
+    return filtered_dbs, table_filter
+
+
 def create_engine_by_id(db_id: str) -> Engine:
     """databases.json 에서 ID 로 DB를 찾아 엔진을 생성한다."""
     db_cfg = get_database(db_id)
