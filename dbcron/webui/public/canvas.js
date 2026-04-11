@@ -11,7 +11,8 @@ const CS = {
 };
 
 // Layout constants
-const TABLE_W = 200, TABLE_H = 36, TABLE_PAD = 10;
+const TABLE_W_MIN = 200, TABLE_H = 36, TABLE_PAD = 10;
+function calcTableW(label) { return Math.max(TABLE_W_MIN, label.length * 7.5 + 90); }
 const DB_PAD_TOP = 48, DB_PAD_X = 24, DB_PAD_BOTTOM = 24;
 const EP_W = 150, EP_H = 40;
 const DB_GAP = 200;
@@ -140,12 +141,22 @@ function computeLayout() {
     toDb: c.to.db, toKey: `${c.to.schema}.${c.to.table}`, label: c.label || "",
   }));
 
-  // DB container x positions
+  // Pre-compute max table width per DB for container sizing
+  const dbMaxW = {};
+  for (const dbKey of dbKeys) {
+    const db = CS.metadata.databases[dbKey];
+    if (!db || !db.tables) { dbMaxW[dbKey] = TABLE_W_MIN; continue; }
+    let mw = TABLE_W_MIN;
+    for (const tData of Object.values(db.tables)) { mw = Math.max(mw, calcTableW(tData.table)); }
+    dbMaxW[dbKey] = mw;
+  }
+
+  // DB container x positions (variable width per DB)
   let dbX = 380;
   const dbPositions = {};
   for (const dbKey of dbKeys) {
     dbPositions[dbKey] = dbX;
-    dbX += TABLE_W + DB_PAD_X * 2 + DB_GAP;
+    dbX += dbMaxW[dbKey] + DB_PAD_X * 2 + DB_GAP;
   }
 
   for (const dbKey of dbKeys) {
@@ -171,6 +182,7 @@ function computeLayout() {
     const orderedKeys = [...connectedOrder.filter(k => allTableKeys.includes(k)), ...unconnected];
 
     const containerX = dbPositions[dbKey];
+    const containerW = dbMaxW[dbKey];
     let y = DB_PAD_TOP;
 
     for (const tKey of orderedKeys) {
@@ -184,7 +196,7 @@ function computeLayout() {
         rowCount: tData.estimated_row_count,
         x: saved ? saved.x : containerX + DB_PAD_X,
         y: saved ? saved.y : y,
-        w: TABLE_W, h: TABLE_H,
+        w: containerW, h: TABLE_H,
         data: tData, dbColor,
       });
       y += TABLE_H + TABLE_PAD;
@@ -193,7 +205,7 @@ function computeLayout() {
     layout.dbContainers.push({
       key: dbKey, label: dbLabel, color: dbColor,
       x: containerX, y: 0,
-      w: TABLE_W + DB_PAD_X * 2,
+      w: containerW + DB_PAD_X * 2,
       h: Math.max(y + DB_PAD_BOTTOM, DB_PAD_TOP + TABLE_H + DB_PAD_BOTTOM),
     });
   }
@@ -314,10 +326,10 @@ function renderTableNodes(layer, nodes) {
     .on("mouseenter", (event, d) => showTooltip(event, d))
     .on("mouseleave", hideTooltip);
 
-  g.append("rect").attr("width", TABLE_W).attr("height", TABLE_H).attr("rx", 3)
+  g.append("rect").attr("width", d => d.w).attr("height", TABLE_H).attr("rx", 3)
     .attr("fill", "#1e1e42").attr("stroke", d => d.dbColor).attr("stroke-width", 2).attr("opacity", 0.9);
 
-  g.append("rect").attr("class", "node-glow").attr("width", TABLE_W).attr("height", TABLE_H)
+  g.append("rect").attr("class", "node-glow").attr("width", d => d.w).attr("height", TABLE_H)
     .attr("rx", 3).attr("fill", "none").attr("stroke", d => d.dbColor).attr("stroke-width", 1).attr("opacity", 0);
 
   g.on("mouseenter.glow", function () {
@@ -329,13 +341,13 @@ function renderTableNodes(layer, nodes) {
   g.append("text").attr("x", 10).attr("y", TABLE_H / 2 + 1)
     .attr("dominant-baseline", "middle").attr("font-family", "'Fira Code', monospace")
     .attr("font-size", 11).attr("fill", "#e4e2f0")
-    .text(d => d.label.length > 20 ? d.label.slice(0, 18) + ".." : d.label);
+    .text(d => d.label);
 
   const badge = g.append("g").attr("class", "row-badge-g");
-  badge.append("rect").attr("x", TABLE_W - 68).attr("y", (TABLE_H - 16) / 2)
+  badge.append("rect").attr("x", d => d.w - 68).attr("y", (TABLE_H - 16) / 2)
     .attr("width", 58).attr("height", 16).attr("rx", 2)
     .attr("fill", "rgba(200,255,0,0.08)").attr("stroke", "rgba(200,255,0,0.25)").attr("stroke-width", 1);
-  badge.append("text").attr("x", TABLE_W - 39).attr("y", TABLE_H / 2 + 1)
+  badge.append("text").attr("x", d => d.w - 39).attr("y", TABLE_H / 2 + 1)
     .attr("dominant-baseline", "middle").attr("text-anchor", "middle")
     .attr("font-family", "'Fira Code', monospace").attr("font-size", 9).attr("fill", "#c8ff00")
     .text(d => formatCount(d.rowCount));
@@ -356,9 +368,9 @@ function renderTableNodes(layer, nodes) {
       if (!info) return;
       const el = d3.select(this);
       const color = info.breaking ? "#ff3355" : "#ffd000";
-      el.append("circle").attr("cx", TABLE_W - 4).attr("cy", 4).attr("r", 7)
+      el.append("circle").attr("cx", d.w - 4).attr("cy", 4).attr("r", 7)
         .attr("fill", color).attr("stroke", "#12122a").attr("stroke-width", 1.5);
-      el.append("text").attr("x", TABLE_W - 4).attr("y", 5)
+      el.append("text").attr("x", d.w - 4).attr("y", 5)
         .attr("text-anchor", "middle").attr("dominant-baseline", "middle")
         .attr("font-family", "'Fira Code', monospace").attr("font-size", 8).attr("font-weight", 700)
         .attr("fill", "#12122a").text(info.count > 9 ? "!" : info.count);
@@ -778,6 +790,32 @@ function closeDetailPanel() {
   gRoot.selectAll("path.connection")
     .attr("opacity", d => d.type === "fk" ? 0.4 : 0.85);
 }
+
+// ── Detail panel resize ───────────────────────────────────────
+
+(function initDetailResize() {
+  const handle = document.getElementById("detail-resize-handle");
+  const panel = document.getElementById("detail-panel");
+  if (!handle || !panel) return;
+  let dragging = false;
+  handle.addEventListener("mousedown", (e) => {
+    e.preventDefault();
+    dragging = true;
+    handle.classList.add("dragging");
+    panel.style.transition = "none";
+  });
+  document.addEventListener("mousemove", (e) => {
+    if (!dragging) return;
+    const w = Math.max(300, window.innerWidth - e.clientX);
+    panel.style.width = w + "px";
+  });
+  document.addEventListener("mouseup", () => {
+    if (!dragging) return;
+    dragging = false;
+    handle.classList.remove("dragging");
+    panel.style.transition = "";
+  });
+})();
 
 // ── Compare panel (Shift+click second table) ──────────────────
 

@@ -454,7 +454,7 @@
 
     /* ── Detail panel ── */
     .detail-panel {
-      position: absolute; top: 0; right: 0; width: 380px; height: 100%;
+      position: absolute; top: 0; right: 0; width: 520px; height: 100%;
       background: rgba(30,30,66,.95); backdrop-filter: blur(10px);
       border-left: var(--border-w) solid var(--cyan);
       box-shadow: -6px 0 20px rgba(0,229,255,.08);
@@ -462,6 +462,12 @@
       transform: translateX(100%); transition: transform .25s ease;
     }
     .detail-panel.open { transform: translateX(0); }
+    .detail-resize-handle {
+      position: absolute; top: 0; left: -4px; width: 8px; height: 100%;
+      cursor: col-resize; z-index: 25;
+    }
+    .detail-resize-handle:hover,
+    .detail-resize-handle.dragging { background: var(--cyan); opacity: 0.3; }
     .detail-header {
       display: flex; align-items: center; gap: 8px; padding: 12px 16px;
       background: var(--bg); border-bottom: 2px solid rgba(0,229,255,.2);
@@ -654,6 +660,7 @@
   </div>
 
   <div class="detail-panel" id="detail-panel">
+    <div class="detail-resize-handle" id="detail-resize-handle"></div>
     <div class="detail-header">
       <span class="detail-db-tag" id="detail-db-tag"></span>
       <span class="detail-table-name" id="detail-table-name"></span>
