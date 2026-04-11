@@ -1368,10 +1368,10 @@ function editDatabase(d) {
   document.getElementById("db-label").value = d.label || "";
   document.getElementById("db-color").value = d.color || "#00e5ff";
   document.getElementById("db-host").value = d.host || "";
-  document.getElementById("db-port").value = d.port || 5432;
+  document.getElementById("db-port").value = d.port ?? 5432;
   document.getElementById("db-dbname").value = d.dbname || "";
   document.getElementById("db-user").value = d.user || "";
-  document.getElementById("db-pass").value = "";
+  document.getElementById("db-pass").value = d.password || "";
   document.getElementById("db-include-tables").value = (d.include_tables || []).join(", ");
   document.getElementById("db-exclude-tables").value = (d.exclude_tables || []).join(", ");
   document.getElementById("db-save-btn").textContent = "UPDATE";

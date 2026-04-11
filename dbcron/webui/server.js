@@ -515,8 +515,7 @@ function saveDatabases(dbs) {
 
 app.get("/api/databases", (_req, res) => {
   const dbs = loadDatabases();
-  // Strip passwords from response
-  res.json(dbs.map(({ password, ...rest }) => ({ ...rest, hasPassword: !!password })));
+  res.json(dbs);
 });
 
 app.post("/api/databases", (req, res) => {
