@@ -1,0 +1,43 @@
+{
+  "source": "my_postgres",
+  "target": "my_clickhouse",
+  "api": {
+    "base_url": "https://api.example.com/v1/orders/{order_code}",
+    "method": "GET",
+    "headers": {
+      "Authorization": "Bearer ${API_TOKEN}"
+    },
+    "timeout_seconds": 10,
+    "mode": "per_row"
+  },
+  "defaults": {
+    "engine": "MergeTree",
+    "batch_size": 500,
+    "timestamp_column": "_enriched_at"
+  },
+  "tables": [
+    {
+      "source_table": "public.orders",
+      "source_columns": {
+        "id": "Int64",
+        "order_code": "String"
+      },
+      "watermark_column": "updated_at",
+      "overlap_minutes": 30,
+
+      "target_table": "default.order_enriched",
+      "timestamp_column": "_enriched_at",
+      "response_mapping": [
+        { "json_path": "status",          "column": "order_status",  "type": "String" },
+        { "json_path": "payment.amount",  "column": "pay_amount",    "type": "Decimal(10,2)" },
+        { "json_path": "details.country", "column": "country_code",  "type": "String" },
+        { "json_path": "items[0].name",   "column": "first_item",    "type": "Nullable(String)" }
+      ],
+
+      "engine": "ReplacingMergeTree(_enriched_at)",
+      "order_by": ["id"],
+      "partition_by": "toYYYYMM(_enriched_at)",
+      "batch_size": 100
+    }
+  ]
+}
