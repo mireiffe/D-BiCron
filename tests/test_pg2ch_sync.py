@@ -255,36 +255,61 @@ class TestRunValidation:
 
 
 class TestWatermark:
-    def _make_job(self, wm_file):
-        job = Pg2ChSyncJob(config=None)
-        job._WATERMARK_FILE = wm_file
-        return job
+    def _make_job(self):
+        return Pg2ChSyncJob(config=None)
 
-    def test_save_and_get_roundtrip(self, tmp_path):
-        wm_file = tmp_path / "wm.json"
-        job = self._make_job(wm_file)
+    def test_ensure_watermark_table(self):
+        job = self._make_job()
+        ch = MagicMock()
+        job._ensure_watermark_table(ch, "tgtdb")
+        ch.execute.assert_called_once()
+        ddl = ch.execute.call_args[0][0]
+        assert "CREATE TABLE IF NOT EXISTS" in ddl
+        assert "`tgtdb`.`_pg2ch_watermarks`" in ddl
+        assert "ReplacingMergeTree" in ddl
 
-        with patch("dbcron.jobs.pg2ch_sync.DATA_DIR", tmp_path):
-            job._save_watermark("db.tbl", "updated_at", "2026-01-01T00:00:00")
+    def test_save_and_get_roundtrip(self):
+        job = self._make_job()
+        ch = MagicMock()
 
-        val = job._get_watermark("db.tbl", "updated_at")
+        # save
+        job._save_watermark(ch, "tgtdb", "db.tbl", "updated_at", "2026-01-01T00:00:00")
+        save_call = ch.execute.call_args
+        assert "INSERT INTO" in save_call[0][0]
+        inserted = save_call[0][1]
+        assert inserted[0][0] == "db.tbl"
+        assert inserted[0][1] == "updated_at"
+        assert inserted[0][2] == "2026-01-01T00:00:00"
+
+        # get — simulate CH returning the saved value
+        ch.reset_mock()
+        ch.execute.return_value = [("2026-01-01T00:00:00",)]
+        val = job._get_watermark(ch, "tgtdb", "db.tbl", "updated_at")
         assert val == "2026-01-01T00:00:00"
+        select_sql = ch.execute.call_args[0][0]
+        assert "FINAL" in select_sql
 
-    def test_wrong_column_returns_none(self, tmp_path):
-        wm_file = tmp_path / "wm.json"
-        job = self._make_job(wm_file)
-
-        with patch("dbcron.jobs.pg2ch_sync.DATA_DIR", tmp_path):
-            job._save_watermark("db.tbl", "updated_at", "2026-01-01T00:00:00")
-
-        val = job._get_watermark("db.tbl", "created_at")
+    def test_wrong_column_returns_none(self):
+        job = self._make_job()
+        ch = MagicMock()
+        ch.execute.return_value = []
+        val = job._get_watermark(ch, "tgtdb", "db.tbl", "created_at")
         assert val is None
 
-    def test_no_file_returns_none(self, tmp_path):
-        wm_file = tmp_path / "nonexistent_wm.json"
-        job = self._make_job(wm_file)
-        val = job._get_watermark("db.tbl", "updated_at")
+    def test_no_rows_returns_none(self):
+        job = self._make_job()
+        ch = MagicMock()
+        ch.execute.return_value = []
+        val = job._get_watermark(ch, "tgtdb", "db.tbl", "updated_at")
         assert val is None
+
+    def test_save_datetime_value(self):
+        job = self._make_job()
+        ch = MagicMock()
+        dt = datetime(2026, 1, 1, 12, 0, 0)
+        job._save_watermark(ch, "tgtdb", "db.tbl", "updated_at", dt)
+        inserted = ch.execute.call_args[0][1]
+        assert inserted[0][2] == "2026-01-01T12:00:00"
 
 
 # ── 8. default_args and scope, load_config ───────────────────────

@@ -22,10 +22,9 @@ PG 소스에서 CH 타겟으로 테이블 데이터를 동기화합니다.
 from __future__ import annotations
 
 import json
-import os
 from datetime import datetime, timedelta
 
-from ..db import DATA_DIR, get_database
+from ..db import get_database
 from .base import Job, JobResult
 
 # ── PG → CH 기본 타입 매핑 ──────────────────────────────────────
@@ -107,7 +106,7 @@ class Pg2ChSyncJob(Job):
     default_args: dict = {"config": "pg2ch_config.json"}
     scope = "pipeline"
 
-    _WATERMARK_FILE = DATA_DIR / "pg2ch_watermarks.json"
+    _WATERMARK_TABLE = "_pg2ch_watermarks"
 
     # ── entry point ──────────────────────────────────────────────
 
@@ -196,29 +195,38 @@ class Pg2ChSyncJob(Job):
 
     # ── watermark ────────────────────────────────────────────────
 
-    def _load_watermarks(self) -> dict:
-        if self._WATERMARK_FILE.exists():
-            return json.loads(self._WATERMARK_FILE.read_text(encoding="utf-8"))
-        return {}
+    def _ensure_watermark_table(self, ch, db_name: str) -> None:
+        tbl = self._WATERMARK_TABLE
+        ddl = (
+            f"CREATE TABLE IF NOT EXISTS `{db_name}`.`{tbl}` ("
+            "  config_key String,"
+            "  watermark_column String,"
+            "  value String,"
+            "  updated_at DateTime64(3)"
+            ") ENGINE = ReplacingMergeTree(updated_at)"
+            " ORDER BY (config_key, watermark_column)"
+        )
+        ch.execute(ddl)
 
-    def _get_watermark(self, key: str, wm_col: str) -> str | None:
-        entry = self._load_watermarks().get(key)
-        if entry and entry.get("watermark_column") == wm_col:
-            return entry["value"]
+    def _get_watermark(self, ch, db_name: str, key: str, wm_col: str) -> str | None:
+        tbl = self._WATERMARK_TABLE
+        rows = ch.execute(
+            f"SELECT value FROM `{db_name}`.`{tbl}` FINAL"
+            " WHERE config_key = %(key)s AND watermark_column = %(wm_col)s"
+            " LIMIT 1",
+            {"key": key, "wm_col": wm_col},
+        )
+        if rows:
+            return rows[0][0]
         return None
 
-    def _save_watermark(self, key: str, wm_col: str, value) -> None:
-        wms = self._load_watermarks()
+    def _save_watermark(self, ch, db_name: str, key: str, wm_col: str, value) -> None:
+        tbl = self._WATERMARK_TABLE
         val_str = value.isoformat() if isinstance(value, datetime) else str(value)
-        wms[key] = {
-            "watermark_column": wm_col,
-            "value": val_str,
-            "updated_at": datetime.now().isoformat(timespec="seconds"),
-        }
-        os.makedirs(DATA_DIR, exist_ok=True)
-        self._WATERMARK_FILE.write_text(
-            json.dumps(wms, ensure_ascii=False, indent=2),
-            encoding="utf-8",
+        ch.execute(
+            f"INSERT INTO `{db_name}`.`{tbl}`"
+            " (config_key, watermark_column, value, updated_at) VALUES",
+            [(key, wm_col, val_str, datetime.now())],
         )
 
     # ── PG schema introspection ──────────────────────────────────
@@ -412,8 +420,9 @@ class Pg2ChSyncJob(Job):
             )
 
             # 4) 동기화 모드 결정
+            self._ensure_watermark_table(ch, tgt_db)
             wm_key = f"{sync_cfg['source']}.{src_table}"
-            watermark = self._get_watermark(wm_key, wm_col) if wm_col else None
+            watermark = self._get_watermark(ch, tgt_db, wm_key, wm_col) if wm_col else None
 
             if watermark:
                 cutoff = watermark
@@ -496,7 +505,7 @@ class Pg2ChSyncJob(Job):
 
             # 6) Watermark 저장
             if wm_col and max_wm is not None:
-                self._save_watermark(wm_key, wm_col, max_wm)
+                self._save_watermark(ch, tgt_db, wm_key, wm_col, max_wm)
                 self.logger.info("%s: watermark → %s", src_table, max_wm)
 
             mode = "incremental" if watermark else "full copy"
