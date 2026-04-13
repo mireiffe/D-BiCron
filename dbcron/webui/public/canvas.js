@@ -141,6 +141,10 @@ async function loadCanvasData() {
 
   CS.layout = computeLayout();
   renderCanvas();
+  // Fix: recalculate container bounds when saved positions exist
+  if (Object.keys(CS.nodePositions).length) {
+    updateContainerBounds();
+  }
   renderJobOverlay();
   initJobSSE();
   requestAnimationFrame(() => canvasFit());
@@ -326,14 +330,35 @@ function renderDBContainers(layer, containers) {
     .attr("class", "db-container")
     .attr("transform", d => `translate(${d.x},${d.y})`);
 
-  g.append("rect").attr("width", d => d.w).attr("height", d => d.h).attr("rx", 6)
-    .attr("fill", "rgba(30,30,66,0.3)").attr("stroke", d => d.color)
-    .attr("stroke-width", 2).attr("stroke-dasharray", "6,3").attr("opacity", 0.6);
+  // Offset shadow (neo-brutalist)
+  g.append("rect").attr("class", "container-shadow")
+    .attr("x", 3).attr("y", 3)
+    .attr("width", d => d.w).attr("height", d => d.h).attr("rx", 4)
+    .attr("fill", d => d.color + "08").attr("stroke", d => d.color)
+    .attr("stroke-width", 1).attr("opacity", 0.25);
 
+  // Main container rect
+  g.append("rect").attr("class", "container-main")
+    .attr("width", d => d.w).attr("height", d => d.h).attr("rx", 4)
+    .attr("fill", "rgba(20, 20, 48, 0.7)").attr("stroke", d => d.color)
+    .attr("stroke-width", 2.5);
+
+  // Header highlight band
+  g.append("rect").attr("class", "container-header")
+    .attr("x", 1.5).attr("y", 1.5)
+    .attr("width", d => d.w - 3).attr("height", 32).attr("rx", 3)
+    .attr("fill", d => d.color).attr("opacity", 0.1);
+
+  // Header separator
+  g.append("line").attr("class", "container-sep")
+    .attr("x1", 10).attr("y1", 34).attr("x2", d => d.w - 10).attr("y2", 34)
+    .attr("stroke", d => d.color).attr("stroke-width", 1).attr("opacity", 0.3);
+
+  // DB title
   g.append("text").attr("x", d => d.w / 2).attr("y", 22)
     .attr("text-anchor", "middle").attr("font-family", "'Rajdhani', sans-serif")
-    .attr("font-size", 14).attr("font-weight", 700).attr("fill", d => d.color)
-    .attr("letter-spacing", 2).text(d => d.label.toUpperCase());
+    .attr("font-size", 15).attr("font-weight", 700).attr("fill", d => d.color)
+    .attr("letter-spacing", 3).text(d => d.label.toUpperCase());
 }
 
 function renderTableNodes(layer, nodes) {
@@ -356,30 +381,47 @@ function renderTableNodes(layer, nodes) {
     .on("mouseenter", (event, d) => showTooltip(event, d))
     .on("mouseleave", hideTooltip);
 
-  g.append("rect").attr("width", d => d.w).attr("height", TABLE_H).attr("rx", 3)
-    .attr("fill", "#1e1e42").attr("stroke", d => d.dbColor).attr("stroke-width", 2).attr("opacity", 0.9);
+  // Offset shadow (neo-brutalist, matches cron card style)
+  g.append("rect").attr("class", "node-shadow")
+    .attr("x", 3).attr("y", 3)
+    .attr("width", d => d.w).attr("height", TABLE_H).attr("rx", 3)
+    .attr("fill", d => d.dbColor + "0a").attr("stroke", d => d.dbColor).attr("stroke-width", 1).attr("opacity", 0.2);
 
-  g.append("rect").attr("class", "node-glow").attr("width", d => d.w).attr("height", TABLE_H)
+  // Main rect
+  g.append("rect").attr("class", "node-main")
+    .attr("width", d => d.w).attr("height", TABLE_H).attr("rx", 3)
+    .attr("fill", "#1a1a40").attr("stroke", d => d.dbColor).attr("stroke-width", 2.5);
+
+  // Left accent bar (matches cron job-card border-left style)
+  g.append("rect").attr("class", "node-accent")
+    .attr("x", 1).attr("y", 3).attr("width", 3).attr("height", TABLE_H - 6)
+    .attr("rx", 1.5).attr("fill", d => d.dbColor).attr("opacity", 0.85);
+
+  // Hover glow
+  g.append("rect").attr("class", "node-glow")
+    .attr("width", d => d.w).attr("height", TABLE_H)
     .attr("rx", 3).attr("fill", "none").attr("stroke", d => d.dbColor).attr("stroke-width", 1).attr("opacity", 0);
 
   g.on("mouseenter.glow", function () {
-    d3.select(this).select(".node-glow").transition().duration(120).attr("opacity", 0.5).attr("stroke-width", 3);
+    d3.select(this).select(".node-glow").transition().duration(120).attr("opacity", 0.6).attr("stroke-width", 4);
   }).on("mouseleave.glow", function () {
     d3.select(this).select(".node-glow").transition().duration(200).attr("opacity", 0);
   });
 
-  g.append("text").attr("x", 10).attr("y", TABLE_H / 2 + 1)
+  // Table name text (larger, brighter)
+  g.append("text").attr("x", 14).attr("y", TABLE_H / 2 + 1)
     .attr("dominant-baseline", "middle").attr("font-family", "'Fira Code', monospace")
-    .attr("font-size", 11).attr("fill", "#e4e2f0")
+    .attr("font-size", 12).attr("fill", "#f0eef8")
     .text(d => d.label);
 
+  // Row count badge (more visible)
   const badge = g.append("g").attr("class", "row-badge-g");
-  badge.append("rect").attr("x", d => d.w - 68).attr("y", (TABLE_H - 16) / 2)
-    .attr("width", 58).attr("height", 16).attr("rx", 2)
-    .attr("fill", "rgba(200,255,0,0.08)").attr("stroke", "rgba(200,255,0,0.25)").attr("stroke-width", 1);
-  badge.append("text").attr("x", d => d.w - 39).attr("y", TABLE_H / 2 + 1)
+  badge.append("rect").attr("x", d => d.w - 70).attr("y", (TABLE_H - 18) / 2)
+    .attr("width", 60).attr("height", 18).attr("rx", 2)
+    .attr("fill", "rgba(200,255,0,0.1)").attr("stroke", "rgba(200,255,0,0.35)").attr("stroke-width", 1.5);
+  badge.append("text").attr("x", d => d.w - 40).attr("y", TABLE_H / 2 + 1)
     .attr("dominant-baseline", "middle").attr("text-anchor", "middle")
-    .attr("font-family", "'Fira Code', monospace").attr("font-size", 9).attr("fill", "#c8ff00")
+    .attr("font-family", "'Fira Code', monospace").attr("font-size", 10).attr("fill", "#c8ff00")
     .text(d => formatCount(d.rowCount));
 
   // Drift badges
@@ -433,29 +475,29 @@ function renderEntryPoints(layer, entryPoints) {
         return `${cx + r * Math.cos(a)},${cy + r * Math.sin(a)}`;
       }).join(" ");
       el.append("polygon").attr("points", pts)
-        .attr("fill", "rgba(255,45,138,0.08)").attr("stroke", "#ff2d8a").attr("stroke-width", 2);
+        .attr("fill", "rgba(255,45,138,0.12)").attr("stroke", "#ff2d8a").attr("stroke-width", 2.5);
     } else if (d.type === "service") {
       el.append("polygon")
         .attr("points", `${cx},${cy - EP_H / 2} ${cx + EP_W / 3},${cy} ${cx},${cy + EP_H / 2} ${cx - EP_W / 3},${cy}`)
-        .attr("fill", "rgba(255,45,138,0.08)").attr("stroke", "#ff2d8a").attr("stroke-width", 2);
+        .attr("fill", "rgba(255,45,138,0.12)").attr("stroke", "#ff2d8a").attr("stroke-width", 2.5);
     } else if (d.type === "file") {
       el.append("rect").attr("x", cx - EP_W / 3).attr("y", 0).attr("width", EP_W * 2 / 3).attr("height", EP_H)
-        .attr("rx", 3).attr("fill", "rgba(255,45,138,0.08)").attr("stroke", "#ff2d8a").attr("stroke-width", 2);
+        .attr("rx", 3).attr("fill", "rgba(255,45,138,0.12)").attr("stroke", "#ff2d8a").attr("stroke-width", 2.5);
     } else {
       el.append("circle").attr("cx", cx).attr("cy", cy).attr("r", EP_H / 2 - 2)
-        .attr("fill", "rgba(255,45,138,0.08)").attr("stroke", "#ff2d8a").attr("stroke-width", 2);
+        .attr("fill", "rgba(255,45,138,0.12)").attr("stroke", "#ff2d8a").attr("stroke-width", 2.5);
     }
   });
 
   g.append("text").attr("x", EP_W / 2).attr("y", EP_H / 2 + 1)
     .attr("dominant-baseline", "middle").attr("text-anchor", "middle")
-    .attr("font-family", "'Rajdhani', sans-serif").attr("font-size", 11).attr("font-weight", 700)
+    .attr("font-family", "'Rajdhani', sans-serif").attr("font-size", 12).attr("font-weight", 700)
     .attr("fill", "#ff2d8a").attr("letter-spacing", 1)
     .text(d => d.name.length > 16 ? d.name.slice(0, 14) + ".." : d.name);
 
   g.append("text").attr("x", EP_W / 2).attr("y", EP_H + 14)
     .attr("text-anchor", "middle").attr("font-family", "'Fira Code', monospace")
-    .attr("font-size", 8).attr("fill", "rgba(255,45,138,0.5)")
+    .attr("font-size", 9).attr("fill", "rgba(255,45,138,0.65)")
     .text(d => d.type.toUpperCase());
 }
 
@@ -469,10 +511,10 @@ function renderConnections(layer, connections) {
     .style("cursor", "pointer")
     .on("click", (_e, d) => openConnectionPanel(d))
     .on("mouseenter", function (_, d) {
-      layer.selectAll(`path.connection`).attr("opacity", c => c.key === d.key ? 1 : (c.type === "fk" ? 0.15 : 0.3));
+      layer.selectAll(`path.connection`).attr("opacity", c => c.key === d.key ? 1 : (c.type === "fk" ? 0.15 : 0.25));
     })
     .on("mouseleave", function () {
-      layer.selectAll("path.connection").attr("opacity", d => d.type === "fk" ? 0.4 : 0.85);
+      layer.selectAll("path.connection").attr("opacity", d => d.type === "fk" ? 0.5 : 0.9);
     });
 
   layer.selectAll("path.connection")
@@ -480,11 +522,11 @@ function renderConnections(layer, connections) {
     .attr("class", d => `connection conn-${d.type}`)
     .attr("d", d => arrowPath(d))
     .attr("fill", "none")
-    .attr("stroke", d => d.type === "pipeline" ? "#ffd000" : d.type === "entry" ? "#ff2d8a" : "rgba(0,229,255,0.3)")
-    .attr("stroke-width", d => d.type === "fk" ? 1 : 2)
+    .attr("stroke", d => d.type === "pipeline" ? "#ffd000" : d.type === "entry" ? "#ff2d8a" : "rgba(0,229,255,0.4)")
+    .attr("stroke-width", d => d.type === "fk" ? 1.5 : 2.5)
     .attr("stroke-dasharray", d => d.type === "entry" ? "6,4" : d.type === "fk" ? "3,3" : "none")
     .attr("marker-end", d => d.type === "pipeline" ? "url(#arrow-pipeline)" : d.type === "entry" ? "url(#arrow-entry)" : "url(#arrow-fk)")
-    .attr("opacity", d => d.type === "fk" ? 0.4 : 0.85)
+    .attr("opacity", d => d.type === "fk" ? 0.5 : 0.9)
     .style("pointer-events", "none");
 
   // Pipeline labels
@@ -492,7 +534,7 @@ function renderConnections(layer, connections) {
     .data(connections.filter(d => d.type === "pipeline" && d.label), d => d.key).join("text")
     .attr("class", "conn-label")
     .attr("font-family", "'Fira Code', monospace").attr("font-size", 9)
-    .attr("fill", "rgba(255,208,0,0.6)").attr("text-anchor", "middle")
+    .attr("fill", "rgba(255,208,0,0.75)").attr("text-anchor", "middle")
     .each(function (d) {
       const sx = d.source.x + d.source.w, sy = d.source.y + d.source.h / 2;
       const tx = d.target.x, ty = d.target.y + d.target.h / 2;
@@ -543,13 +585,13 @@ function updateContainerBounds() {
     container.w = maxX - minX + DB_PAD_X * 2;
     container.h = maxY - minY + DB_PAD_TOP + DB_PAD_BOTTOM;
   }
-  gRoot.selectAll("g.db-container")
-    .data(CS.layout.dbContainers, d => d.key)
-    .attr("transform", d => `translate(${d.x},${d.y})`)
-    .select("rect").attr("width", d => d.w).attr("height", d => d.h);
-  gRoot.selectAll("g.db-container")
-    .data(CS.layout.dbContainers, d => d.key)
-    .select("text").attr("x", d => d.w / 2);
+  const sel = gRoot.selectAll("g.db-container").data(CS.layout.dbContainers, d => d.key);
+  sel.attr("transform", d => `translate(${d.x},${d.y})`);
+  sel.select(".container-shadow").attr("width", d => d.w).attr("height", d => d.h);
+  sel.select(".container-main").attr("width", d => d.w).attr("height", d => d.h);
+  sel.select(".container-header").attr("width", d => d.w - 3);
+  sel.select(".container-sep").attr("x2", d => d.w - 10);
+  sel.select("text").attr("x", d => d.w / 2);
 }
 
 // ── Tooltip ────────────────────────────────────────────────────
@@ -801,13 +843,13 @@ function openDetailPanel(node) {
   }
 
   gRoot.selectAll("g.table-node")
-    .attr("opacity", d => connectedKeys.has(d.key) ? 1 : 0.2)
-    .select("rect:first-child")
-    .attr("stroke-width", d => d.key === node.key ? 3 : connectedKeys.has(d.key) ? 2.5 : 2);
+    .attr("opacity", d => connectedKeys.has(d.key) ? 1 : 0.15)
+    .select(".node-main")
+    .attr("stroke-width", d => d.key === node.key ? 3.5 : connectedKeys.has(d.key) ? 3 : 2.5);
   gRoot.selectAll("g.entry-point")
-    .attr("opacity", d => connectedKeys.has(d.key) ? 1 : 0.2);
+    .attr("opacity", d => connectedKeys.has(d.key) ? 1 : 0.15);
   gRoot.selectAll("path.connection")
-    .attr("opacity", d => connectedEdges.has(d.key) ? 1 : 0.08);
+    .attr("opacity", d => connectedEdges.has(d.key) ? 1 : 0.06);
 }
 
 function closeDetailPanel() {
@@ -815,10 +857,10 @@ function closeDetailPanel() {
   CS.selectedTable = null;
   // Restore full opacity
   gRoot.selectAll("g.table-node").attr("opacity", 1)
-    .select("rect:first-child").attr("stroke-width", 2);
+    .select(".node-main").attr("stroke-width", 2.5);
   gRoot.selectAll("g.entry-point").attr("opacity", 1);
   gRoot.selectAll("path.connection")
-    .attr("opacity", d => d.type === "fk" ? 0.4 : 0.85);
+    .attr("opacity", d => d.type === "fk" ? 0.5 : 0.9);
 }
 
 // ── Detail panel resize ───────────────────────────────────────
@@ -930,9 +972,9 @@ function openComparePanel(nodeB) {
 
   // Highlight both nodes
   gRoot.selectAll("g.table-node")
-    .attr("opacity", d => (d.key === nodeA.key || d.key === nodeB.key) ? 1 : 0.2)
-    .select("rect:first-child")
-    .attr("stroke-width", d => (d.key === nodeA.key || d.key === nodeB.key) ? 3 : 2);
+    .attr("opacity", d => (d.key === nodeA.key || d.key === nodeB.key) ? 1 : 0.15)
+    .select(".node-main")
+    .attr("stroke-width", d => (d.key === nodeA.key || d.key === nodeB.key) ? 3.5 : 2.5);
 }
 
 // ── Connection (arrow) detail panel ────────────────────────────
@@ -1162,7 +1204,7 @@ function canvasSearch(query) {
     gRoot.selectAll("g.table-node").attr("opacity", 1);
     gRoot.selectAll("g.db-container").attr("opacity", 1);
     gRoot.selectAll("g.entry-point").attr("opacity", 1);
-    gRoot.selectAll("path.connection").attr("opacity", d => d.type === "fk" ? 0.4 : 0.85);
+    gRoot.selectAll("path.connection").attr("opacity", d => d.type === "fk" ? 0.5 : 0.9);
     if (countEl) countEl.textContent = "";
     return;
   }
