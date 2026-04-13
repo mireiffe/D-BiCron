@@ -343,9 +343,25 @@ class Pg2ChSyncJob(Job):
         import json as _json
 
         transforms: dict[int, callable] = {}
+        # non-nullable CH 컬럼에 NULL 유입 시 타입별 기본값으로 치환
+        _CH_DEFAULTS: dict[str, object] = {
+            "String": "",
+            "UUID": "00000000-0000-0000-0000-000000000000",
+            "Date": "1970-01-01",
+        }
+        null_coerce: dict[int, object] = {}
         for i, col in enumerate(columns):
             pg_t = col["pg_type"]
-            base = _unwrap_ch_type(col["ch_type"])
+            ch_type = col["ch_type"]
+            base = _unwrap_ch_type(ch_type)
+
+            if not ch_type.startswith("Nullable("):
+                if base in _CH_DEFAULTS:
+                    null_coerce[i] = _CH_DEFAULTS[base]
+                elif base.startswith(("Int", "UInt", "Float", "Decimal")):
+                    null_coerce[i] = 0
+                elif base.startswith("DateTime"):
+                    null_coerce[i] = "1970-01-01 00:00:00"
 
             if pg_t in ("json", "jsonb"):
 
@@ -378,13 +394,16 @@ class Pg2ChSyncJob(Job):
 
                 transforms[i] = _sconv
 
-        if not transforms:
+        if not transforms and not null_coerce:
             return None
 
         def transform(row: tuple) -> tuple:
             lst = list(row)
             for idx, fn in transforms.items():
                 lst[idx] = fn(lst[idx])
+            for idx, default in null_coerce.items():
+                if lst[idx] is None:
+                    lst[idx] = default
             return tuple(lst)
 
         return transform

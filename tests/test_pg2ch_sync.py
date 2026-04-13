@@ -141,15 +141,37 @@ class TestBuildTransformer:
         assert fn((b"\xde\xad",)) == ("dead",)
 
     def test_no_transform_needed(self):
-        columns = [{"name": "txt", "pg_type": "text", "ch_type": "String"}]
+        columns = [{"name": "txt", "pg_type": "text", "ch_type": "Nullable(String)"}]
         fn = Pg2ChSyncJob._build_transformer(columns)
         assert fn is None
 
-    def test_none_passthrough(self):
-        columns = [{"name": "data", "pg_type": "jsonb", "ch_type": "String"}]
+    def test_none_passthrough_nullable(self):
+        columns = [{"name": "data", "pg_type": "jsonb", "ch_type": "Nullable(String)"}]
         fn = Pg2ChSyncJob._build_transformer(columns)
         assert fn is not None
         assert fn((None,)) == (None,)
+
+    def test_null_coerce_string(self):
+        """Non-nullable String column should coerce None → empty string."""
+        columns = [{"name": "txt", "pg_type": "text", "ch_type": "String"}]
+        fn = Pg2ChSyncJob._build_transformer(columns)
+        assert fn is not None
+        assert fn((None,)) == ("",)
+        assert fn(("hello",)) == ("hello",)
+
+    def test_null_coerce_int(self):
+        """Non-nullable Int column should coerce None → 0."""
+        columns = [{"name": "n", "pg_type": "integer", "ch_type": "Int32"}]
+        fn = Pg2ChSyncJob._build_transformer(columns)
+        assert fn is not None
+        assert fn((None,)) == (0,)
+        assert fn((42,)) == (42,)
+
+    def test_null_coerce_skipped_for_nullable(self):
+        """Nullable columns should pass None through."""
+        columns = [{"name": "n", "pg_type": "integer", "ch_type": "Nullable(Int32)"}]
+        fn = Pg2ChSyncJob._build_transformer(columns)
+        assert fn is None
 
 
 # ── 6. run() validation ─────────────────────────────────────────
