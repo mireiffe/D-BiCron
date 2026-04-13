@@ -46,6 +46,8 @@ class Job(ABC):
     #   pipeline   — pipeline_config 의 특정 source/target 테이블
     #   none       — DB 접근 없음
     scope: str = "none"
+    # bundled: 플랫폼 기본 제공 job (DB 상태 조회, 변경점 감지 등)
+    bundled: bool = False
 
     def __init__(self, config: AppConfig | None = None):
         self.config = config

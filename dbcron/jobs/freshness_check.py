@@ -18,6 +18,7 @@ class FreshnessCheckJob(Job):
     description = "이전 스냅샷 대비 row count 변화가 없는 테이블 감지"
     default_args: dict = {}
     scope = "all_tables"
+    bundled = True
 
     def run(self, **kwargs) -> JobResult:
         cur_path = DATA_DIR / "metadata_snapshot.json"

@@ -22,6 +22,7 @@ class ConnectionTestJob(Job):
     description = "등록된 모든 DB의 연결/인증 상태를 점검"
     default_args: dict = {}
     scope = "all_dbs"
+    bundled = True
 
     def run(self, **kwargs) -> JobResult:
         databases, _ = self.resolve_databases()

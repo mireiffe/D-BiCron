@@ -20,6 +20,7 @@ class FKIntegrityJob(Job):
     description = "FK 관계에서 참조 무결성 위반(고아 행) 탐지"
     default_args: dict = {}
     scope = "all_tables"
+    bundled = True
 
     def run(self, **kwargs) -> JobResult:
         snapshot_path = DATA_DIR / "metadata_snapshot.json"

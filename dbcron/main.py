@@ -65,6 +65,7 @@ def main():
                 "description": getattr(cls, "description", ""),
                 "defaultArgs": getattr(cls, "default_args", {"days": 1}),
                 "scope": getattr(cls, "scope", "none"),
+                "bundled": getattr(cls, "bundled", False),
             })
         print(json.dumps(jobs))
         sys.exit(0)

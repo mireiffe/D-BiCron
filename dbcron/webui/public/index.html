@@ -197,6 +197,12 @@
       margin-bottom: 8px;
     }
     .job-card:hover { border-color: rgba(200, 255, 0, .5); transform: translate(-1px, -1px); box-shadow: 5px 5px 0 var(--lime-glow); }
+    .job-card.bundled {
+      border-color: rgba(0, 229, 255, .25);
+      border-left-color: var(--cyan);
+      box-shadow: 3px 3px 0 var(--cyan-glow);
+    }
+    .job-card.bundled:hover { border-color: rgba(0, 229, 255, .45); box-shadow: 5px 5px 0 var(--cyan-glow); }
     .job-name { font-family: var(--font-display); font-weight: 700; font-size: 14px; color: var(--text-bright); margin-bottom: 2px; }
     .job-desc { font-size: 11px; color: var(--text-dim); margin-bottom: 10px; }
     .job-actions { display: flex; gap: 8px; align-items: center; }
@@ -701,6 +707,11 @@
 <div class="dashboard">
   <aside class="sidebar">
     <div class="stitle">
+      <span class="stitle-tag cyan">&gt;_</span>
+      Bundled <span class="count" id="bundled-job-count">0</span>
+    </div>
+    <div id="bundled-jobs-list"></div>
+    <div class="stitle" style="margin-top:16px">
       <span class="stitle-tag lime">&gt;_</span>
       Jobs <span class="count" id="job-count">0</span>
     </div>
@@ -1125,11 +1136,15 @@ async function loadJobs() {
   const [jobs, jobStats] = await Promise.all([api("/api/jobs"), api("/api/jobs/stats").catch(() => ({}))]);
   jobsCache = jobs;
   const el = document.getElementById("jobs-list");
+  const bel = document.getElementById("bundled-jobs-list");
   const sel = document.getElementById("sched-job");
-  document.getElementById("job-count").textContent = jobs.length;
-  clearEl(el); clearEl(sel);
+  const bundledJobs = jobs.filter(j => j.bundled);
+  const customJobs = jobs.filter(j => !j.bundled);
+  document.getElementById("bundled-job-count").textContent = bundledJobs.length;
+  document.getElementById("job-count").textContent = customJobs.length;
+  clearEl(el); clearEl(bel); clearEl(sel);
   if (!jobs.length) { el.appendChild(makeEl("div", { className: "empty" }, "No jobs registered")); return; }
-  jobs.forEach(j => {
+  function renderJobCard(j, container) {
     sel.appendChild(makeEl("option", { value: j.name }, j.label));
     const argInputs = {};
     const actions = [];
@@ -1142,8 +1157,9 @@ async function loadJobs() {
         actions.push(makeEl("div", { className: "field-inline" }, [makeEl("label", null, key), input]));
       }
     }
+    const btnClass = j.bundled ? "btn btn-cyan btn-sm" : "btn btn-lime btn-sm";
     const runBtn = makeEl("button", {
-      className: "btn btn-lime btn-sm",
+      className: btnClass,
       onClick: async () => {
         runBtn.disabled = true;
         try {
@@ -1174,8 +1190,13 @@ async function loadJobs() {
     const children = [makeEl("div", { className: "job-name" }, j.label), makeEl("div", { className: "job-desc" }, j.description)];
     if (statsEl) children.push(statsEl);
     children.push(makeEl("div", { className: "job-actions" }, actions));
-    el.appendChild(makeEl("div", { className: "job-card" }, children));
-  });
+    const cardClass = j.bundled ? "job-card bundled" : "job-card";
+    container.appendChild(makeEl("div", { className: cardClass }, children));
+  }
+  bundledJobs.forEach(j => renderJobCard(j, bel));
+  customJobs.forEach(j => renderJobCard(j, el));
+  if (!bundledJobs.length) bel.appendChild(makeEl("div", { className: "empty" }, "No bundled jobs"));
+  if (!customJobs.length) el.appendChild(makeEl("div", { className: "empty" }, "No custom jobs"));
   sel.addEventListener("change", () => updateSchedArgs());
   updateSchedArgs();
   // Populate depends-on selector
