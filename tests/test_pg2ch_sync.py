@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import json
-from datetime import datetime
+from datetime import datetime, timedelta
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -12,6 +12,7 @@ from dbcron.jobs.pg2ch_sync import (
     Pg2ChSyncJob,
     _fmt_bytes,
     _pg_type_to_ch,
+    _resolve_sync_since,
     _unwrap_ch_type,
 )
 
@@ -312,7 +313,36 @@ class TestWatermark:
         assert inserted[0][2] == "2026-01-01T12:00:00"
 
 
-# ── 8. sync_since ────────────────────────────────────────────────
+# ── 8. _resolve_sync_since ───────────────────────────────────────
+
+
+class TestResolveSyncSince:
+    def test_days(self):
+        result = _resolve_sync_since("30d")
+        expected = datetime.now() - timedelta(days=30)
+        assert abs(datetime.fromisoformat(result) - expected) < timedelta(seconds=2)
+
+    def test_hours(self):
+        result = _resolve_sync_since("12h")
+        expected = datetime.now() - timedelta(hours=12)
+        assert abs(datetime.fromisoformat(result) - expected) < timedelta(seconds=2)
+
+    def test_minutes(self):
+        result = _resolve_sync_since("90m")
+        expected = datetime.now() - timedelta(minutes=90)
+        assert abs(datetime.fromisoformat(result) - expected) < timedelta(seconds=2)
+
+    def test_absolute_passthrough(self):
+        ts = "2025-01-01T00:00:00"
+        assert _resolve_sync_since(ts) == ts
+
+    def test_whitespace_stripped(self):
+        result = _resolve_sync_since("  7d  ")
+        expected = datetime.now() - timedelta(days=7)
+        assert abs(datetime.fromisoformat(result) - expected) < timedelta(seconds=2)
+
+
+# ── 9. sync_since ────────────────────────────────────────────────
 
 
 class TestSyncSince:
@@ -485,7 +515,7 @@ class TestSyncSince:
             assert params == ("2025-06-01T00:00:00",)
 
 
-# ── 9. default_args and scope, load_config ───────────────────────
+# ── 10. default_args and scope, load_config ──────────────────────
 
 
 class TestJobMeta:

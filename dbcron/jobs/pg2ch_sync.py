@@ -23,6 +23,7 @@ PG 소스에서 CH 타겟으로 테이블 데이터를 동기화합니다.
 from __future__ import annotations
 
 import json
+import re
 from datetime import datetime, timedelta
 
 from ..db import get_database
@@ -87,6 +88,25 @@ def _unwrap_ch_type(ch_type: str) -> str:
                 s = s[len(prefix) : -1]
                 changed = True
     return s
+
+
+_RELATIVE_RE = re.compile(r"^(\d+)\s*([dhm])$", re.IGNORECASE)
+
+
+def _resolve_sync_since(raw: str) -> str:
+    """sync_since 값을 ISO timestamp 문자열로 변환.
+
+    지원 형식:
+      - 상대: "30d" (일), "12h" (시간), "90m" (분)
+      - 절대: ISO 8601 timestamp (그대로 반환)
+    """
+    m = _RELATIVE_RE.match(raw.strip())
+    if m:
+        amount = int(m.group(1))
+        unit = m.group(2).lower()
+        delta = {"d": timedelta(days=amount), "h": timedelta(hours=amount), "m": timedelta(minutes=amount)}[unit]
+        return (datetime.now() - delta).isoformat()
+    return raw
 
 
 def _fmt_bytes(n: int) -> str:
@@ -381,7 +401,8 @@ class Pg2ChSyncJob(Job):
         src_table: str = tc["source_table"]
         tgt_table: str = tc["target_table"]
         ts_col: str | None = tc.get("timestamp_column")
-        sync_since: str | None = tc.get("sync_since")
+        raw_since: str | None = tc.get("sync_since")
+        sync_since: str | None = _resolve_sync_since(raw_since) if raw_since else None
         drop_cols = set(tc.get("drop_columns", []))
         col_overrides: dict = tc.get("column_overrides", {})
         order_by: list[str] = tc["order_by"]

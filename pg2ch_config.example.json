@@ -13,7 +13,7 @@
       "source_table": "public.orders",
       "target_table": "default.orders",
       "timestamp_column": "updated_at",
-      "sync_since": "2025-01-01T00:00:00",
+      "sync_since": "30d",
       "engine": "ReplacingMergeTree(updated_at)",
       "order_by": ["id"],
       "partition_by": "toYYYYMM(created_at)",
