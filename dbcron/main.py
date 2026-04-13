@@ -49,7 +49,7 @@ def main():
         help="Print available jobs as JSON and exit",
     )
 
-    args = parser.parse_args()
+    args, _remaining = parser.parse_known_args()
 
     if args.list_jobs:
         jobs = []
@@ -67,7 +67,21 @@ def main():
     if not args.job:
         parser.error("job is required (or use --list-jobs)")
 
+    # job 의 default_args 에 선언된 키를 동적으로 argparse 에 추가
+    job_cls = JOB_REGISTRY[args.job]
+    for key, default in getattr(job_cls, "default_args", {}).items():
+        if key == "days":
+            continue  # 전역 인자로 이미 정의됨
+        parser.add_argument(f"--{key}", default=default)
+    args = parser.parse_args()
+
     job_kwargs = {"days": args.days}
+    for key in getattr(job_cls, "default_args", {}):
+        if key == "days":
+            continue
+        val = getattr(args, key, None)
+        if val is not None:
+            job_kwargs[key] = val
 
     if args.targets:
         import json as _json

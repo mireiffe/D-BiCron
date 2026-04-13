@@ -1,0 +1,41 @@
+{
+  "_comment": "PostgreSQL → ClickHouse 동기화 설정. source/target 은 databases.json 의 DB ID",
+  "source": "my_postgres",
+  "target": "my_clickhouse",
+  "ch_native_port": 9000,
+  "defaults": {
+    "engine": "ReplacingMergeTree",
+    "batch_size": 100000,
+    "overlap_minutes": 0
+  },
+  "tables": [
+    {
+      "source_table": "public.orders",
+      "target_table": "default.orders",
+      "watermark_column": "updated_at",
+      "engine": "ReplacingMergeTree(updated_at)",
+      "order_by": ["id"],
+      "partition_by": "toYYYYMM(created_at)",
+      "drop_columns": ["internal_note", "debug_payload"],
+      "column_overrides": {
+        "status": "LowCardinality(String)",
+        "country": "LowCardinality(String)",
+        "amount": "Decimal(18,4)"
+      },
+      "batch_size": 50000,
+      "overlap_minutes": 30
+    },
+    {
+      "source_table": "public.event_logs",
+      "target_table": "default.event_logs",
+      "watermark_column": "created_at",
+      "engine": "MergeTree",
+      "order_by": ["event_type", "created_at"],
+      "partition_by": "toYYYYMMDD(created_at)",
+      "drop_columns": [],
+      "column_overrides": {
+        "event_type": "LowCardinality(String)"
+      }
+    }
+  ]
+}
