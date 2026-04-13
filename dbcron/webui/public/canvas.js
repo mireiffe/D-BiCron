@@ -5,12 +5,28 @@
 const CS = {
   metadata: null,
   pipelineConfig: null,
+  databases: [],
   layout: null,
   selectedTable: null,
   nodePositions: {},
   scheduleStatus: null,
   jobOverlayVisible: true,
 };
+
+// ── Table filtering (mirrors Python should_include_table) ──────
+function globMatch(pattern, str) {
+  const re = new RegExp("^" + pattern.replace(/[.+^${}()|[\]\\]/g, "\\$&")
+    .replace(/\*/g, ".*").replace(/\?/g, ".") + "$");
+  return re.test(str);
+}
+
+function shouldIncludeTable(tableName, dbCfg) {
+  const includes = dbCfg.include_tables || [];
+  const excludes = dbCfg.exclude_tables || [];
+  if (includes.length && !includes.some(pat => globMatch(pat, tableName))) return false;
+  if (excludes.length && excludes.some(pat => globMatch(pat, tableName))) return false;
+  return true;
+}
 
 // Layout constants
 const TABLE_W_MIN = 200, TABLE_H = 36, TABLE_PAD = 10;
@@ -152,8 +168,12 @@ function computeLayout() {
   for (const dbKey of dbKeys) {
     const db = CS.metadata.databases[dbKey];
     if (!db || !db.tables) { dbMaxW[dbKey] = TABLE_W_MIN; continue; }
+    const dbCfg = CS.databases.find(d => d.id === dbKey) || {};
     let mw = TABLE_W_MIN;
-    for (const tData of Object.values(db.tables)) { mw = Math.max(mw, calcTableW(tData.table)); }
+    for (const tData of Object.values(db.tables)) {
+      if (!shouldIncludeTable(tData.table, dbCfg)) continue;
+      mw = Math.max(mw, calcTableW(tData.table));
+    }
     dbMaxW[dbKey] = mw;
   }
 
@@ -171,7 +191,11 @@ function computeLayout() {
 
     const dbLabel = cfg.databases?.[dbKey]?.label || dbKey;
     const dbColor = cfg.databases?.[dbKey]?.color || "#00e5ff";
-    const allTableKeys = Object.keys(db.tables);
+    const dbCfg = CS.databases.find(d => d.id === dbKey) || {};
+    const allTableKeys = Object.keys(db.tables).filter(tKey => {
+      const tData = db.tables[tKey];
+      return tData && shouldIncludeTable(tData.table, dbCfg);
+    });
 
     const connectedSet = new Set();
     const connectedOrder = [];
