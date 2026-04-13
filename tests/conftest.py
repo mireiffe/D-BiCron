@@ -138,7 +138,7 @@ def pg2ch_config(tmp_path):
             {
                 "source_table": "public.orders",
                 "target_table": "default.orders",
-                "watermark_column": "updated_at",
+                "timestamp_column": "updated_at",
                 "engine": "ReplacingMergeTree(updated_at)",
                 "order_by": ["id"],
                 "partition_by": "toYYYYMM(created_at)",

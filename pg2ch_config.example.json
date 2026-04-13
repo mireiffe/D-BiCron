@@ -12,7 +12,8 @@
     {
       "source_table": "public.orders",
       "target_table": "default.orders",
-      "watermark_column": "updated_at",
+      "timestamp_column": "updated_at",
+      "sync_since": "2025-01-01T00:00:00",
       "engine": "ReplacingMergeTree(updated_at)",
       "order_by": ["id"],
       "partition_by": "toYYYYMM(created_at)",
@@ -28,7 +29,7 @@
     {
       "source_table": "public.event_logs",
       "target_table": "default.event_logs",
-      "watermark_column": "created_at",
+      "timestamp_column": "created_at",
       "engine": "MergeTree",
       "order_by": ["event_type", "created_at"],
       "partition_by": "toYYYYMMDD(created_at)",

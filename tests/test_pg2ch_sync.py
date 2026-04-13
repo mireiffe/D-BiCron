@@ -312,7 +312,180 @@ class TestWatermark:
         assert inserted[0][2] == "2026-01-01T12:00:00"
 
 
-# ── 8. default_args and scope, load_config ───────────────────────
+# ── 8. sync_since ────────────────────────────────────────────────
+
+
+class TestSyncSince:
+    def _make_job(self):
+        return Pg2ChSyncJob(config=None)
+
+    def test_sync_since_without_timestamp_column_raises(self):
+        """sync_since requires timestamp_column to be set."""
+        job = self._make_job()
+        tc = {
+            "source_table": "public.orders",
+            "target_table": "default.orders",
+            "sync_since": "2025-01-01T00:00:00",
+            "order_by": ["id"],
+        }
+        src = {"host": "localhost", "port": 5432, "dbname": "src", "user": "u", "password": "p"}
+        tgt = {"host": "localhost", "port": 9000, "dbname": "tgt", "user": "default", "password": ""}
+        sync_cfg = {"source": "pg_src", "target": "ch_tgt"}
+        with pytest.raises(ValueError, match="sync_since requires timestamp_column"):
+            job._sync_table(src, tgt, tc, sync_cfg)
+
+    def test_sync_since_applied_in_full_copy(self):
+        """Full copy mode should add WHERE ts_col >= sync_since."""
+        job = self._make_job()
+        ch = MagicMock()
+        ch.execute.return_value = []  # _get_watermark → no rows
+
+        pg_conn = MagicMock()
+        cursor_mock = MagicMock()
+        cursor_mock.fetchmany.return_value = []
+        pg_conn.cursor.return_value.__enter__ = MagicMock(return_value=cursor_mock)
+        pg_conn.cursor.return_value.__exit__ = MagicMock(return_value=False)
+
+        # _get_pg_columns mock
+        pg_cols = [
+            {"name": "id", "pg_type": "integer", "nullable": False, "precision": None, "scale": None},
+            {"name": "updated_at", "pg_type": "timestamp without time zone", "nullable": False, "precision": None, "scale": None},
+        ]
+
+        tc = {
+            "source_table": "public.orders",
+            "target_table": "default.orders",
+            "timestamp_column": "updated_at",
+            "sync_since": "2025-01-01T00:00:00",
+            "order_by": ["id"],
+            "engine": "ReplacingMergeTree",
+        }
+        sync_cfg = {"source": "pg_src"}
+
+        with (
+            patch.object(job, "_pg_connect", return_value=pg_conn),
+            patch.object(job, "_ch_connect", return_value=ch),
+            patch.object(job, "_get_pg_columns", return_value=pg_cols),
+        ):
+            # named cursor for streaming
+            stream_cursor = MagicMock()
+            stream_cursor.fetchmany.return_value = []
+            pg_conn.cursor.return_value = stream_cursor
+
+            job._sync_table(
+                {"host": "h", "port": 5432, "dbname": "src", "user": "u", "password": "p"},
+                {"host": "h", "port": 9000, "dbname": "tgt", "user": "default", "password": ""},
+                tc,
+                sync_cfg,
+            )
+
+            # Verify the SELECT query includes WHERE ... >= sync_since
+            execute_calls = stream_cursor.execute.call_args_list
+            assert len(execute_calls) == 1
+            query = execute_calls[0][0][0]
+            params = execute_calls[0][0][1] if len(execute_calls[0][0]) > 1 else None
+            assert 'WHERE "updated_at" >= %s' in query
+            assert params == ("2025-01-01T00:00:00",)
+
+    def test_sync_since_overrides_older_watermark(self):
+        """When sync_since > watermark cutoff, sync_since should be used."""
+        job = self._make_job()
+        ch = MagicMock()
+        # _get_watermark returns old watermark
+        ch.execute.side_effect = [
+            None,  # _ensure_ch_table
+            None,  # _ensure_watermark_table
+            [("2024-06-01T00:00:00",)],  # _get_watermark
+        ]
+
+        pg_conn = MagicMock()
+        pg_cols = [
+            {"name": "id", "pg_type": "integer", "nullable": False, "precision": None, "scale": None},
+            {"name": "updated_at", "pg_type": "timestamp without time zone", "nullable": False, "precision": None, "scale": None},
+        ]
+
+        tc = {
+            "source_table": "public.orders",
+            "target_table": "default.orders",
+            "timestamp_column": "updated_at",
+            "sync_since": "2025-01-01T00:00:00",
+            "order_by": ["id"],
+            "engine": "ReplacingMergeTree",
+        }
+        sync_cfg = {"source": "pg_src"}
+
+        with (
+            patch.object(job, "_pg_connect", return_value=pg_conn),
+            patch.object(job, "_ch_connect", return_value=ch),
+            patch.object(job, "_get_pg_columns", return_value=pg_cols),
+        ):
+            stream_cursor = MagicMock()
+            stream_cursor.fetchmany.return_value = []
+            pg_conn.cursor.return_value = stream_cursor
+
+            job._sync_table(
+                {"host": "h", "port": 5432, "dbname": "src", "user": "u", "password": "p"},
+                {"host": "h", "port": 9000, "dbname": "tgt", "user": "default", "password": ""},
+                tc,
+                sync_cfg,
+            )
+
+            # cutoff should be sync_since (2025) not watermark (2024)
+            execute_calls = stream_cursor.execute.call_args_list
+            query = execute_calls[0][0][0]
+            params = execute_calls[0][0][1]
+            assert 'WHERE "updated_at" > %s' in query
+            assert params == ("2025-01-01T00:00:00",)
+
+    def test_sync_since_ignored_when_watermark_is_newer(self):
+        """When watermark > sync_since, watermark should be used."""
+        job = self._make_job()
+        ch = MagicMock()
+        ch.execute.side_effect = [
+            None,  # _ensure_ch_table
+            None,  # _ensure_watermark_table
+            [("2025-06-01T00:00:00",)],  # _get_watermark (newer than sync_since)
+        ]
+
+        pg_conn = MagicMock()
+        pg_cols = [
+            {"name": "id", "pg_type": "integer", "nullable": False, "precision": None, "scale": None},
+            {"name": "updated_at", "pg_type": "timestamp without time zone", "nullable": False, "precision": None, "scale": None},
+        ]
+
+        tc = {
+            "source_table": "public.orders",
+            "target_table": "default.orders",
+            "timestamp_column": "updated_at",
+            "sync_since": "2025-01-01T00:00:00",
+            "order_by": ["id"],
+            "engine": "ReplacingMergeTree",
+        }
+        sync_cfg = {"source": "pg_src"}
+
+        with (
+            patch.object(job, "_pg_connect", return_value=pg_conn),
+            patch.object(job, "_ch_connect", return_value=ch),
+            patch.object(job, "_get_pg_columns", return_value=pg_cols),
+        ):
+            stream_cursor = MagicMock()
+            stream_cursor.fetchmany.return_value = []
+            pg_conn.cursor.return_value = stream_cursor
+
+            job._sync_table(
+                {"host": "h", "port": 5432, "dbname": "src", "user": "u", "password": "p"},
+                {"host": "h", "port": 9000, "dbname": "tgt", "user": "default", "password": ""},
+                tc,
+                sync_cfg,
+            )
+
+            # cutoff should be watermark (2025-06), not sync_since (2025-01)
+            execute_calls = stream_cursor.execute.call_args_list
+            params = execute_calls[0][0][1]
+            assert params == ("2025-06-01T00:00:00",)
+
+
+# ── 9. default_args and scope, load_config ───────────────────────
 
 
 class TestJobMeta:

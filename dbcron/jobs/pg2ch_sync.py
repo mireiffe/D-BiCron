@@ -13,6 +13,7 @@ PG 소스에서 CH 타겟으로 테이블 데이터를 동기화합니다.
   - ORDER BY / PARTITION BY / ENGINE 설정
   - 자동 테이블 생성 (CREATE TABLE IF NOT EXISTS)
   - Watermark 기반 증분 동기화 (timestamp / integer 모두 지원)
+  - sync_since: timestamp_column 기반 하한 필터 (full copy / incremental 공통)
 
 설정:
   PG2CH_CONFIG 환경변수로 JSON 설정 파일 경로 지정 (기본: pg2ch_config.json)
@@ -200,33 +201,33 @@ class Pg2ChSyncJob(Job):
         ddl = (
             f"CREATE TABLE IF NOT EXISTS `{db_name}`.`{tbl}` ("
             "  config_key String,"
-            "  watermark_column String,"
+            "  timestamp_column String,"
             "  value String,"
             "  updated_at DateTime64(3)"
             ") ENGINE = ReplacingMergeTree(updated_at)"
-            " ORDER BY (config_key, watermark_column)"
+            " ORDER BY (config_key, timestamp_column)"
         )
         ch.execute(ddl)
 
-    def _get_watermark(self, ch, db_name: str, key: str, wm_col: str) -> str | None:
+    def _get_watermark(self, ch, db_name: str, key: str, ts_col: str) -> str | None:
         tbl = self._WATERMARK_TABLE
         rows = ch.execute(
             f"SELECT value FROM `{db_name}`.`{tbl}` FINAL"
-            " WHERE config_key = %(key)s AND watermark_column = %(wm_col)s"
+            " WHERE config_key = %(key)s AND timestamp_column = %(ts_col)s"
             " LIMIT 1",
-            {"key": key, "wm_col": wm_col},
+            {"key": key, "ts_col": ts_col},
         )
         if rows:
             return rows[0][0]
         return None
 
-    def _save_watermark(self, ch, db_name: str, key: str, wm_col: str, value) -> None:
+    def _save_watermark(self, ch, db_name: str, key: str, ts_col: str, value) -> None:
         tbl = self._WATERMARK_TABLE
         val_str = value.isoformat() if isinstance(value, datetime) else str(value)
         ch.execute(
             f"INSERT INTO `{db_name}`.`{tbl}`"
-            " (config_key, watermark_column, value, updated_at) VALUES",
-            [(key, wm_col, val_str, datetime.now())],
+            " (config_key, timestamp_column, value, updated_at) VALUES",
+            [(key, ts_col, val_str, datetime.now())],
         )
 
     # ── PG schema introspection ──────────────────────────────────
@@ -379,7 +380,8 @@ class Pg2ChSyncJob(Job):
     ) -> int:
         src_table: str = tc["source_table"]
         tgt_table: str = tc["target_table"]
-        wm_col: str | None = tc.get("watermark_column")
+        ts_col: str | None = tc.get("timestamp_column")
+        sync_since: str | None = tc.get("sync_since")
         drop_cols = set(tc.get("drop_columns", []))
         col_overrides: dict = tc.get("column_overrides", {})
         order_by: list[str] = tc["order_by"]
@@ -387,6 +389,11 @@ class Pg2ChSyncJob(Job):
         engine: str = tc.get("engine", "ReplacingMergeTree")
         batch_size: int = tc.get("batch_size", 100_000)
         overlap_min: int = tc.get("overlap_minutes", 0)
+
+        if sync_since and not ts_col:
+            raise ValueError(
+                f"{src_table}: sync_since requires timestamp_column to be set"
+            )
 
         # schema.table 파싱
         src_schema, src_name = (
@@ -422,7 +429,7 @@ class Pg2ChSyncJob(Job):
             # 4) 동기화 모드 결정
             self._ensure_watermark_table(ch, tgt_db)
             wm_key = f"{sync_cfg['source']}.{src_table}"
-            watermark = self._get_watermark(ch, tgt_db, wm_key, wm_col) if wm_col else None
+            watermark = self._get_watermark(ch, tgt_db, wm_key, ts_col) if ts_col else None
 
             if watermark:
                 cutoff = watermark
@@ -435,9 +442,13 @@ class Pg2ChSyncJob(Job):
                     except (ValueError, TypeError):
                         pass  # 정수형 watermark — overlap 미적용
 
+                # sync_since 가 watermark 보다 크면 sync_since 우선
+                if sync_since and sync_since > cutoff:
+                    cutoff = sync_since
+
                 query = (
                     f'SELECT {col_list_pg} FROM "{src_schema}"."{src_name}" '
-                    f'WHERE "{wm_col}" > %s ORDER BY "{wm_col}"'
+                    f'WHERE "{ts_col}" > %s ORDER BY "{ts_col}"'
                 )
                 params: tuple | None = (cutoff,)
                 self.logger.info(
@@ -454,9 +465,16 @@ class Pg2ChSyncJob(Job):
                 query = (
                     f'SELECT {col_list_pg} FROM "{src_schema}"."{src_name}"'
                 )
-                if wm_col:
-                    query += f' ORDER BY "{wm_col}"'
-                params = None
+                if sync_since:
+                    query += f' WHERE "{ts_col}" >= %s'
+                    params = (sync_since,)
+                    self.logger.info(
+                        "%s: full copy with sync_since %s", src_table, sync_since
+                    )
+                else:
+                    params = None
+                if ts_col:
+                    query += f' ORDER BY "{ts_col}"'
 
             # 5) 스트리밍 전송
             transformer = self._build_transformer(ch_columns)
@@ -476,8 +494,8 @@ class Pg2ChSyncJob(Job):
             total_rows = 0
             max_wm = None
             wm_idx = (
-                col_names.index(wm_col)
-                if wm_col and wm_col in col_names
+                col_names.index(ts_col)
+                if ts_col and ts_col in col_names
                 else None
             )
 
@@ -504,8 +522,8 @@ class Pg2ChSyncJob(Job):
             cursor.close()
 
             # 6) Watermark 저장
-            if wm_col and max_wm is not None:
-                self._save_watermark(ch, tgt_db, wm_key, wm_col, max_wm)
+            if ts_col and max_wm is not None:
+                self._save_watermark(ch, tgt_db, wm_key, ts_col, max_wm)
                 self.logger.info("%s: watermark → %s", src_table, max_wm)
 
             mode = "incremental" if watermark else "full copy"
