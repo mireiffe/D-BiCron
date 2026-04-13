@@ -48,6 +48,11 @@ def main():
         action="store_true",
         help="Print available jobs as JSON and exit",
     )
+    parser.add_argument(
+        "--list-connections",
+        action="store_true",
+        help="Print pipeline connections for the given job as JSON and exit",
+    )
 
     args, _remaining = parser.parse_known_args()
 
@@ -82,6 +87,10 @@ def main():
         val = getattr(args, key, None)
         if val is not None:
             job_kwargs[key] = val
+
+    if args.list_connections:
+        print(json.dumps(job_cls.get_connections(**job_kwargs)))
+        sys.exit(0)
 
     if args.targets:
         import json as _json

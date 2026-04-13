@@ -1,7 +1,7 @@
 const express = require("express");
 const cron = require("node-cron");
 const fs = require("fs");
-const { spawn, execFileSync } = require("child_process");
+const { spawn, execFile, execFileSync } = require("child_process");
 const path = require("path");
 
 const app = express();
@@ -158,6 +158,72 @@ for (const s of persisted.schedules) {
 }
 if (persisted.schedules.length) {
   console.log(`Restored ${persisted.schedules.length} schedule(s) from disk`);
+}
+
+// -------------------------------------------------------------------
+// Pipeline connection cache (auto-discovered from schedule configs)
+// -------------------------------------------------------------------
+const PYTHON_BIN = path.join(PROJECT_ROOT, ".venv", "bin", "python");
+const jobScopeLookup = {};
+for (const j of AVAILABLE_JOBS) jobScopeLookup[j.name] = j.scope || "none";
+
+// Map<scheduleId, [{from:{db,schema,table}, to:{db,schema,table}, label}]>
+const pipelineCache = new Map();
+
+function refreshPipelineConnectionsForSchedule(schedId, jobName, args) {
+  if (jobScopeLookup[jobName] !== "pipeline") return;
+  const cliArgs = ["-u", "-m", "dbcron.main", jobName, "--list-connections"];
+  for (const [k, v] of Object.entries(args || {})) {
+    if (k === "days") continue;
+    cliArgs.push(`--${k}`, String(v));
+  }
+  execFile(PYTHON_BIN, cliArgs, { cwd: PROJECT_ROOT, timeout: 10000 }, (err, stdout) => {
+    if (err) {
+      console.warn(`Pipeline discovery failed for schedule #${schedId} (${jobName}):`, err.message);
+      pipelineCache.set(schedId, []);
+      return;
+    }
+    try {
+      pipelineCache.set(schedId, JSON.parse(stdout));
+    } catch {
+      pipelineCache.set(schedId, []);
+    }
+  });
+}
+
+function refreshAllPipelineConnectionsSync() {
+  pipelineCache.clear();
+  for (const [id, s] of scheduledTasks) {
+    if (jobScopeLookup[s.jobName] !== "pipeline") continue;
+    const cliArgs = ["-u", "-m", "dbcron.main", s.jobName, "--list-connections"];
+    for (const [k, v] of Object.entries(s.args || {})) {
+      if (k === "days") continue;
+      cliArgs.push(`--${k}`, String(v));
+    }
+    try {
+      const stdout = execFileSync(PYTHON_BIN, cliArgs, { cwd: PROJECT_ROOT, timeout: 10000 }).toString();
+      const conns = JSON.parse(stdout);
+      pipelineCache.set(id, conns);
+      console.log(`Pipeline discovery: schedule #${id} (${s.jobName}) → ${conns.length} connection(s)`);
+    } catch (e) {
+      console.warn(`Pipeline discovery failed for schedule #${id} (${s.jobName}):`, e.message);
+      pipelineCache.set(id, []);
+    }
+  }
+}
+
+// Initial discovery (synchronous — ensures cache is ready before first request)
+refreshAllPipelineConnectionsSync();
+
+// Helper: get all cached connections as flat array with scheduleId
+function getAllCachedConnections() {
+  const all = [];
+  for (const [schedId, conns] of pipelineCache) {
+    for (const c of conns) {
+      all.push({ ...c, scheduleId: schedId });
+    }
+  }
+  return all;
 }
 
 // -------------------------------------------------------------------
@@ -382,6 +448,7 @@ app.post("/api/schedules", (req, res) => {
     createdAt: new Date().toISOString(),
   });
   saveSchedules();
+  refreshPipelineConnectionsForSchedule(id, jobName, args || {});
 
   res.status(201).json({ id, jobName, cron: cronExpr, targets: validTargets, dependsOn });
 });
@@ -436,6 +503,7 @@ app.put("/api/schedules/:id", (req, res) => {
     createdAt: entry.createdAt,
   });
   saveSchedules();
+  refreshPipelineConnectionsForSchedule(id, entry.jobName, newArgs);
   res.json({ id, jobName: entry.jobName, cron: newCron });
 });
 
@@ -447,6 +515,7 @@ app.delete("/api/schedules/:id", (req, res) => {
 
   entry.task.stop();
   scheduledTasks.delete(id);
+  pipelineCache.delete(id);
   saveSchedules();
   res.json({ deleted: id });
 });
@@ -778,25 +847,17 @@ app.get("/api/lineage/:db/:table", (req, res) => {
   let cfg = { entry_points: [], pipelines: [] };
   try { cfg = { ...cfg, ...JSON.parse(fs.readFileSync(cfgPath, "utf-8")) }; } catch {}
 
-  // Resolve auto connections
-  const syncCfgPath = path.join(PROJECT_ROOT, process.env.SYNC_CONFIG || "sync_config.json");
-  let syncCfg = null;
-  try { syncCfg = JSON.parse(fs.readFileSync(syncCfgPath, "utf-8")); } catch {}
+  // Collect all connections: static pipelines + auto-discovered cache
   const allConns = [];
   for (const p of cfg.pipelines || []) {
-    if (p.connections === "auto" && syncCfg?.tables) {
-      const srcDb = syncCfg.source || "unknown";
-      const tgtDb = syncCfg.target || "unknown";
-      const fromDb = typeof srcDb === "string" ? srcDb : srcDb.database || "source";
-      const toDb = typeof tgtDb === "string" ? tgtDb : tgtDb.database || "target";
-      for (const t of syncCfg.tables) {
-        allConns.push({ from: `${t.source_schema || "public"}.${t.table}`, fromDb, to: `${t.target_schema || "public"}.${t.table}`, toDb, label: p.description || "" });
-      }
-    } else if (Array.isArray(p.connections)) {
-      for (const c of p.connections) {
-        allConns.push({ from: `${c.from.schema}.${c.from.table}`, fromDb: c.from.db, to: `${c.to.schema}.${c.to.table}`, toDb: c.to.db, label: c.label || "" });
-      }
+    if (p.connections === "auto") continue; // skip stale placeholders
+    for (const c of Array.isArray(p.connections) ? p.connections : []) {
+      allConns.push({ from: `${c.from.schema}.${c.from.table}`, fromDb: c.from.db, to: `${c.to.schema}.${c.to.table}`, toDb: c.to.db, label: c.label || "" });
     }
+  }
+  // Merge auto-discovered connections from schedule cache
+  for (const c of getAllCachedConnections()) {
+    allConns.push({ from: `${c.from.schema}.${c.from.table}`, fromDb: c.from.db, to: `${c.to.schema}.${c.to.table}`, toDb: c.to.db, label: c.label || "" });
   }
 
   const targetDb = req.params.db;
@@ -846,7 +907,7 @@ app.get("/api/connection-test", (_req, res) => {
   }
 });
 
-// Serve pipeline config with auto-derived connections from sync_config
+// Serve pipeline config with auto-discovered connections from schedule cache
 app.get("/api/pipeline-config", (_req, res) => {
   let cfg = { databases: {}, entry_points: [], pipelines: [] };
   const cfgPath = path.join(
@@ -866,38 +927,22 @@ app.get("/api/pipeline-config", (_req, res) => {
     }
   }
 
-  // Resolve "auto" pipelines from sync_config.json
-  const syncCfgPath = path.join(
-    PROJECT_ROOT,
-    process.env.SYNC_CONFIG || "sync_config.json",
-  );
-  let syncCfg = null;
-  try {
-    syncCfg = JSON.parse(fs.readFileSync(syncCfgPath, "utf-8"));
-  } catch {}
+  // Remove stale "auto" placeholders from static config
+  if (cfg.pipelines) {
+    cfg.pipelines = cfg.pipelines.filter((p) => p.connections !== "auto");
+  }
 
-  if (syncCfg && cfg.pipelines) {
-    for (const p of cfg.pipelines) {
-      if (p.connections === "auto" && syncCfg.tables) {
-        const srcDb = syncCfg.source || "unknown";
-        const tgtDb = syncCfg.target || "unknown";
-        const fromDb = typeof srcDb === "string" ? srcDb : srcDb.database || "source";
-        const toDb = typeof tgtDb === "string" ? tgtDb : tgtDb.database || "target";
-        p.connections = syncCfg.tables.map((t) => ({
-          from: {
-            db: fromDb,
-            schema: t.source_schema || "public",
-            table: t.table,
-          },
-          to: {
-            db: toDb,
-            schema: t.target_schema || "public",
-            table: t.table,
-          },
-          label: `${t.table} (incremental_sync)`,
-        }));
-      }
-    }
+  // Merge auto-discovered pipeline connections from schedule cache
+  for (const [schedId, conns] of pipelineCache) {
+    if (!conns.length) continue;
+    const s = scheduledTasks.get(schedId);
+    if (!s) continue;
+    cfg.pipelines.push({
+      id: `auto_sched_${schedId}`,
+      source_job: s.jobName,
+      description: `${s.jobName} (schedule #${schedId})`,
+      connections: conns,
+    });
   }
 
   res.json(cfg);
@@ -914,13 +959,6 @@ app.get("/api/schedule-status", (_req, res) => {
     jobScopeMap[j.name] = j.scope || "none";
   }
 
-  // Load pipeline config for resolving "pipeline" scope targets
-  let pipelineCfg = { pipelines: [] };
-  try {
-    const cfgPath = path.join(PROJECT_ROOT, process.env.PIPELINE_CONFIG || "pipeline_config.json");
-    pipelineCfg = JSON.parse(fs.readFileSync(cfgPath, "utf-8"));
-  } catch {}
-
   // Load metadata snapshot for resolving "all_tables" scope
   let metadata = null;
   try {
@@ -930,15 +968,13 @@ app.get("/api/schedule-status", (_req, res) => {
   // Load databases for resolving "all_dbs" scope
   const databases = loadDatabases();
 
-  // Helper: get pipeline targets for a given jobName
-  function getPipelineTargets(jobName) {
+  // Helper: get pipeline targets from per-schedule cache
+  function getPipelineTargets(scheduleId) {
+    const conns = pipelineCache.get(scheduleId) || [];
     const targets = [];
-    for (const p of pipelineCfg.pipelines || []) {
-      if (p.source_job !== jobName) continue;
-      for (const c of p.connections || []) {
-        if (c.to) targets.push({ db: c.to.db, schema: c.to.schema, table: c.to.table });
-        if (c.from) targets.push({ db: c.from.db, schema: c.from.schema, table: c.from.table });
-      }
+    for (const c of conns) {
+      if (c.from) targets.push({ db: c.from.db, schema: c.from.schema, table: c.from.table });
+      if (c.to) targets.push({ db: c.to.db, schema: c.to.schema, table: c.to.table });
     }
     return targets;
   }
@@ -983,7 +1019,7 @@ app.get("/api/schedule-status", (_req, res) => {
     if (s.targets && s.targets.length) {
       targets = s.targets;
     } else if (scope === "pipeline") {
-      targets = getPipelineTargets(s.jobName);
+      targets = getPipelineTargets(id);
     } else if (scope === "all_tables") {
       targets = getAllTableTargets();
     } else if (scope === "all_dbs") {
@@ -1027,3 +1063,4 @@ setInterval(pruneHistory, 3600_000);
 app.listen(PORT, "0.0.0.0", () => {
   console.log(`db_manager WebUI running on http://0.0.0.0:${PORT}`);
 });
+

@@ -33,11 +33,11 @@ class IncrementalSyncJob(Job):
     name = "incremental_sync"
     label = "증분 동기화"
     description = "Source DB delta 행을 Target DB 로 증분 동기화 (upsert)"
-    default_args = {"days": 1}
+    default_args = {"days": 1, "config": "sync_config.json"}
     scope = "pipeline"
 
-    def run(self, *, days: int = 1, **kwargs) -> JobResult:
-        sync_cfg = self._load_sync_config()
+    def run(self, *, days: int = 1, config: str = "sync_config.json", **kwargs) -> JobResult:
+        sync_cfg = self._load_sync_config(config)
         tables = sync_cfg["tables"]
 
         src_engine = self._build_engine(sync_cfg, "source")
@@ -70,8 +70,8 @@ class IncrementalSyncJob(Job):
 
     # ── config ────────────────────────────────────────────────────────
 
-    def _load_sync_config(self) -> dict:
-        path = os.getenv("SYNC_CONFIG", "sync_config.json")
+    @staticmethod
+    def _load_sync_config(path: str) -> dict:
         with open(path) as f:
             return json.load(f)
 

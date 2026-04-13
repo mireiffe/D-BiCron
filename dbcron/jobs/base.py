@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import logging
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
@@ -97,3 +98,55 @@ class Job(ABC):
     @abstractmethod
     def run(self, **kwargs) -> JobResult:
         ...
+
+    # ── pipeline connection discovery ────────────────────────────
+
+    @classmethod
+    def get_connections(cls, **kwargs) -> list[dict]:
+        """Job config 에서 파이프라인 연결 정보를 추출한다.
+
+        표준 컨벤션 (source/target DB ID + tables 배열) 을 따르는 config 는
+        오버라이드 없이 자동 파싱된다.  특수 포맷은 서브클래스에서 오버라이드.
+
+        Returns:
+            [{from: {db, schema, table}, to: {db, schema, table}, label}, ...]
+        """
+        config_path = kwargs.get("config")
+        if not config_path:
+            return []
+        try:
+            with open(config_path) as f:
+                cfg = json.load(f)
+        except (FileNotFoundError, json.JSONDecodeError):
+            return []
+
+        source = cfg.get("source")
+        target = cfg.get("target")
+        if not source or not target:
+            return []
+
+        connections: list[dict] = []
+        for t in cfg.get("tables", []):
+            src_raw = t.get("source_table") or t.get("table")
+            tgt_raw = t.get("target_table") or t.get("table")
+            if not src_raw or not tgt_raw:
+                continue
+
+            if "." in src_raw:
+                src_schema, src_name = src_raw.split(".", 1)
+            else:
+                src_schema = t.get("source_schema", "public")
+                src_name = src_raw
+
+            if "." in tgt_raw:
+                tgt_schema, tgt_name = tgt_raw.split(".", 1)
+            else:
+                tgt_schema = t.get("target_schema", "public")
+                tgt_name = tgt_raw
+
+            connections.append({
+                "from": {"db": source, "schema": src_schema, "table": src_name},
+                "to": {"db": target, "schema": tgt_schema, "table": tgt_name},
+                "label": f"{src_name} ({cls.name})",
+            })
+        return connections
