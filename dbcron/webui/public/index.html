@@ -725,10 +725,7 @@
               <input id="sched-cron" type="text" placeholder="*/10 * * * *" value="*/10 * * * *" style="width:140px" oninput="updateCronPreview()" />
               <div id="cron-preview" style="font-size:9px;color:var(--text-dim);margin-top:4px;line-height:1.5"></div>
             </div>
-            <div class="field" id="sched-days-field">
-              <span class="field-label">Days</span>
-              <input id="sched-days" type="number" value="1" min="1" style="width:60px" />
-            </div>
+            <div id="sched-args-container" style="display:flex;gap:10px;flex-wrap:wrap"></div>
             <div class="field">
               <span class="field-label">Depends on</span>
               <select id="sched-depends" style="width:120px"><option value="">None (cron)</option></select>
@@ -911,11 +908,39 @@ let jobsCache = [];
 function openCronGuide() { document.getElementById("cron-guide-modal").style.display = ""; }
 function closeCronGuide() { document.getElementById("cron-guide-modal").style.display = "none"; }
 
-function updateSchedDaysField() {
+function updateSchedArgs(restoreArgs) {
   const sel = document.getElementById("sched-job");
-  const field = document.getElementById("sched-days-field");
+  const container = document.getElementById("sched-args-container");
+  clearEl(container);
   const j = jobsCache.find(j => j.name === sel.value);
-  field.style.display = (j && j.defaultArgs && "days" in j.defaultArgs) ? "" : "none";
+  if (!j || !j.defaultArgs) return;
+  for (const [key, def] of Object.entries(j.defaultArgs)) {
+    const isNum = typeof def === "number";
+    const val = restoreArgs && key in restoreArgs ? restoreArgs[key] : def;
+    const input = makeEl("input", {
+      type: isNum ? "number" : "text",
+      value: String(val),
+      id: "sched-arg-" + key,
+      style: isNum ? "width:60px" : "width:160px",
+    });
+    if (isNum) input.min = "1";
+    container.appendChild(makeEl("div", { className: "field" }, [
+      makeEl("span", { className: "field-label" }, key),
+      input,
+    ]));
+  }
+}
+function collectSchedArgs() {
+  const sel = document.getElementById("sched-job");
+  const j = jobsCache.find(j => j.name === sel.value);
+  if (!j || !j.defaultArgs) return {};
+  const args = {};
+  for (const [key, def] of Object.entries(j.defaultArgs)) {
+    const input = document.getElementById("sched-arg-" + key);
+    if (!input) continue;
+    args[key] = typeof def === "number" ? (Number(input.value) || def) : input.value;
+  }
+  return args;
 }
 
 function switchView(view) {
@@ -1106,14 +1131,26 @@ async function loadJobs() {
   if (!jobs.length) { el.appendChild(makeEl("div", { className: "empty" }, "No jobs registered")); return; }
   jobs.forEach(j => {
     sel.appendChild(makeEl("option", { value: j.name }, j.label));
-    const hasDays = j.defaultArgs && "days" in j.defaultArgs;
-    const daysInput = hasDays ? makeEl("input", { type: "number", value: String(j.defaultArgs.days ?? 1), min: "1" }) : null;
+    const argInputs = {};
+    const actions = [];
+    if (j.defaultArgs) {
+      for (const [key, def] of Object.entries(j.defaultArgs)) {
+        const isNum = typeof def === "number";
+        const input = makeEl("input", { type: isNum ? "number" : "text", value: String(def), style: isNum ? "" : "width:120px" });
+        if (isNum) input.min = "1";
+        argInputs[key] = { input, isNum, def };
+        actions.push(makeEl("div", { className: "field-inline" }, [makeEl("label", null, key), input]));
+      }
+    }
     const runBtn = makeEl("button", {
       className: "btn btn-lime btn-sm",
       onClick: async () => {
         runBtn.disabled = true;
         try {
-          const body = hasDays ? { days: Number(daysInput.value) || 1 } : {};
+          const body = {};
+          for (const [k, { input, isNum, def }] of Object.entries(argInputs)) {
+            body[k] = isNum ? (Number(input.value) || def) : input.value;
+          }
           await api(`/api/jobs/${encodeURIComponent(j.name)}/run`, { method: "POST", body: JSON.stringify(body) });
           toast(`${j.label} started`, true);
           switchTab('history');
@@ -1122,8 +1159,6 @@ async function loadJobs() {
         runBtn.disabled = false;
       },
     }, "RUN");
-    const actions = [];
-    if (hasDays) actions.push(makeEl("div", { className: "field-inline" }, [makeEl("label", null, "days"), daysInput]));
     actions.push(runBtn);
     // Stats line
     const st = jobStats[j.name];
@@ -1141,8 +1176,8 @@ async function loadJobs() {
     children.push(makeEl("div", { className: "job-actions" }, actions));
     el.appendChild(makeEl("div", { className: "job-card" }, children));
   });
-  sel.addEventListener("change", updateSchedDaysField);
-  updateSchedDaysField();
+  sel.addEventListener("change", () => updateSchedArgs());
+  updateSchedArgs();
   // Populate depends-on selector
   const depSel = document.getElementById("sched-depends");
   clearEl(depSel);
@@ -1186,16 +1221,12 @@ async function loadSchedules() {
 function editSchedule(s) {
   document.getElementById("sched-job").value = s.jobName;
   document.getElementById("sched-cron").value = s.cron;
-  updateSchedDaysField();
-  if (s.args && "days" in s.args) document.getElementById("sched-days").value = s.args.days;
-  // Switch to editing mode
+  updateSchedArgs(s.args);
   const btn = document.querySelector(".sched-form .btn-cyan");
   btn.textContent = "UPDATE #" + s.id;
   btn.onclick = async () => {
     const cronExpr = document.getElementById("sched-cron").value;
-    const j = jobsCache.find(j => j.name === s.jobName);
-    const args = {};
-    if (j && j.defaultArgs && "days" in j.defaultArgs) args.days = Number(document.getElementById("sched-days").value) || 1;
+    const args = collectSchedArgs();
     try {
       await api("/api/schedules/" + encodeURIComponent(s.id), { method: "PUT", body: JSON.stringify({ cronExpr, args }) });
       toast("Schedule updated", true);
@@ -1210,11 +1241,7 @@ function editSchedule(s) {
 async function createSchedule() {
   const jobName = document.getElementById("sched-job").value;
   const cronExpr = document.getElementById("sched-cron").value;
-  const j = jobsCache.find(j => j.name === jobName);
-  const args = {};
-  if (j && j.defaultArgs && "days" in j.defaultArgs) {
-    args.days = Number(document.getElementById("sched-days").value) || 1;
-  }
+  const args = collectSchedArgs();
   try {
     const dependsOn = document.getElementById("sched-depends").value || undefined;
     await api("/api/schedules", { method: "POST", body: JSON.stringify({ jobName, cronExpr: dependsOn ? "" : cronExpr, args, dependsOn }) });
