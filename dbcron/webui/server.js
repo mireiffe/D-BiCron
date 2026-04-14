@@ -637,6 +637,18 @@ app.post("/api/databases", (req, res) => {
   res.status(201).json({ id });
 });
 
+app.put("/api/databases/reorder", (req, res) => {
+  const { order } = req.body;
+  if (!Array.isArray(order)) return res.status(400).json({ error: "order must be an array of DB IDs" });
+  const dbs = loadDatabases();
+  for (let i = 0; i < order.length; i++) {
+    const db = dbs.find((d) => d.id === order[i]);
+    if (db) db.canvas_order = i;
+  }
+  saveDatabases(dbs);
+  res.json({ ok: true });
+});
+
 app.put("/api/databases/:id", (req, res) => {
   const dbs = loadDatabases();
   const idx = dbs.findIndex((d) => d.id === req.params.id);

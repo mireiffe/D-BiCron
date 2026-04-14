@@ -258,6 +258,58 @@ console.log("\narrowPath:");
 }
 
 // ══════════════════════════════════════════════════════════════
+// resolveDbOrder tests (canvas_order vs topo sort)
+// ══════════════════════════════════════════════════════════════
+
+// Replicate the logic from computeLayout
+function resolveDbOrder(rawDbKeys, databases, pipeConns, epConns) {
+  const orderMap = new Map();
+  for (const d of databases) { if (d.canvas_order != null) orderMap.set(d.id, d.canvas_order); }
+  if (orderMap.size > 0) {
+    return [...rawDbKeys].sort((a, b) => (orderMap.get(a) ?? Infinity) - (orderMap.get(b) ?? Infinity));
+  }
+  return topoSortDBs(rawDbKeys, pipeConns, epConns);
+}
+
+console.log("\nresolveDbOrder:");
+
+// Test: canvas_order overrides topo sort
+{
+  const dbs = [{ id: "ch", canvas_order: 0 }, { id: "pg", canvas_order: 1 }, { id: "mysql", canvas_order: 2 }];
+  const pipes = [{ from: { db: "pg" }, to: { db: "ch" } }]; // topo would put pg first
+  const result = resolveDbOrder(["pg", "ch", "mysql"], dbs, pipes, []);
+  assertDeepEqual(result, ["ch", "pg", "mysql"], "canvas_order overrides topo");
+  console.log(`  canvas_order overrides: [${result}]`);
+}
+
+// Test: no canvas_order falls back to topo sort
+{
+  const dbs = [{ id: "a" }, { id: "b" }];
+  const pipes = [{ from: { db: "a" }, to: { db: "b" } }];
+  const result = resolveDbOrder(["b", "a"], dbs, pipes, []);
+  assertDeepEqual(result, ["a", "b"], "no canvas_order: topo sort used");
+  console.log(`  no canvas_order fallback: [${result}]`);
+}
+
+// Test: partial canvas_order — ordered DBs first, rest at end
+{
+  const dbs = [{ id: "x", canvas_order: 0 }, { id: "y" }, { id: "z", canvas_order: 1 }];
+  const result = resolveDbOrder(["y", "z", "x"], dbs, [], []);
+  assert(result[0] === "x", "partial: x (order 0) first");
+  assert(result[1] === "z", "partial: z (order 1) second");
+  assert(result[2] === "y", "partial: y (no order) last");
+  console.log(`  partial order: [${result}]`);
+}
+
+// Test: canvas_order with value 0 is respected (not treated as falsy)
+{
+  const dbs = [{ id: "a", canvas_order: 2 }, { id: "b", canvas_order: 0 }, { id: "c", canvas_order: 1 }];
+  const result = resolveDbOrder(["a", "b", "c"], dbs, [], []);
+  assertDeepEqual(result, ["b", "c", "a"], "order 0 is valid");
+  console.log(`  zero order: [${result}]`);
+}
+
+// ══════════════════════════════════════════════════════════════
 // Summary
 // ══════════════════════════════════════════════════════════════
 

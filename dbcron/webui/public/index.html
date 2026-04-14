@@ -599,9 +599,16 @@
     .db-list-item {
       display: flex; align-items: center; gap: 10px; padding: 8px 12px;
       border: 1px solid rgba(255,255,255,.06); border-radius: var(--radius);
-      margin-bottom: 6px; background: var(--bg); transition: border-color .15s;
+      margin-bottom: 6px; background: var(--bg); transition: border-color .15s, opacity .15s, transform .15s;
     }
     .db-list-item:hover { border-color: rgba(255,255,255,.15); }
+    .db-list-item.dragging { opacity: 0.35; }
+    .db-list-item.drag-over { border-color: var(--cyan); box-shadow: 0 0 6px rgba(0,229,255,.25); }
+    .db-list-grip {
+      cursor: grab; color: var(--text-dim); font-size: 14px; flex-shrink: 0;
+      user-select: none; line-height: 1; padding: 0 2px; letter-spacing: 1px;
+    }
+    .db-list-grip:active { cursor: grabbing; }
     .db-list-color { width: 10px; height: 10px; border-radius: 50%; flex-shrink: 0; }
     .db-list-info { flex: 1; min-width: 0; }
     .db-list-label { font-family: var(--font-display); font-size: 12px; font-weight: 700; color: var(--text-bright); }
@@ -1419,7 +1426,14 @@ async function loadDbList() {
   const el = document.getElementById("db-list");
   clearEl(el);
   if (!dbs.length) { el.appendChild(makeEl("div", { className: "empty" }, "No databases registered")); return; }
-  dbs.forEach(d => {
+
+  // Sort by canvas_order when present
+  const sorted = [...dbs].sort((a, b) => (a.canvas_order ?? Infinity) - (b.canvas_order ?? Infinity));
+
+  let dragSrcId = null;
+
+  sorted.forEach(d => {
+    const grip = makeEl("span", { className: "db-list-grip" }, "\u2261");
     const colorDot = makeEl("div", { className: "db-list-color" });
     colorDot.style.background = d.color;
     const typeBadge = makeEl("span", { style: "font-size:9px;color:var(--text-dim);background:var(--surface-hi);padding:1px 5px;border-radius:2px;margin-left:6px" }, (d.type || "postgresql").toUpperCase());
@@ -1435,7 +1449,47 @@ async function loadDbList() {
     ]);
     const editBtn = makeEl("button", { className: "btn btn-cyan btn-sm", onClick: () => editDatabase(d) }, "EDIT");
     const delBtn = makeEl("button", { className: "btn btn-red btn-sm", onClick: () => deleteDatabase(d.id) }, "DEL");
-    el.appendChild(makeEl("div", { className: "db-list-item" }, [colorDot, info, makeEl("div", { className: "db-list-actions" }, [editBtn, delBtn])]));
+    const item = makeEl("div", { className: "db-list-item", draggable: "true" }, [grip, colorDot, info, makeEl("div", { className: "db-list-actions" }, [editBtn, delBtn])]);
+    item.dataset.dbId = d.id;
+
+    item.addEventListener("dragstart", (e) => {
+      dragSrcId = d.id;
+      item.classList.add("dragging");
+      e.dataTransfer.effectAllowed = "move";
+    });
+    item.addEventListener("dragend", () => {
+      item.classList.remove("dragging");
+      el.querySelectorAll(".drag-over").forEach(n => n.classList.remove("drag-over"));
+      // Persist new order from DOM
+      const order = [...el.querySelectorAll(".db-list-item")].map(n => n.dataset.dbId);
+      fetch("/api/databases/reorder", {
+        method: "PUT", headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ order }),
+      }).then(() => {
+        if (typeof loadCanvasData === "function") loadCanvasData();
+      });
+      dragSrcId = null;
+    });
+    item.addEventListener("dragover", (e) => {
+      e.preventDefault();
+      e.dataTransfer.dropEffect = "move";
+      if (d.id === dragSrcId) return;
+      item.classList.add("drag-over");
+      // Reorder DOM: insert dragged item before or after this one
+      const dragged = el.querySelector(".dragging");
+      if (!dragged || dragged === item) return;
+      const rect = item.getBoundingClientRect();
+      const mid = rect.top + rect.height / 2;
+      if (e.clientY < mid) { el.insertBefore(dragged, item); }
+      else { el.insertBefore(dragged, item.nextSibling); }
+    });
+    item.addEventListener("dragleave", () => item.classList.remove("drag-over"));
+    item.addEventListener("drop", (e) => {
+      e.preventDefault();
+      item.classList.remove("drag-over");
+    });
+
+    el.appendChild(item);
   });
 }
 

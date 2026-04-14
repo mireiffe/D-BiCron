@@ -159,7 +159,14 @@ function computeLayout() {
   const cfg = CS.pipelineConfig || { databases: {}, entry_points: [], pipelines: [] };
   const pipeConns = collectPipelineConnections(cfg);
   const epConns = collectEntryPointConnections(cfg);
-  const dbKeys = topoSortDBs(Object.keys(CS.metadata.databases), pipeConns, epConns);
+  const rawDbKeys = Object.keys(CS.metadata.databases);
+
+  // Use explicit canvas_order when available, otherwise fall back to topo sort
+  const orderMap = new Map();
+  for (const d of CS.databases) { if (d.canvas_order != null) orderMap.set(d.id, d.canvas_order); }
+  const dbKeys = orderMap.size > 0
+    ? [...rawDbKeys].sort((a, b) => (orderMap.get(a) ?? Infinity) - (orderMap.get(b) ?? Infinity))
+    : topoSortDBs(rawDbKeys, pipeConns, epConns);
 
   // Connected pairs for y-ordering
   const connectedPairs = pipeConns.map(c => ({
