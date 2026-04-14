@@ -24,7 +24,8 @@
         "amount": "Decimal(18,4)"
       },
       "batch_size": 50000,
-      "overlap_minutes": 30
+      "overlap_minutes": 30,
+      "use_nullable": false
     },
     {
       "source_table": "public.event_logs",

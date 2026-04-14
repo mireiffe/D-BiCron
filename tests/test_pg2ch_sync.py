@@ -115,6 +115,33 @@ class TestBuildChColumns:
         assert name_col["ch_type"] == "String"
         assert "Nullable" not in name_col["ch_type"]
 
+    def test_use_nullable_false_removes_all_nullable(self):
+        """use_nullable=False 이면 모든 컬럼이 non-nullable."""
+        result = Pg2ChSyncJob._build_ch_columns(
+            self.PG_COLS, set(), {}, [], use_nullable=False
+        )
+        for col in result:
+            assert not col["ch_type"].startswith("Nullable("), (
+                f"{col['name']} should not be Nullable"
+            )
+
+    def test_use_nullable_true_preserves_nullable(self):
+        """use_nullable=True (기본값) 이면 PG nullable 컬럼은 Nullable 유지."""
+        result = Pg2ChSyncJob._build_ch_columns(
+            self.PG_COLS, set(), {}, [], use_nullable=True
+        )
+        name_col = [c for c in result if c["name"] == "name"][0]
+        assert name_col["ch_type"] == "Nullable(String)"
+
+    def test_use_nullable_false_respects_override(self):
+        """use_nullable=False 여도 column_overrides 는 그대로 적용."""
+        overrides = {"name": "Nullable(String)"}
+        result = Pg2ChSyncJob._build_ch_columns(
+            self.PG_COLS, set(), overrides, [], use_nullable=False
+        )
+        name_col = [c for c in result if c["name"] == "name"][0]
+        assert name_col["ch_type"] == "Nullable(String)"
+
 
 # ── 5. _build_transformer ───────────────────────────────────────
 
