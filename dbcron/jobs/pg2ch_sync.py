@@ -383,6 +383,28 @@ class Pg2ChSyncJob(Job):
 
                 transforms[i] = _bconv
 
+            elif pg_t in (
+                "character varying",
+                "character",
+                "text",
+            ) and base.startswith(("Int", "UInt", "Float", "Decimal")):
+                # PG string → CH numeric (column_overrides 로 타입 변경 시)
+                if base.startswith("Float"):
+                    _conv = float
+                elif base.startswith("Decimal"):
+                    from decimal import Decimal as _Dec
+
+                    _conv = _Dec
+                else:
+                    _conv = int
+
+                def _nconv(v, _c=_conv):
+                    if v is not None and isinstance(v, str):
+                        return _c(v)
+                    return v
+
+                transforms[i] = _nconv
+
             elif base == "String" and pg_t not in (
                 "character varying",
                 "character",

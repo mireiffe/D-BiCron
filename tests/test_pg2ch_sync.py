@@ -200,6 +200,38 @@ class TestBuildTransformer:
         fn = Pg2ChSyncJob._build_transformer(columns)
         assert fn is None
 
+    def test_string_to_float_override(self):
+        """PG string column overridden to Float64 should cast str → float."""
+        columns = [{"name": "x", "pg_type": "character varying", "ch_type": "Float64"}]
+        fn = Pg2ChSyncJob._build_transformer(columns)
+        assert fn is not None
+        assert fn(("-22503.95903",)) == (-22503.95903,)
+        assert fn((None,)) == (0,)
+
+    def test_string_to_int_override(self):
+        """PG text column overridden to Int64 should cast str → int."""
+        columns = [{"name": "n", "pg_type": "text", "ch_type": "Int64"}]
+        fn = Pg2ChSyncJob._build_transformer(columns)
+        assert fn is not None
+        assert fn(("42",)) == (42,)
+
+    def test_string_to_decimal_override(self):
+        """PG varchar overridden to Decimal should cast str → Decimal."""
+        from decimal import Decimal
+
+        columns = [{"name": "amt", "pg_type": "character varying", "ch_type": "Decimal(18,4)"}]
+        fn = Pg2ChSyncJob._build_transformer(columns)
+        assert fn is not None
+        assert fn(("123.45",)) == (Decimal("123.45"),)
+
+    def test_string_to_nullable_float_override(self):
+        """PG string → Nullable(Float64) should cast str → float, pass None."""
+        columns = [{"name": "x", "pg_type": "text", "ch_type": "Nullable(Float64)"}]
+        fn = Pg2ChSyncJob._build_transformer(columns)
+        assert fn is not None
+        assert fn(("3.14",)) == (3.14,)
+        assert fn((None,)) == (None,)
+
 
 # ── 6. run() validation ─────────────────────────────────────────
 
