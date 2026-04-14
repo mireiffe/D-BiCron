@@ -333,68 +333,7 @@ class TestRunValidation:
         assert "Target must be clickhouse" in result.message
 
 
-# ── 7. _get_ch_column_types & schema drift ──────────────────────
-
-
-class TestGetChColumnTypes:
-    def _make_job(self):
-        return Pg2ChSyncJob(config=None)
-
-    def test_returns_column_type_map(self):
-        job = self._make_job()
-        ch = MagicMock()
-        ch.execute.return_value = [("id", "Int32"), ("name", "String")]
-        result = job._get_ch_column_types(ch, "mydb", "mytable")
-        assert result == {"id": "Int32", "name": "String"}
-
-    def test_empty_when_table_missing(self):
-        job = self._make_job()
-        ch = MagicMock()
-        ch.execute.return_value = []
-        result = job._get_ch_column_types(ch, "mydb", "missing")
-        assert result == {}
-
-
-class TestSchemaDrift:
-    """Transformer should use actual CH table types, not assumed types."""
-
-    def _make_job(self):
-        return Pg2ChSyncJob(config=None)
-
-    def test_int_to_string_drift(self):
-        """PG integer → assumed Int32, but actual CH table has String.
-
-        Transformer should coerce int → str after drift correction.
-        """
-        # Without drift correction: int value passes through as-is
-        columns = [{"name": "siteid", "pg_type": "integer", "ch_type": "Int32"}]
-        fn_before = Pg2ChSyncJob._build_transformer(columns)
-        assert fn_before is not None
-        assert fn_before((1,)) == (1,)  # int stays int
-
-        # After drift correction (as _sync_table does): int → str
-        columns[0]["ch_type"] = "String"  # actual CH type
-        fn_after = Pg2ChSyncJob._build_transformer(columns)
-        assert fn_after is not None
-        assert fn_after((1,)) == ("1",)
-        assert fn_after((None,)) == ("",)  # non-nullable String default
-
-    def test_string_to_float_drift(self):
-        """PG varchar → assumed String, but actual CH table has Float64."""
-        # Without drift correction: str value passes through as-is
-        columns = [{"name": "val", "pg_type": "character varying", "ch_type": "String"}]
-        fn_before = Pg2ChSyncJob._build_transformer(columns)
-        assert fn_before is not None
-        assert fn_before(("3.14",)) == ("3.14",)  # str stays str
-
-        # After drift correction: str → float
-        columns[0]["ch_type"] = "Float64"
-        fn_after = Pg2ChSyncJob._build_transformer(columns)
-        assert fn_after is not None
-        assert fn_after(("3.14",)) == (3.14,)
-
-
-# ── 8. watermark ─────────────────────────────────────────────────
+# ── 7. watermark ─────────────────────────────────────────────────
 
 
 class TestWatermark:
@@ -455,7 +394,7 @@ class TestWatermark:
         assert inserted[0][2] == "2026-01-01T12:00:00"
 
 
-# ── 9. _resolve_sync_since ───────────────────────────────────────
+# ── 8. _resolve_sync_since ───────────────────────────────────────
 
 
 class TestResolveSyncSince:
@@ -484,7 +423,7 @@ class TestResolveSyncSince:
         assert abs(datetime.fromisoformat(result) - expected) < timedelta(seconds=2)
 
 
-# ── 10. sync_since ───────────────────────────────────────────────
+# ── 9. sync_since ────────────────────────────────────────────────
 
 
 class TestSyncSince:
@@ -566,7 +505,6 @@ class TestSyncSince:
         # _get_watermark returns old watermark
         ch.execute.side_effect = [
             None,  # _ensure_ch_table
-            [],    # _get_ch_column_types
             None,  # _ensure_watermark_table
             [("2024-06-01T00:00:00",)],  # _get_watermark
         ]
@@ -616,7 +554,6 @@ class TestSyncSince:
         ch = MagicMock()
         ch.execute.side_effect = [
             None,  # _ensure_ch_table
-            [],    # _get_ch_column_types
             None,  # _ensure_watermark_table
             [("2025-06-01T00:00:00",)],  # _get_watermark (newer than sync_since)
         ]
@@ -659,7 +596,7 @@ class TestSyncSince:
             assert params == ("2025-06-01T00:00:00",)
 
 
-# ── 11. default_args and scope, load_config ──────────────────────
+# ── 10. default_args and scope, load_config ──────────────────────
 
 
 class TestJobMeta:

@@ -339,18 +339,6 @@ class Pg2ChSyncJob(Job):
         self.logger.debug("DDL: %s", ddl)
         ch.execute(ddl)
 
-    # ── CH schema introspection ─────────────────────────────────
-
-    @staticmethod
-    def _get_ch_column_types(ch, db_name: str, table_name: str) -> dict[str, str]:
-        """기존 CH 테이블의 실제 컬럼 타입 조회."""
-        rows = ch.execute(
-            "SELECT name, type FROM system.columns "
-            "WHERE database = %(db)s AND table = %(tbl)s",
-            {"db": db_name, "tbl": table_name},
-        )
-        return {r[0]: r[1] for r in rows}
-
     # ── row transform ────────────────────────────────────────────
 
     @staticmethod
@@ -504,20 +492,6 @@ class Pg2ChSyncJob(Job):
             self._ensure_ch_table(
                 ch, tgt_db, tgt_name, ch_columns, order_by, partition_by, engine
             )
-
-            # 3-1) 기존 테이블의 실제 스키마로 ch_columns 보정
-            actual_types = self._get_ch_column_types(ch, tgt_db, tgt_name)
-            for col in ch_columns:
-                actual = actual_types.get(col["name"])
-                if actual and actual != col["ch_type"]:
-                    self.logger.warning(
-                        "%s: column '%s' type drift — expected %s, actual %s",
-                        src_table,
-                        col["name"],
-                        col["ch_type"],
-                        actual,
-                    )
-                    col["ch_type"] = actual
 
             # 4) 동기화 모드 결정
             self._ensure_watermark_table(ch, tgt_db)
