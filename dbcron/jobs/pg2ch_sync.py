@@ -94,6 +94,16 @@ def _unwrap_ch_type(ch_type: str) -> str:
 _RELATIVE_RE = re.compile(r"^(\d+)\s*([dhm])$", re.IGNORECASE)
 
 
+def _parse_relative_to_timedelta(raw: str) -> timedelta | None:
+    """상대 시간 표현('30d'/'12h'/'90m')을 timedelta 로 변환. 절대값이면 None."""
+    m = _RELATIVE_RE.match(raw.strip())
+    if not m:
+        return None
+    amount = int(m.group(1))
+    unit = m.group(2).lower()
+    return {"d": timedelta(days=amount), "h": timedelta(hours=amount), "m": timedelta(minutes=amount)}[unit]
+
+
 def _resolve_sync_since(raw: str) -> str:
     """sync_since 값을 ISO timestamp 문자열로 변환.
 
@@ -101,13 +111,55 @@ def _resolve_sync_since(raw: str) -> str:
       - 상대: "30d" (일), "12h" (시간), "90m" (분)
       - 절대: ISO 8601 timestamp (그대로 반환)
     """
-    m = _RELATIVE_RE.match(raw.strip())
-    if m:
-        amount = int(m.group(1))
-        unit = m.group(2).lower()
-        delta = {"d": timedelta(days=amount), "h": timedelta(hours=amount), "m": timedelta(minutes=amount)}[unit]
+    delta = _parse_relative_to_timedelta(raw)
+    if delta:
         return (datetime.now() - delta).isoformat()
     return raw
+
+
+def _validate_source_retention(
+    src_table: str,
+    source_retention: str,
+    sync_since: str | None,
+    ts_col: str | None,
+) -> None:
+    """source_retention 설정 유효성 검증.
+
+    - timestamp_column 필수
+    - sync_since 가 있으면 source_retention > sync_since (동일 형식끼리만 비교)
+    """
+    if not ts_col:
+        raise ValueError(
+            f"{src_table}: source_retention requires timestamp_column to be set"
+        )
+    if not sync_since:
+        return
+
+    ret_delta = _parse_relative_to_timedelta(source_retention)
+    since_delta = _parse_relative_to_timedelta(sync_since)
+
+    if ret_delta is not None and since_delta is not None:
+        if ret_delta <= since_delta:
+            raise ValueError(
+                f"{src_table}: source_retention ({source_retention}) must be "
+                f"strictly greater than sync_since ({sync_since})"
+            )
+        return
+
+    if ret_delta is None and since_delta is None:
+        ret_ts = _resolve_sync_since(source_retention)
+        since_ts = _resolve_sync_since(sync_since)
+        if ret_ts >= since_ts:
+            raise ValueError(
+                f"{src_table}: source_retention cutoff ({ret_ts}) must be "
+                f"older than sync_since cutoff ({since_ts})"
+            )
+        return
+
+    raise ValueError(
+        f"{src_table}: source_retention and sync_since must both be "
+        f"relative (e.g. '180d') or both absolute ISO timestamps"
+    )
 
 
 def _fmt_bytes(n: int) -> str:
@@ -157,27 +209,32 @@ class Pg2ChSyncJob(Job):
             return JobResult(False, f"Target must be clickhouse, got '{tgt_db.get('type')}'")
 
         total_rows = 0
+        total_purged = 0
         errors: list[str] = []
 
         for tc in tables:
             merged = {**defaults, **tc}
             try:
-                n = self._sync_table(src_db, tgt_db, merged, cfg)
-                total_rows += n
+                synced, purged = self._sync_table(src_db, tgt_db, merged, cfg)
+                total_rows += synced
+                total_purged += purged
             except Exception as e:
                 self.logger.exception("Failed: %s", tc.get("source_table", "?"))
                 errors.append(f"{tc.get('source_table', '?')}: {e}")
 
+        msg = f"Synced {total_rows} rows across {len(tables)} table(s)"
+        if total_purged:
+            msg += f", purged {total_purged} source rows"
+
         if errors:
             return JobResult(
                 success=False,
-                message=f"Synced {total_rows} rows, {len(errors)} error(s): "
-                + "; ".join(errors),
+                message=msg + f", {len(errors)} error(s): " + "; ".join(errors),
                 rows_affected=total_rows,
             )
         return JobResult(
             success=True,
-            message=f"Synced {total_rows} rows across {len(tables)} table(s)",
+            message=msg,
             rows_affected=total_rows,
         )
 
@@ -250,6 +307,70 @@ class Pg2ChSyncJob(Job):
             " (config_key, timestamp_column, value, updated_at) VALUES",
             [(key, ts_col, val_str, datetime.now())],
         )
+
+    # ── source retention purge ──────────────────────────────────
+
+    def _purge_source(
+        self,
+        pg_conn,
+        src_schema: str,
+        src_name: str,
+        ts_col: str,
+        retention_cutoff: str,
+        batch_size: int = 10_000,
+        lock_timeout_ms: int = 5_000,
+    ) -> int:
+        """PG source 에서 retention_cutoff 이전 row 를 배치 삭제.
+
+        SET LOCAL lock_timeout 으로 DDL lock 대기를 회피하며,
+        LockNotAvailable 발생 시 graceful stop 후 부분 삭제 수를 반환한다.
+        """
+        src_fqn = f'"{src_schema}"."{src_name}"'
+        total_deleted = 0
+
+        while True:
+            try:
+                with pg_conn.cursor() as cur:
+                    cur.execute(
+                        f"SET LOCAL lock_timeout = '{lock_timeout_ms}ms'"
+                    )
+                    cur.execute(
+                        f"DELETE FROM {src_fqn} "
+                        f"WHERE ctid = ANY(ARRAY("
+                        f'  SELECT ctid FROM {src_fqn}'
+                        f'  WHERE "{ts_col}" < %s'
+                        f"  LIMIT %s"
+                        f"))",
+                        (retention_cutoff, batch_size),
+                    )
+                    deleted = cur.rowcount
+                pg_conn.commit()
+            except Exception as e:
+                pg_conn.rollback()
+                err_name = type(e).__name__
+                if "LockNotAvailable" in err_name or "lock timeout" in str(e).lower():
+                    self.logger.warning(
+                        "%s.%s: lock_timeout hit during purge, "
+                        "stopping. Deleted %d so far.",
+                        src_schema,
+                        src_name,
+                        total_deleted,
+                    )
+                    break
+                raise
+
+            total_deleted += deleted
+            self.logger.info(
+                "%s.%s: purged batch %d rows (total %d)",
+                src_schema,
+                src_name,
+                deleted,
+                total_deleted,
+            )
+            if deleted < batch_size:
+                break
+
+        return total_deleted
 
     # ── PG schema introspection ──────────────────────────────────
 
@@ -442,7 +563,7 @@ class Pg2ChSyncJob(Job):
         tgt_cfg: dict,
         tc: dict,
         sync_cfg: dict,
-    ) -> int:
+    ) -> tuple[int, int]:
         src_table: str = tc["source_table"]
         tgt_table: str = tc["target_table"]
         ts_col: str | None = tc.get("timestamp_column")
@@ -456,11 +577,18 @@ class Pg2ChSyncJob(Job):
         batch_size: int = tc.get("batch_size", 100_000)
         overlap_min: int = tc.get("overlap_minutes", 0)
         use_nullable: bool = tc.get("use_nullable", True)
+        raw_retention: str | None = tc.get("source_retention")
 
         if sync_since and not ts_col:
             raise ValueError(
                 f"{src_table}: sync_since requires timestamp_column to be set"
             )
+
+        if raw_retention:
+            _validate_source_retention(src_table, raw_retention, raw_since, ts_col)
+            retention_cutoff = _resolve_sync_since(raw_retention)
+        else:
+            retention_cutoff = None
 
         # schema.table 파싱
         src_schema, src_name = (
@@ -587,15 +715,36 @@ class Pg2ChSyncJob(Job):
                 )
 
             cursor.close()
+            pg_conn.rollback()  # read 트랜잭션 정리
 
             # 6) Watermark 저장
             if ts_col and max_wm is not None:
                 self._save_watermark(ch, tgt_db, wm_key, ts_col, max_wm)
                 self.logger.info("%s: watermark → %s", src_table, max_wm)
 
+            # 7) Source retention purge
+            purged_rows = 0
+            if retention_cutoff:
+                self.logger.info(
+                    "%s: purging source rows older than %s",
+                    src_table,
+                    retention_cutoff,
+                )
+                purged_rows = self._purge_source(
+                    pg_conn,
+                    src_schema,
+                    src_name,
+                    ts_col,
+                    retention_cutoff,
+                    batch_size=min(batch_size, 10_000),
+                )
+                self.logger.info(
+                    "%s: purged %d source rows", src_table, purged_rows
+                )
+
             mode = "incremental" if watermark else "full copy"
             self.logger.info("%s: %s complete — %d rows", src_table, mode, total_rows)
-            return total_rows
+            return total_rows, purged_rows
 
         finally:
             if ch:

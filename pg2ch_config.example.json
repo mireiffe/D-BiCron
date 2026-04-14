@@ -14,6 +14,7 @@
       "target_table": "default.orders",
       "timestamp_column": "updated_at",
       "sync_since": "30d",
+      "source_retention": "180d",
       "engine": "ReplacingMergeTree(updated_at)",
       "order_by": ["id"],
       "partition_by": "toYYYYMM(created_at)",

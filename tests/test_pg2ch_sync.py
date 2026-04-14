@@ -11,9 +11,11 @@ import pytest
 from dbcron.jobs.pg2ch_sync import (
     Pg2ChSyncJob,
     _fmt_bytes,
+    _parse_relative_to_timedelta,
     _pg_type_to_ch,
     _resolve_sync_since,
     _unwrap_ch_type,
+    _validate_source_retention,
 )
 
 # ── 1. _pg_type_to_ch ───────────────────────────────────────────
@@ -616,3 +618,324 @@ class TestJobMeta:
     def test_load_config_missing_file(self):
         with pytest.raises(FileNotFoundError):
             Pg2ChSyncJob._load_config("/tmp/nonexistent_pg2ch_config_12345.json")
+
+
+# ── 11. _parse_relative_to_timedelta ────────────────────────────
+
+
+class TestParseRelativeToTimedelta:
+    def test_days(self):
+        assert _parse_relative_to_timedelta("30d") == timedelta(days=30)
+
+    def test_hours(self):
+        assert _parse_relative_to_timedelta("12h") == timedelta(hours=12)
+
+    def test_minutes(self):
+        assert _parse_relative_to_timedelta("90m") == timedelta(minutes=90)
+
+    def test_absolute_returns_none(self):
+        assert _parse_relative_to_timedelta("2025-01-01T00:00:00") is None
+
+
+# ── 12. _validate_source_retention ──────────────────────────────
+
+
+class TestValidateSourceRetention:
+    def test_retention_without_timestamp_column_raises(self):
+        with pytest.raises(ValueError, match="requires timestamp_column"):
+            _validate_source_retention("public.t", "180d", "90d", None)
+
+    def test_retention_less_than_sync_since_raises(self):
+        with pytest.raises(ValueError, match="strictly greater"):
+            _validate_source_retention("public.t", "30d", "90d", "ts")
+
+    def test_retention_equal_to_sync_since_raises(self):
+        with pytest.raises(ValueError, match="strictly greater"):
+            _validate_source_retention("public.t", "90d", "90d", "ts")
+
+    def test_retention_greater_than_sync_since_ok(self):
+        _validate_source_retention("public.t", "180d", "90d", "ts")
+
+    def test_retention_without_sync_since_ok(self):
+        _validate_source_retention("public.t", "180d", None, "ts")
+
+    def test_mixed_relative_absolute_raises(self):
+        with pytest.raises(ValueError, match="must both be relative"):
+            _validate_source_retention(
+                "public.t", "180d", "2025-01-01T00:00:00", "ts"
+            )
+
+    def test_both_absolute_valid(self):
+        # retention cutoff older (smaller) than sync_since cutoff
+        _validate_source_retention(
+            "public.t", "2024-01-01T00:00:00", "2025-01-01T00:00:00", "ts"
+        )
+
+    def test_both_absolute_invalid(self):
+        # retention cutoff newer — means we'd delete data not yet synced
+        with pytest.raises(ValueError, match="must be older"):
+            _validate_source_retention(
+                "public.t", "2025-06-01T00:00:00", "2025-01-01T00:00:00", "ts"
+            )
+
+
+# ── 13. _purge_source ──────────────────────────────────────────
+
+
+class TestPurgeSource:
+    def _make_job(self):
+        return Pg2ChSyncJob(config=None)
+
+    def test_purge_single_batch(self):
+        """batch_size 보다 적게 삭제되면 한 번에 종료."""
+        job = self._make_job()
+        pg_conn = MagicMock()
+        cur = MagicMock()
+        cur.rowcount = 50
+        pg_conn.cursor.return_value.__enter__ = MagicMock(return_value=cur)
+        pg_conn.cursor.return_value.__exit__ = MagicMock(return_value=False)
+
+        result = job._purge_source(
+            pg_conn, "public", "orders", "created_at",
+            "2024-01-01T00:00:00", batch_size=100,
+        )
+        assert result == 50
+        pg_conn.commit.assert_called_once()
+
+    def test_purge_multi_batch(self):
+        """여러 배치에 걸쳐 삭제."""
+        job = self._make_job()
+        pg_conn = MagicMock()
+
+        cur1 = MagicMock()
+        cur1.rowcount = 100
+        cur2 = MagicMock()
+        cur2.rowcount = 30
+
+        ctx1 = MagicMock()
+        ctx1.__enter__ = MagicMock(return_value=cur1)
+        ctx1.__exit__ = MagicMock(return_value=False)
+        ctx2 = MagicMock()
+        ctx2.__enter__ = MagicMock(return_value=cur2)
+        ctx2.__exit__ = MagicMock(return_value=False)
+
+        pg_conn.cursor.side_effect = [ctx1, ctx2]
+
+        result = job._purge_source(
+            pg_conn, "public", "orders", "created_at",
+            "2024-01-01T00:00:00", batch_size=100,
+        )
+        assert result == 130
+        assert pg_conn.commit.call_count == 2
+
+    def test_purge_lock_timeout_stops_gracefully(self):
+        """LockNotAvailable 발생 시 graceful stop."""
+        job = self._make_job()
+        pg_conn = MagicMock()
+        cur = MagicMock()
+        # 첫 배치 성공, 두 번째에서 lock timeout
+        cur_ok = MagicMock()
+        cur_ok.rowcount = 100
+
+        ctx_ok = MagicMock()
+        ctx_ok.__enter__ = MagicMock(return_value=cur_ok)
+        ctx_ok.__exit__ = MagicMock(return_value=False)
+
+        # LockNotAvailable exception
+        lock_err = type("LockNotAvailable", (Exception,), {})()
+        ctx_fail = MagicMock()
+        ctx_fail.__enter__ = MagicMock(side_effect=lock_err)
+        ctx_fail.__exit__ = MagicMock(return_value=False)
+
+        pg_conn.cursor.side_effect = [ctx_ok, ctx_fail]
+
+        result = job._purge_source(
+            pg_conn, "public", "orders", "created_at",
+            "2024-01-01T00:00:00", batch_size=100,
+        )
+        assert result == 100
+        pg_conn.rollback.assert_called_once()
+
+    def test_purge_other_error_reraises(self):
+        """lock timeout 이 아닌 에러는 re-raise."""
+        job = self._make_job()
+        pg_conn = MagicMock()
+
+        ctx_fail = MagicMock()
+        ctx_fail.__enter__ = MagicMock(side_effect=RuntimeError("disk full"))
+        ctx_fail.__exit__ = MagicMock(return_value=False)
+        pg_conn.cursor.return_value = ctx_fail
+
+        with pytest.raises(RuntimeError, match="disk full"):
+            job._purge_source(
+                pg_conn, "public", "orders", "created_at",
+                "2024-01-01T00:00:00",
+            )
+
+    def test_purge_sets_lock_timeout(self):
+        """SET LOCAL lock_timeout 이 실행되는지 확인."""
+        job = self._make_job()
+        pg_conn = MagicMock()
+        cur = MagicMock()
+        cur.rowcount = 0
+        pg_conn.cursor.return_value.__enter__ = MagicMock(return_value=cur)
+        pg_conn.cursor.return_value.__exit__ = MagicMock(return_value=False)
+
+        job._purge_source(
+            pg_conn, "public", "orders", "created_at",
+            "2024-01-01T00:00:00", lock_timeout_ms=3000,
+        )
+        calls = [str(c) for c in cur.execute.call_args_list]
+        assert any("lock_timeout" in c and "3000" in c for c in calls)
+
+    def test_purge_uses_correct_cutoff(self):
+        """DELETE 쿼리에 retention_cutoff 파라미터가 전달되는지 확인."""
+        job = self._make_job()
+        pg_conn = MagicMock()
+        cur = MagicMock()
+        cur.rowcount = 0
+        pg_conn.cursor.return_value.__enter__ = MagicMock(return_value=cur)
+        pg_conn.cursor.return_value.__exit__ = MagicMock(return_value=False)
+
+        job._purge_source(
+            pg_conn, "public", "orders", "created_at",
+            "2024-07-01T00:00:00", batch_size=5000,
+        )
+        delete_call = cur.execute.call_args_list[1]  # 두 번째 execute (첫 번째는 SET LOCAL)
+        assert delete_call[0][1] == ("2024-07-01T00:00:00", 5000)
+
+
+# ── 14. source_retention integration ────────────────────────────
+
+
+class TestSourceRetentionIntegration:
+    def _make_job(self):
+        return Pg2ChSyncJob(config=None)
+
+    def test_sync_then_purge(self):
+        """sync 후 _purge_source 가 호출되고 결과 tuple 에 포함."""
+        job = self._make_job()
+        ch = MagicMock()
+        ch.execute.return_value = []  # watermark 없음
+
+        pg_conn = MagicMock()
+        pg_cols = [
+            {"name": "id", "pg_type": "integer", "nullable": False, "precision": None, "scale": None},
+            {"name": "updated_at", "pg_type": "timestamp without time zone", "nullable": False, "precision": None, "scale": None},
+        ]
+
+        tc = {
+            "source_table": "public.orders",
+            "target_table": "default.orders",
+            "timestamp_column": "updated_at",
+            "sync_since": "90d",
+            "source_retention": "180d",
+            "order_by": ["id"],
+            "engine": "ReplacingMergeTree",
+        }
+        sync_cfg = {"source": "pg_src"}
+
+        with (
+            patch.object(job, "_pg_connect", return_value=pg_conn),
+            patch.object(job, "_ch_connect", return_value=ch),
+            patch.object(job, "_get_pg_columns", return_value=pg_cols),
+            patch.object(job, "_purge_source", return_value=42) as mock_purge,
+        ):
+            stream_cursor = MagicMock()
+            stream_cursor.fetchmany.return_value = []
+            pg_conn.cursor.return_value = stream_cursor
+
+            synced, purged = job._sync_table(
+                {"host": "h", "port": 5432, "dbname": "src", "user": "u", "password": "p"},
+                {"host": "h", "port": 9000, "dbname": "tgt", "user": "default", "password": ""},
+                tc, sync_cfg,
+            )
+            assert purged == 42
+            mock_purge.assert_called_once()
+            # retention_cutoff 이 전달되었는지 확인
+            call_args = mock_purge.call_args
+            assert call_args[0][0] is pg_conn
+            assert call_args[0][1] == "public"
+            assert call_args[0][2] == "orders"
+            assert call_args[0][3] == "updated_at"
+
+    def test_no_purge_when_retention_not_set(self):
+        """source_retention 미설정 시 _purge_source 미호출."""
+        job = self._make_job()
+        ch = MagicMock()
+        ch.execute.return_value = []
+
+        pg_conn = MagicMock()
+        pg_cols = [
+            {"name": "id", "pg_type": "integer", "nullable": False, "precision": None, "scale": None},
+            {"name": "updated_at", "pg_type": "timestamp without time zone", "nullable": False, "precision": None, "scale": None},
+        ]
+
+        tc = {
+            "source_table": "public.orders",
+            "target_table": "default.orders",
+            "timestamp_column": "updated_at",
+            "order_by": ["id"],
+            "engine": "ReplacingMergeTree",
+        }
+        sync_cfg = {"source": "pg_src"}
+
+        with (
+            patch.object(job, "_pg_connect", return_value=pg_conn),
+            patch.object(job, "_ch_connect", return_value=ch),
+            patch.object(job, "_get_pg_columns", return_value=pg_cols),
+            patch.object(job, "_purge_source") as mock_purge,
+        ):
+            stream_cursor = MagicMock()
+            stream_cursor.fetchmany.return_value = []
+            pg_conn.cursor.return_value = stream_cursor
+
+            synced, purged = job._sync_table(
+                {"host": "h", "port": 5432, "dbname": "src", "user": "u", "password": "p"},
+                {"host": "h", "port": 9000, "dbname": "tgt", "user": "default", "password": ""},
+                tc, sync_cfg,
+            )
+            assert purged == 0
+            mock_purge.assert_not_called()
+
+    def test_purge_failure_propagates_to_run(self, pg2ch_config, tmp_data_dir):
+        """_purge_source 에러가 run() 에러 목록에 포함."""
+        job = self._make_job()
+
+        # pg2ch_config 에 source_retention 추가
+        with open(pg2ch_config) as f:
+            cfg = json.load(f)
+        cfg["tables"][0]["sync_since"] = "30d"
+        cfg["tables"][0]["source_retention"] = "180d"
+        with open(pg2ch_config, "w") as f:
+            json.dump(cfg, f)
+
+        with (
+            patch.dict("sys.modules", {"clickhouse_driver": MagicMock()}),
+            patch("dbcron.jobs.pg2ch_sync.get_database") as mock_get_db,
+            patch.object(job, "_sync_table", side_effect=RuntimeError("purge exploded")),
+        ):
+            mock_get_db.side_effect = lambda db_id: (
+                {"id": "pg_src", "type": "postgresql"} if db_id == "pg_src"
+                else {"id": "ch_tgt", "type": "clickhouse"}
+            )
+            result = job.run(config=pg2ch_config)
+        assert not result.success
+        assert "purge exploded" in result.message
+
+    def test_run_message_includes_purge_count(self, pg2ch_config, tmp_data_dir):
+        """run() 결과 메시지에 purge 수가 포함."""
+        job = self._make_job()
+
+        with (
+            patch.dict("sys.modules", {"clickhouse_driver": MagicMock()}),
+            patch("dbcron.jobs.pg2ch_sync.get_database") as mock_get_db,
+            patch.object(job, "_sync_table", return_value=(100, 50)),
+        ):
+            mock_get_db.side_effect = lambda db_id: (
+                {"id": "pg_src", "type": "postgresql"} if db_id == "pg_src"
+                else {"id": "ch_tgt", "type": "clickhouse"}
+            )
+            result = job.run(config=pg2ch_config)
+        assert result.success
+        assert "purged 50 source rows" in result.message
