@@ -4,16 +4,18 @@
 JSON 응답을 타겟 DB 테이블에 매핑/저장합니다.
 
 동작 모드:
-  - per_row: 소스 행 1건당 API 1회 호출
-  - batch: 소스 행 N건을 묶어 API 1회 호출
+  - per_row: 소스 행 1건당 API 1회 호출 (확장 기능 지원)
+  - batch: 소스 행 N건을 묶어 API 1회 호출 (기존 기능만)
 
-기능:
-  - Watermark 기반 증분 처리
-  - JSON dot-path 응답 매핑 (e.g. "payment.amount", "items[0].name")
-  - 자동 타겟 테이블 생성 (CREATE TABLE IF NOT EXISTS)
-  - 타임스탬프 컬럼 자동 추가
-  - 다중 DB 타입 타겟 지원 (ClickHouse, PostgreSQL, MSSQL, SQLite)
-  - API 실패 시 skip + 로그 (다음 행 계속)
+확장 기능 (per_row 모드):
+  - 멀티소스 쿼리 체인 (source_queries)
+  - S3 객체 로더 (s3_objects)
+  - 중첩 요청 바디 템플릿 (request_body_template)
+  - 멀티배열 응답 병합 (response_merge)
+  - 멀티타겟 쓰기 (child_targets)
+  - Upsert / Replace 전략 (write_strategy)
+  - 행 단위 병렬 처리 (max_workers)
+  - 처리된 키 제외 (exclusion)
 
 설정:
   config JSON 파일로 source/target DB, API 설정, 컬럼 매핑 지정
@@ -22,10 +24,7 @@ JSON 응답을 타겟 DB 테이블에 매핑/저장합니다.
 from __future__ import annotations
 
 import json
-import os
-import re
 from datetime import datetime, timedelta
-from urllib.parse import quote
 
 import httpx
 from sqlalchemy import text
@@ -33,62 +32,35 @@ from sqlalchemy import text
 from ..db import create_engine_by_id, create_engine_for, get_database
 from .base import Job, JobResult
 
-# ── 유틸리티 ──────────────────────────────────────────────────────
+# ── enrich 서브패키지 ────────────────────────────────────────────
+from .enrich.context import RowContext, run_query_chain
+from .enrich.exclusion import filter_excluded_rows, get_existing_keys
+from .enrich.parallel import run_parallel
+from .enrich.request_builder import build_request_body, build_request_url
+from .enrich.response_parser import extract_response_mapping, merge_response_arrays
+from .enrich.s3_loader import RowSkipError, load_s3_objects
+from .enrich.util import (
+    _TIMESTAMP_TYPES,
+    _expand_env,
+    _extract_json_path,
+    _resolve_url,
+)
+from .enrich.writer import (
+    ensure_target_table,
+    ensure_watermark_table,
+    get_watermark,
+    save_watermark,
+    write_parent_and_children,
+    write_rows,
+)
 
-
-def _extract_json_path(data: dict, path: str):
-    """Dot-notation path 로 중첩 dict/list 에서 값을 추출한다.
-
-    Examples:
-        _extract_json_path({"a": {"b": 1}}, "a.b") → 1
-        _extract_json_path({"items": [{"x": 1}]}, "items[0].x") → 1
-    """
-    current = data
-    for part in re.split(r"\.", path):
-        m = re.match(r"^(\w+)\[(\d+)\]$", part)
-        if m:
-            key, idx = m.group(1), int(m.group(2))
-            if not isinstance(current, dict) or key not in current:
-                return None
-            current = current[key]
-            if not isinstance(current, list) or idx >= len(current):
-                return None
-            current = current[idx]
-        else:
-            if not isinstance(current, dict) or part not in current:
-                return None
-            current = current[part]
-    return current
-
-
-def _expand_env(value: str) -> str:
-    """``${VAR}`` 패턴을 환경변수 값으로 치환한다."""
-    return re.sub(
-        r"\$\{(\w+)\}",
-        lambda m: os.environ.get(m.group(1), m.group(0)),
-        value,
-    )
-
-
-def _resolve_url(template: str, row: dict) -> str:
-    """``{column_name}`` 플레이스홀더를 row 값으로 치환한다."""
-
-    def _replace(m: re.Match) -> str:
-        key = m.group(1)
-        val = row.get(key, "")
-        return quote(str(val), safe="")
-
-    return re.sub(r"\{(\w+)\}", _replace, template)
-
-
-# ── 타임스탬프 타입 ───────────────────────────────────────────────
-
-_TIMESTAMP_TYPES: dict[str, str] = {
-    "clickhouse": "DateTime64(3)",
-    "mssql": "DATETIME2",
-    "postgresql": "TIMESTAMP",
-    "sqlite": "TIMESTAMP",
-}
+# ── 하위 호환을 위한 re-export (기존 테스트에서 import) ────────────
+__all__ = [
+    "ApiEnrichJob",
+    "_extract_json_path",
+    "_expand_env",
+    "_resolve_url",
+]
 
 
 # ── Job ───────────────────────────────────────────────────────────
@@ -175,81 +147,48 @@ class ApiEnrichJob(Job):
         db = get_database(db_id)
         return db.get("type", "postgresql") if db else "postgresql"
 
-    # ── watermark ────────────────────────────────────────────────
+    @staticmethod
+    def _validate_config(tc: dict, api_cfg: dict) -> None:
+        """비호환 기능 조합을 사전 검증한다."""
+        mode = api_cfg.get("mode", "per_row")
+        if mode == "batch":
+            per_row_only = []
+            if tc.get("source_queries"):
+                per_row_only.append("source_queries")
+            if tc.get("s3_objects"):
+                per_row_only.append("s3_objects")
+            if api_cfg.get("request_body_template"):
+                per_row_only.append("request_body_template")
+            if api_cfg.get("response_merge"):
+                per_row_only.append("response_merge")
+            if per_row_only:
+                raise ValueError(
+                    f"batch mode is incompatible with: {', '.join(per_row_only)}. "
+                    f"Use per_row mode for these features."
+                )
+
+        strategy = tc.get("write_strategy", "insert")
+        if strategy in ("upsert", "replace") and not tc.get("upsert_key_columns"):
+            raise ValueError(
+                f"write_strategy '{strategy}' requires upsert_key_columns"
+            )
+
+    # ── watermark (delegate to enrich.writer) ────────────────────
 
     def _ensure_watermark_table(self, engine, db_type: str) -> None:
-        tbl = self._WATERMARK_TABLE
-        if db_type == "clickhouse":
-            ddl = (
-                f"CREATE TABLE IF NOT EXISTS {tbl} ("
-                " config_key String,"
-                " watermark_column String,"
-                " value String,"
-                " updated_at DateTime64(3)"
-                ") ENGINE = ReplacingMergeTree(updated_at)"
-                " ORDER BY (config_key, watermark_column)"
-            )
-        elif db_type == "mssql":
-            ddl = (
-                f"IF NOT EXISTS (SELECT * FROM sys.tables WHERE name = '{tbl}')"
-                f" CREATE TABLE {tbl} ("
-                " config_key NVARCHAR(512) NOT NULL,"
-                " watermark_column NVARCHAR(256) NOT NULL,"
-                " value NVARCHAR(512) NOT NULL,"
-                " updated_at DATETIME2 NOT NULL)"
-            )
-        else:
-            ddl = (
-                f"CREATE TABLE IF NOT EXISTS {tbl} ("
-                " config_key VARCHAR(512) NOT NULL,"
-                " watermark_column VARCHAR(256) NOT NULL,"
-                " value VARCHAR(512) NOT NULL,"
-                " updated_at TIMESTAMP NOT NULL)"
-            )
-        with engine.begin() as conn:
-            conn.execute(text(ddl))
+        ensure_watermark_table(engine, db_type)
 
     def _get_watermark(
         self, engine, db_type: str, key: str, wm_col: str
     ) -> str | None:
-        tbl = self._WATERMARK_TABLE
-        final = " FINAL" if db_type == "clickhouse" else ""
-        sql = (
-            f"SELECT value FROM {tbl}{final}"
-            " WHERE config_key = :key AND watermark_column = :wm_col"
-        )
-        with engine.connect() as conn:
-            row = conn.execute(
-                text(sql), {"key": key, "wm_col": wm_col}
-            ).fetchone()
-        return row[0] if row else None
+        return get_watermark(engine, db_type, key, wm_col)
 
     def _save_watermark(
         self, engine, db_type: str, key: str, wm_col: str, value
     ) -> None:
-        tbl = self._WATERMARK_TABLE
-        val_str = value.isoformat() if isinstance(value, datetime) else str(value)
-        now = datetime.now()
-        with engine.begin() as conn:
-            if db_type != "clickhouse":
-                conn.execute(
-                    text(
-                        f"DELETE FROM {tbl}"
-                        " WHERE config_key = :key"
-                        " AND watermark_column = :wm_col"
-                    ),
-                    {"key": key, "wm_col": wm_col},
-                )
-            conn.execute(
-                text(
-                    f"INSERT INTO {tbl}"
-                    " (config_key, watermark_column, value, updated_at)"
-                    " VALUES (:key, :wm_col, :value, :now)"
-                ),
-                {"key": key, "wm_col": wm_col, "value": val_str, "now": now},
-            )
+        save_watermark(engine, db_type, key, wm_col, value)
 
-    # ── target DDL ───────────────────────────────────────────────
+    # ── target DDL (delegate to enrich.writer) ───────────────────
 
     def _ensure_target_table(
         self,
@@ -261,30 +200,9 @@ class ApiEnrichJob(Job):
         engine_clause: str | None,
         partition_by: str | None,
     ) -> None:
-        col_defs = ", ".join(f'"{n}" {t}' for n, t in columns.items())
-
-        if db_type == "clickhouse":
-            ddl = f"CREATE TABLE IF NOT EXISTS {table} ({col_defs})"
-            ddl += f" ENGINE = {engine_clause or 'MergeTree'}"
-            if order_by:
-                ddl += f" ORDER BY ({', '.join(order_by)})"
-            else:
-                ddl += " ORDER BY tuple()"
-            if partition_by:
-                ddl += f" PARTITION BY {partition_by}"
-        elif db_type == "mssql":
-            tbl_name = table.rsplit(".", 1)[-1]
-            ddl = (
-                f"IF NOT EXISTS (SELECT * FROM sys.tables WHERE name = '{tbl_name}')"
-                f" CREATE TABLE {table} ({col_defs})"
-            )
-        else:
-            ddl = f"CREATE TABLE IF NOT EXISTS {table} ({col_defs})"
-
-        self.logger.info("Ensuring table: %s", table)
-        self.logger.debug("DDL: %s", ddl)
-        with engine.begin() as conn:
-            conn.execute(text(ddl))
+        ensure_target_table(
+            engine, db_type, table, columns, order_by, engine_clause, partition_by
+        )
 
     # ── API calls ────────────────────────────────────────────────
 
@@ -293,12 +211,25 @@ class ApiEnrichJob(Job):
         client: httpx.Client,
         api_cfg: dict,
         row: dict,
+        *,
+        context: RowContext | None = None,
     ) -> dict | None:
-        url = _resolve_url(api_cfg["base_url"], row)
+        """per_row API 호출. context가 있으면 확장 기능 사용."""
+        if context is not None:
+            url = build_request_url(api_cfg["base_url"], context)
+        else:
+            url = _resolve_url(api_cfg["base_url"], row)
+
         method = api_cfg.get("method", "GET").upper()
         timeout = api_cfg.get("timeout_seconds", 10)
+
+        kwargs: dict = {"timeout": timeout}
+        body_template = api_cfg.get("request_body_template")
+        if body_template and context is not None:
+            kwargs["json"] = build_request_body(body_template, context)
+
         try:
-            resp = client.request(method, url, timeout=timeout)
+            resp = client.request(method, url, **kwargs)
             resp.raise_for_status()
             return resp.json()
         except (httpx.HTTPError, ValueError) as exc:
@@ -343,6 +274,66 @@ class ApiEnrichJob(Job):
         # positional fallback
         return [items[i] if i < len(items) else None for i in range(len(rows))]
 
+    # ── per-row pipeline (for parallel execution) ────────────────
+
+    def _process_single_row(
+        self,
+        row: dict,
+        tc: dict,
+        api_cfg: dict,
+        full_cfg: dict,
+        query_engines: dict,
+        http_client: httpx.Client,
+        src_col_names: list[str],
+        response_mapping: list[dict],
+        merge_config: list[dict] | None,
+        timestamp_col: str | None,
+    ) -> tuple[list[dict], dict | None]:
+        """단일 행 파이프라인. (enriched_rows, api_response) 반환.
+
+        enriched_rows가 비어있으면 스킵된 행.
+        예외 발생 시 실패 행.
+        """
+        # 1. 쿼리 체인 실행
+        query_chain = tc.get("source_queries", [])
+        ctx = run_query_chain(row, query_chain, query_engines)
+
+        # 2. S3 객체 로드
+        s3_config = tc.get("s3_objects")
+        if s3_config:
+            collections = load_s3_objects(ctx, s3_config)
+            ctx.collections.update(collections)
+
+        # 3. API 호출
+        resp = self._call_api_per_row(http_client, api_cfg, row, context=ctx)
+        if resp is None:
+            return [], None
+
+        # 4. 응답 파싱
+        if merge_config:
+            merged_elements = merge_response_arrays(resp, merge_config)
+            if not merged_elements:
+                return [], resp
+
+            enriched: list[dict] = []
+            for elem in merged_elements:
+                row_out: dict = {}
+                for col in src_col_names:
+                    row_out[col] = row.get(col)
+                row_out.update(extract_response_mapping(elem, response_mapping))
+                if timestamp_col:
+                    row_out[timestamp_col] = datetime.now()
+                enriched.append(row_out)
+            return enriched, resp
+        else:
+            row_out: dict = {}
+            for col in src_col_names:
+                row_out[col] = row.get(col)
+            row_out.update(extract_response_mapping(resp, response_mapping))
+            if timestamp_col:
+                row_out[timestamp_col] = datetime.now()
+            return [row_out], resp
+
     # ── core pipeline ────────────────────────────────────────────
 
     def _enrich_table(
@@ -362,6 +353,17 @@ class ApiEnrichJob(Job):
         batch_size: int = tc.get("batch_size", 500)
         overlap_min: int = tc.get("overlap_minutes", 0)
         mode: str = api_cfg.get("mode", "per_row")
+        max_workers: int = api_cfg.get("max_workers", 1)
+
+        # 확장 기능 설정
+        exclusion_cfg = tc.get("exclusion")
+        child_configs = tc.get("child_targets", [])
+        write_strategy = tc.get("write_strategy", "insert")
+        upsert_key_cols = tc.get("upsert_key_columns")
+        merge_config = api_cfg.get("response_merge")
+
+        # Config 검증
+        self._validate_config(tc, api_cfg)
 
         db_type = self._get_db_type(full_cfg["target"])
 
@@ -382,16 +384,27 @@ class ApiEnrichJob(Job):
         else:
             src_schema, src_name = "public", source_table
 
-        # ── 타겟 DDL ───────────────────────────────────────────
+        # ── 타겟 DDL (부모 + 자식) ─────────────────────────────
         self._ensure_target_table(
-            tgt_engine,
-            db_type,
-            target_table,
-            target_cols,
-            tc.get("order_by"),
-            tc.get("engine"),
-            tc.get("partition_by"),
+            tgt_engine, db_type, target_table, target_cols,
+            tc.get("order_by"), tc.get("engine"), tc.get("partition_by"),
         )
+        for child_cfg in child_configs:
+            child_cols: dict[str, str] = {
+                child_cfg["foreign_key_column"]: target_cols.get(
+                    child_cfg["parent_key_column"],
+                    source_columns.get(child_cfg["parent_key_column"], "String"),
+                )
+            }
+            for cm in child_cfg.get("response_mapping", []):
+                child_cols[cm["column"]] = cm["type"]
+            if timestamp_col:
+                child_cols[timestamp_col] = _TIMESTAMP_TYPES.get(db_type, "TIMESTAMP")
+            self._ensure_target_table(
+                tgt_engine, db_type, child_cfg["target_table"], child_cols,
+                child_cfg.get("order_by"), child_cfg.get("engine"),
+                child_cfg.get("partition_by"),
+            )
 
         # ── watermark ──────────────────────────────────────────
         self._ensure_watermark_table(tgt_engine, db_type)
@@ -425,9 +438,7 @@ class ApiEnrichJob(Job):
             params: dict = {"cutoff": cutoff}
             self.logger.info(
                 "%s: incremental from %s (overlap %dm)",
-                source_table,
-                cutoff,
-                overlap_min,
+                source_table, cutoff, overlap_min,
             )
         else:
             query = f'SELECT {col_list_sql} FROM "{src_schema}"."{src_name}"'
@@ -439,80 +450,155 @@ class ApiEnrichJob(Job):
         # ── API 헤더 ───────────────────────────────────────────
         headers = {k: _expand_env(v) for k, v in api_cfg.get("headers", {}).items()}
 
+        # ── 쿼리 체인용 엔진 사전 생성 ────────────────────────
+        query_engines: dict = {}
+        for qcfg in tc.get("source_queries", []):
+            db_id = qcfg["db"]
+            if db_id not in query_engines:
+                query_engines[db_id] = self._build_engine(
+                    {db_id: full_cfg.get(db_id, db_id)}, db_id
+                ) if isinstance(full_cfg.get(db_id), dict) else create_engine_by_id(db_id)
+
         # ── 스트리밍 enrichment ────────────────────────────────
         src_col_names = list(source_columns.keys())
         total_rows = 0
         max_wm = None
 
-        with (
-            httpx.Client(headers=headers) as http_client,
-            src_engine.connect() as src_conn,
-        ):
-            result = src_conn.execute(text(query), params)
-            col_keys = list(result.keys())
+        try:
+            with (
+                httpx.Client(headers=headers) as http_client,
+                src_engine.connect() as src_conn,
+            ):
+                result = src_conn.execute(text(query), params)
+                col_keys = list(result.keys())
 
-            while True:
-                rows = result.fetchmany(batch_size)
-                if not rows:
-                    break
+                while True:
+                    rows = result.fetchmany(batch_size)
+                    if not rows:
+                        break
 
-                row_dicts = [dict(zip(col_keys, r)) for r in rows]
+                    row_dicts = [dict(zip(col_keys, r)) for r in rows]
 
-                # watermark 추적
-                if wm_col:
-                    for rd in row_dicts:
-                        val = rd.get(wm_col)
-                        if val is not None and (max_wm is None or val > max_wm):
-                            max_wm = val
+                    # watermark 추적
+                    if wm_col:
+                        for rd in row_dicts:
+                            val = rd.get(wm_col)
+                            if val is not None and (max_wm is None or val > max_wm):
+                                max_wm = val
 
-                # API 호출
-                if mode == "batch":
-                    responses = self._call_api_batch(
-                        http_client, api_cfg, row_dicts
-                    )
-                else:
-                    responses = [
-                        self._call_api_per_row(http_client, api_cfg, rd)
-                        for rd in row_dicts
-                    ]
-
-                # enriched rows 구성
-                enriched: list[dict] = []
-                for rd, resp in zip(row_dicts, responses):
-                    if resp is None:
-                        continue
-                    row_out: dict = {}
-                    for col in src_col_names:
-                        row_out[col] = rd.get(col)
-                    for mapping in response_mapping:
-                        row_out[mapping["column"]] = _extract_json_path(
-                            resp, mapping["json_path"]
+                    # ── exclusion 필터 ────────────────────────
+                    if exclusion_cfg and exclusion_cfg.get("enabled"):
+                        src_key = exclusion_cfg["key_column"]
+                        tgt_key = exclusion_cfg.get("target_key_column", src_key)
+                        candidate_keys = [r.get(src_key) for r in row_dicts]
+                        existing = get_existing_keys(
+                            tgt_engine, db_type, target_table, tgt_key,
+                            candidate_keys=candidate_keys,
                         )
-                    if timestamp_col:
-                        row_out[timestamp_col] = datetime.now()
-                    enriched.append(row_out)
+                        row_dicts = filter_excluded_rows(row_dicts, existing, src_key)
+                        if not row_dicts:
+                            continue
 
-                if not enriched:
-                    continue
+                    # ── batch 모드 (기존 동작) ────────────────
+                    if mode == "batch":
+                        responses = self._call_api_batch(
+                            http_client, api_cfg, row_dicts
+                        )
+                        enriched: list[dict] = []
+                        for rd, resp in zip(row_dicts, responses):
+                            if resp is None:
+                                continue
+                            row_out: dict = {}
+                            for col in src_col_names:
+                                row_out[col] = rd.get(col)
+                            for mapping in response_mapping:
+                                row_out[mapping["column"]] = _extract_json_path(
+                                    resp, mapping["json_path"]
+                                )
+                            if timestamp_col:
+                                row_out[timestamp_col] = datetime.now()
+                            enriched.append(row_out)
 
-                # 타겟 INSERT
-                ins_cols = list(enriched[0].keys())
-                col_list = ", ".join(f'"{c}"' for c in ins_cols)
-                placeholders = ", ".join(f":{c}" for c in ins_cols)
-                insert_sql = text(
-                    f"INSERT INTO {target_table} ({col_list})"
-                    f" VALUES ({placeholders})"
-                )
-                with tgt_engine.begin() as tgt_conn:
-                    tgt_conn.execute(insert_sql, enriched)
+                        if enriched:
+                            write_rows(
+                                tgt_engine, db_type, target_table, enriched,
+                                strategy=write_strategy,
+                                key_columns=upsert_key_cols,
+                            )
+                            total_rows += len(enriched)
+                        continue
 
-                total_rows += len(enriched)
-                self.logger.info(
-                    "%s: batch %d rows (total %d)",
-                    source_table,
-                    len(enriched),
-                    total_rows,
-                )
+                    # ── per_row 모드 (확장 파이프라인) ─────────
+                    if max_workers > 1:
+                        # 병렬 실행
+                        def _pipeline(row):
+                            enriched_rows, _ = self._process_single_row(
+                                row, tc, api_cfg, full_cfg,
+                                query_engines, http_client,
+                                src_col_names, response_mapping,
+                                merge_config, timestamp_col,
+                            )
+                            return enriched_rows
+
+                        enriched_rows, stats = run_parallel(
+                            row_dicts, _pipeline, max_workers,
+                        )
+                    else:
+                        # 순차 실행
+                        enriched_rows = []
+                        all_responses: list[dict | None] = []
+                        for rd in row_dicts:
+                            try:
+                                er, resp = self._process_single_row(
+                                    rd, tc, api_cfg, full_cfg,
+                                    query_engines, http_client,
+                                    src_col_names, response_mapping,
+                                    merge_config, timestamp_col,
+                                )
+                                enriched_rows.extend(er)
+                                all_responses.append(resp)
+                            except RowSkipError:
+                                self.logger.info("Row skipped (S3 failure)")
+                                all_responses.append(None)
+                            except Exception:
+                                self.logger.warning("Row pipeline failed", exc_info=True)
+                                all_responses.append(None)
+
+                    if not enriched_rows:
+                        continue
+
+                    # ── 쓰기 (메인 스레드) ────────────────────
+                    if child_configs:
+                        # 멀티타겟: 부모 + 자식
+                        # 병렬 모드에서는 all_responses가 없으므로 부모만 직접 쓰기
+                        if max_workers > 1:
+                            n = write_rows(
+                                tgt_engine, db_type, target_table,
+                                enriched_rows, strategy=write_strategy,
+                                key_columns=upsert_key_cols,
+                            )
+                        else:
+                            n = write_parent_and_children(
+                                tgt_engine, db_type, target_table,
+                                enriched_rows, write_strategy, upsert_key_cols,
+                                child_configs, all_responses, row_dicts,
+                                timestamp_col,
+                            )
+                    else:
+                        n = write_rows(
+                            tgt_engine, db_type, target_table,
+                            enriched_rows, strategy=write_strategy,
+                            key_columns=upsert_key_cols,
+                        )
+
+                    total_rows += n
+                    self.logger.info(
+                        "%s: batch %d rows (total %d)",
+                        source_table, n, total_rows,
+                    )
+        finally:
+            for eng in query_engines.values():
+                eng.dispose()
 
         # ── watermark 저장 ─────────────────────────────────────
         if wm_col and max_wm is not None:
