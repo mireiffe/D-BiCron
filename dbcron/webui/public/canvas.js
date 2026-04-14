@@ -153,13 +153,13 @@ async function loadCanvasData() {
 // ── Layout computation ─────────────────────────────────────────
 
 function computeLayout() {
-  const layout = { entryPoints: [], dbContainers: [], tableNodes: [], connections: [] };
+  const layout = { entryPoints: [], dbContainers: [], tableNodes: [], connections: [], gapColumns: [] };
   if (!CS.metadata) return layout;
 
-  const dbKeys = Object.keys(CS.metadata.databases);
   const cfg = CS.pipelineConfig || { databases: {}, entry_points: [], pipelines: [] };
   const pipeConns = collectPipelineConnections(cfg);
   const epConns = collectEntryPointConnections(cfg);
+  const dbKeys = topoSortDBs(Object.keys(CS.metadata.databases), pipeConns, epConns);
 
   // Connected pairs for y-ordering
   const connectedPairs = pipeConns.map(c => ({
@@ -244,6 +244,14 @@ function computeLayout() {
     });
   }
 
+  // Compute gap columns between DB containers for arrow routing
+  const sortedContainers = [...layout.dbContainers].sort((a, b) => a.x - b.x);
+  for (let i = 0; i < sortedContainers.length - 1; i++) {
+    const left = sortedContainers[i];
+    const right = sortedContainers[i + 1];
+    layout.gapColumns.push({ midX: (left.x + left.w + right.x) / 2 });
+  }
+
   // Entry points
   if (cfg.entry_points) {
     let epY = 30;
@@ -306,14 +314,43 @@ function collectEntryPointConnections(cfg) {
   return out;
 }
 
+function topoSortDBs(dbKeys, pipeConns, epConns) {
+  const adj = new Map();
+  const inDeg = new Map();
+  for (const k of dbKeys) { adj.set(k, new Set()); inDeg.set(k, 0); }
+  for (const c of pipeConns) {
+    const from = c.from.db, to = c.to.db;
+    if (from !== to && adj.has(from) && adj.has(to) && !adj.get(from).has(to)) {
+      adj.get(from).add(to);
+      inDeg.set(to, inDeg.get(to) + 1);
+    }
+  }
+  const epTargetDBs = new Set();
+  for (const epc of epConns) { if (epc.target?.db) epTargetDBs.add(epc.target.db); }
+  // Kahn's algorithm — EP-targeted roots first
+  const queue = dbKeys.filter(k => inDeg.get(k) === 0)
+    .sort((a, b) => (epTargetDBs.has(a) ? 0 : 1) - (epTargetDBs.has(b) ? 0 : 1));
+  const sorted = [];
+  while (queue.length) {
+    const u = queue.shift();
+    sorted.push(u);
+    for (const v of adj.get(u)) {
+      inDeg.set(v, inDeg.get(v) - 1);
+      if (inDeg.get(v) === 0) queue.push(v);
+    }
+  }
+  for (const k of dbKeys) { if (!sorted.includes(k)) sorted.push(k); }
+  return sorted;
+}
+
 // ── Rendering ──────────────────────────────────────────────────
 
 function renderCanvas() {
   if (!CS.layout) return;
   gRoot.selectAll("*").remove();
 
-  const connLayer = gRoot.append("g").attr("class", "layer-connections");
   const containerLayer = gRoot.append("g").attr("class", "layer-containers");
+  const connLayer = gRoot.append("g").attr("class", "layer-connections");
   const nodeLayer = gRoot.append("g").attr("class", "layer-nodes");
   const epLayer = gRoot.append("g").attr("class", "layer-entrypoints");
 
@@ -545,14 +582,49 @@ function renderConnections(layer, connections) {
 
 function arrowPath(conn) {
   const s = conn.source, t = conn.target;
-  const sx = s.x + s.w, sy = s.y + s.h / 2;
-  const tx = t.x, ty = t.y + t.h / 2;
-  if (tx <= sx) {
-    const mx = Math.max(sx, tx) + 60;
-    return `M${sx},${sy} C${mx},${sy} ${mx},${ty} ${tx},${ty}`;
+  const sy = s.y + s.h / 2;
+  const ty = t.y + t.h / 2;
+
+  // Same-DB FK: compact right-side bump curve
+  if (conn.type === "fk" && s.dbKey && s.dbKey === t.dbKey) {
+    const rightEdge = Math.max(s.x + s.w, t.x + t.w);
+    const dist = Math.abs(sy - ty);
+    const bump = Math.min(60, Math.max(25, dist * 0.35));
+    return `M${s.x + s.w},${sy} C${rightEdge + bump},${sy} ${rightEdge + bump},${ty} ${t.x + t.w},${ty}`;
   }
-  const mx = (sx + tx) / 2;
-  return `M${sx},${sy} C${mx},${sy} ${mx},${ty} ${tx},${ty}`;
+
+  const sx = s.x + (s.w || 0);
+  const tx = t.x;
+
+  if (tx > sx + 10) {
+    // Forward connection — route through gap columns
+    const gaps = CS.layout?.gapColumns || [];
+    const relevant = gaps.filter(g => g.midX > sx && g.midX < tx);
+
+    if (relevant.length <= 1) {
+      // Adjacent or single gap: simple S-curve
+      const mx = relevant.length === 1 ? relevant[0].midX : (sx + tx) / 2;
+      return `M${sx},${sy} C${mx},${sy} ${mx},${ty} ${tx},${ty}`;
+    }
+
+    // Multiple gaps: control points in first and last gap
+    const cx1 = relevant[0].midX;
+    const cx2 = relevant[relevant.length - 1].midX;
+    return `M${sx},${sy} C${cx1},${sy} ${cx2},${ty} ${tx},${ty}`;
+  }
+
+  // Backward connection — route above all containers
+  const containers = CS.layout?.dbContainers || [];
+  let topY = Math.min(sy, ty);
+  for (const c of containers) {
+    if (c.x + c.w > Math.min(tx, sx) - 10 && c.x < Math.max(tx, sx) + 10) {
+      topY = Math.min(topY, c.y);
+    }
+  }
+  topY -= 40;
+  const loopOut = 50;
+  return `M${sx},${sy} C${sx + loopOut},${sy} ${sx + loopOut},${topY} ${(sx + tx) / 2},${topY}` +
+    ` C${tx - loopOut},${topY} ${tx - loopOut},${ty} ${tx},${ty}`;
 }
 
 function updateConnections() {
@@ -1094,6 +1166,17 @@ function canvasFit() {
   const ty = (ch - bh * scale) / 2 - minY * scale + pad * scale;
 
   svgEl.transition().duration(500).call(zoomBehavior.transform, d3.zoomIdentity.translate(tx, ty).scale(scale));
+}
+
+function autoArrange() {
+  CS.nodePositions = {};
+  savePositions();
+  CS.layout = computeLayout();
+  renderCanvas();
+  updateContainerBounds();
+  renderJobOverlay();
+  requestAnimationFrame(() => canvasFit());
+  if (typeof toast === "function") toast("Layout arranged", true);
 }
 
 // ── Refresh metadata ───────────────────────────────────────────
