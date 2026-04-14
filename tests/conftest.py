@@ -38,6 +38,17 @@ SAMPLE_DBS = [
         "password": "",
     },
     {
+        "id": "pg_tgt",
+        "type": "postgresql",
+        "label": "PG Target",
+        "color": "#ff9800",
+        "host": "localhost",
+        "port": 5433,
+        "dbname": "tgtdb",
+        "user": "admin",
+        "password": "secret",
+    },
+    {
         "id": "sqlite_test",
         "type": "sqlite",
         "label": "SQLite Test",
@@ -151,6 +162,30 @@ def pg2ch_config(tmp_path):
         ],
     }
     path = tmp_path / "pg2ch_config.json"
+    path.write_text(json.dumps(cfg, indent=2))
+    return str(path)
+
+
+@pytest.fixture()
+def pg2pg_config(tmp_path):
+    """Create a temporary pg2pg_config.json and return its path."""
+    cfg = {
+        "source": "pg_src",
+        "target": "pg_tgt",
+        "tables": [
+            {
+                "source_table": "public.orders",
+                "target_table": "public.orders",
+                "timestamp_column": "updated_at",
+                "sync_mode": "upsert",
+                "conflict_key": ["id"],
+                "drop_columns": ["internal_note"],
+                "column_overrides": {},
+                "batch_size": 1000,
+            },
+        ],
+    }
+    path = tmp_path / "pg2pg_config.json"
     path.write_text(json.dumps(cfg, indent=2))
     return str(path)
 

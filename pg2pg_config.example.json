@@ -1,0 +1,39 @@
+{
+  "_comment": "PostgreSQL → PostgreSQL 동기화 설정. source/target 은 databases.json 의 DB ID",
+  "source": "my_source_pg",
+  "target": "my_target_pg",
+  "defaults": {
+    "batch_size": 100000,
+    "overlap_minutes": 0,
+    "sync_mode": "append"
+  },
+  "tables": [
+    {
+      "source_table": "public.orders",
+      "target_table": "public.orders",
+      "timestamp_column": "updated_at",
+      "sync_since": "30d",
+      "source_retention": "180d",
+      "sync_mode": "upsert",
+      "conflict_key": ["id"],
+      "drop_columns": ["internal_note", "debug_payload"],
+      "column_overrides": {
+        "amount": "numeric(18,4)"
+      },
+      "batch_size": 50000,
+      "overlap_minutes": 30,
+      "create_indexes": [
+        {"columns": ["user_id"], "unique": false},
+        {"columns": ["email"], "unique": true}
+      ]
+    },
+    {
+      "source_table": "public.event_logs",
+      "target_table": "analytics.event_logs",
+      "timestamp_column": "created_at",
+      "sync_mode": "append",
+      "drop_columns": [],
+      "column_overrides": {}
+    }
+  ]
+}
