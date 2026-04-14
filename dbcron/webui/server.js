@@ -229,16 +229,17 @@ function getAllCachedConnections() {
 // -------------------------------------------------------------------
 // Helpers
 // -------------------------------------------------------------------
-function isJobRunning(jobName) {
+function isJobRunning(jobName, args = {}) {
   for (const [, r] of runningJobs) {
-    if (r.jobName === jobName) return true;
+    if (r.jobName !== jobName) continue;
+    if (JSON.stringify(r.args ?? {}) === JSON.stringify(args)) return true;
   }
   return false;
 }
 
 function startJob(jobName, args = {}, _retryCount = 0, _scheduleId = null, _targets = null) {
-  if (isJobRunning(jobName)) {
-    console.log(`Skipped ${jobName}: already running`);
+  if (isJobRunning(jobName, args)) {
+    console.log(`Skipped ${jobName} (${JSON.stringify(args)}): already running`);
     return null;
   }
 

@@ -323,7 +323,7 @@ class TestJobs:
         assert "error" in r.json()
 
     def test_run_job_already_running(self, client: httpx.Client):
-        """POST when job already running returns 409."""
+        """POST when job already running with same args returns 409."""
         # Start a job that takes a while — use metadata_snapshot which
         # connects to DBs.  We fire it twice rapidly.
         job = "metadata_snapshot"
@@ -340,6 +340,18 @@ class TestJobs:
             # Job was already running from a previous test; just verify the
             # conflict response.
             assert r1.status_code == 409
+
+    def test_run_same_job_different_args_concurrent(self, client: httpx.Client):
+        """POST same job with different args should NOT conflict (200+200)."""
+        job = "metadata_snapshot"
+        # Fire with two different arg sets — they should run concurrently.
+        r1 = client.post(f"/api/jobs/{job}/run", json={"tag": "a"})
+        r2 = client.post(f"/api/jobs/{job}/run", json={"tag": "b"})
+        # Both should be accepted (not 409) because args differ.
+        assert r1.status_code == 200, f"First run failed: {r1.text}"
+        assert r2.status_code == 200, f"Second run (different args) should not conflict: {r2.text}"
+        # Wait for both to finish
+        time.sleep(3)
 
 
 # ===================================================================
