@@ -939,3 +939,270 @@ class TestSourceRetentionIntegration:
             result = job.run(config=pg2ch_config)
         assert result.success
         assert "purged 50 source rows" in result.message
+
+
+# ── 15. watermark_column separation ────────────────────────────
+
+
+class TestWatermarkColumn:
+    """watermark_column 과 timestamp_column 분리 동작 검증."""
+
+    def _make_job(self):
+        return Pg2ChSyncJob(config=None)
+
+    PG_COLS = [
+        {"name": "sync_id", "pg_type": "bigint", "nullable": False, "precision": None, "scale": None},
+        {"name": "created_at", "pg_type": "timestamp without time zone", "nullable": False, "precision": None, "scale": None},
+        {"name": "data", "pg_type": "text", "nullable": True, "precision": None, "scale": None},
+    ]
+
+    def test_watermark_column_used_in_incremental_query(self):
+        """증분 모드에서 watermark_column 으로 WHERE 절 구성."""
+        job = self._make_job()
+        ch = MagicMock()
+        ch.execute.side_effect = [
+            None,  # _ensure_ch_table
+            None,  # _ensure_watermark_table
+            [("100",)],  # _get_watermark → sync_id 기반
+        ]
+
+        pg_conn = MagicMock()
+        tc = {
+            "source_table": "public.events",
+            "target_table": "default.events",
+            "timestamp_column": "created_at",
+            "watermark_column": "sync_id",
+            "order_by": ["sync_id"],
+            "engine": "MergeTree",
+        }
+        sync_cfg = {"source": "pg_src"}
+
+        with (
+            patch.object(job, "_pg_connect", return_value=pg_conn),
+            patch.object(job, "_ch_connect", return_value=ch),
+            patch.object(job, "_get_pg_columns", return_value=self.PG_COLS),
+        ):
+            stream_cursor = MagicMock()
+            stream_cursor.fetchmany.return_value = []
+            pg_conn.cursor.return_value = stream_cursor
+
+            job._sync_table(
+                {"host": "h", "port": 5432, "dbname": "src", "user": "u", "password": "p"},
+                {"host": "h", "port": 9000, "dbname": "tgt", "user": "default", "password": ""},
+                tc, sync_cfg,
+            )
+
+            query = stream_cursor.execute.call_args[0][0]
+            params = stream_cursor.execute.call_args[0][1]
+            assert '"sync_id" > %s' in query
+            assert 'ORDER BY "sync_id"' in query
+            # WHERE 절에 created_at 가 없어야 함 (SELECT 목록에는 있음)
+            where_part = query.split("WHERE", 1)[1]
+            assert '"created_at"' not in where_part
+            assert params == ("100",)
+
+    def test_watermark_column_with_sync_since_adds_both_conditions(self):
+        """watermark_column != timestamp_column 일 때 sync_since 는 별도 AND 조건."""
+        job = self._make_job()
+        ch = MagicMock()
+        ch.execute.side_effect = [
+            None,  # _ensure_ch_table
+            None,  # _ensure_watermark_table
+            [("100",)],  # _get_watermark
+        ]
+
+        pg_conn = MagicMock()
+        tc = {
+            "source_table": "public.events",
+            "target_table": "default.events",
+            "timestamp_column": "created_at",
+            "watermark_column": "sync_id",
+            "sync_since": "2025-01-01T00:00:00",
+            "order_by": ["sync_id"],
+            "engine": "MergeTree",
+        }
+        sync_cfg = {"source": "pg_src"}
+
+        with (
+            patch.object(job, "_pg_connect", return_value=pg_conn),
+            patch.object(job, "_ch_connect", return_value=ch),
+            patch.object(job, "_get_pg_columns", return_value=self.PG_COLS),
+        ):
+            stream_cursor = MagicMock()
+            stream_cursor.fetchmany.return_value = []
+            pg_conn.cursor.return_value = stream_cursor
+
+            job._sync_table(
+                {"host": "h", "port": 5432, "dbname": "src", "user": "u", "password": "p"},
+                {"host": "h", "port": 9000, "dbname": "tgt", "user": "default", "password": ""},
+                tc, sync_cfg,
+            )
+
+            query = stream_cursor.execute.call_args[0][0]
+            params = stream_cursor.execute.call_args[0][1]
+            assert '"sync_id" > %s' in query
+            assert '"created_at" >= %s' in query
+            assert params == ("100", "2025-01-01T00:00:00")
+
+    def test_watermark_saved_with_watermark_column_name(self):
+        """워터마크 저장 시 watermark_column 이름으로 기록."""
+        job = self._make_job()
+        ch = MagicMock()
+        ch.execute.side_effect = [
+            None,  # _ensure_ch_table
+            None,  # _ensure_watermark_table
+            [],  # _get_watermark → 없음 (full copy)
+            None,  # TRUNCATE
+            None,  # INSERT rows
+            None,  # _save_watermark
+        ]
+
+        pg_conn = MagicMock()
+        tc = {
+            "source_table": "public.events",
+            "target_table": "default.events",
+            "timestamp_column": "created_at",
+            "watermark_column": "sync_id",
+            "order_by": ["sync_id"],
+            "engine": "MergeTree",
+        }
+        sync_cfg = {"source": "pg_src"}
+
+        with (
+            patch.object(job, "_pg_connect", return_value=pg_conn),
+            patch.object(job, "_ch_connect", return_value=ch),
+            patch.object(job, "_get_pg_columns", return_value=self.PG_COLS),
+            patch.object(job, "_save_watermark") as mock_save,
+        ):
+            stream_cursor = MagicMock()
+            stream_cursor.fetchmany.side_effect = [
+                [(200, "2025-06-01", "hello")],
+                [],
+            ]
+            pg_conn.cursor.return_value = stream_cursor
+
+            job._sync_table(
+                {"host": "h", "port": 5432, "dbname": "src", "user": "u", "password": "p"},
+                {"host": "h", "port": 9000, "dbname": "tgt", "user": "default", "password": ""},
+                tc, sync_cfg,
+            )
+
+            mock_save.assert_called_once()
+            call_args = mock_save.call_args[0]
+            assert call_args[2] == "pg_src.public.events"  # wm_key
+            assert call_args[3] == "sync_id"  # wm_col, not ts_col
+            assert call_args[4] == 200  # max sync_id value
+
+    def test_retention_purge_uses_timestamp_column(self):
+        """source_retention 삭제는 timestamp_column 기준."""
+        job = self._make_job()
+        ch = MagicMock()
+        ch.execute.return_value = []  # no watermark
+
+        pg_conn = MagicMock()
+        tc = {
+            "source_table": "public.events",
+            "target_table": "default.events",
+            "timestamp_column": "created_at",
+            "watermark_column": "sync_id",
+            "sync_since": "30d",
+            "source_retention": "180d",
+            "order_by": ["sync_id"],
+            "engine": "MergeTree",
+        }
+        sync_cfg = {"source": "pg_src"}
+
+        with (
+            patch.object(job, "_pg_connect", return_value=pg_conn),
+            patch.object(job, "_ch_connect", return_value=ch),
+            patch.object(job, "_get_pg_columns", return_value=self.PG_COLS),
+            patch.object(job, "_purge_source", return_value=10) as mock_purge,
+        ):
+            stream_cursor = MagicMock()
+            stream_cursor.fetchmany.return_value = []
+            pg_conn.cursor.return_value = stream_cursor
+
+            job._sync_table(
+                {"host": "h", "port": 5432, "dbname": "src", "user": "u", "password": "p"},
+                {"host": "h", "port": 9000, "dbname": "tgt", "user": "default", "password": ""},
+                tc, sync_cfg,
+            )
+
+            mock_purge.assert_called_once()
+            purge_ts_col = mock_purge.call_args[0][3]
+            assert purge_ts_col == "created_at"  # ts_col, not wm_col
+
+    def test_fallback_to_timestamp_column_when_watermark_column_not_set(self):
+        """watermark_column 미설정 시 timestamp_column 으로 fallback."""
+        job = self._make_job()
+        ch = MagicMock()
+        ch.execute.side_effect = [
+            None,  # _ensure_ch_table
+            None,  # _ensure_watermark_table
+            [("2025-06-01T00:00:00",)],  # _get_watermark
+        ]
+
+        pg_conn = MagicMock()
+        tc = {
+            "source_table": "public.events",
+            "target_table": "default.events",
+            "timestamp_column": "created_at",
+            # watermark_column 미설정
+            "order_by": ["created_at"],
+            "engine": "MergeTree",
+        }
+        sync_cfg = {"source": "pg_src"}
+
+        with (
+            patch.object(job, "_pg_connect", return_value=pg_conn),
+            patch.object(job, "_ch_connect", return_value=ch),
+            patch.object(job, "_get_pg_columns", return_value=self.PG_COLS),
+        ):
+            stream_cursor = MagicMock()
+            stream_cursor.fetchmany.return_value = []
+            pg_conn.cursor.return_value = stream_cursor
+
+            job._sync_table(
+                {"host": "h", "port": 5432, "dbname": "src", "user": "u", "password": "p"},
+                {"host": "h", "port": 9000, "dbname": "tgt", "user": "default", "password": ""},
+                tc, sync_cfg,
+            )
+
+            query = stream_cursor.execute.call_args[0][0]
+            # fallback: created_at 이 워터마크 컬럼으로 사용됨
+            assert '"created_at" > %s' in query
+
+    def test_full_copy_orders_by_watermark_column(self):
+        """Full copy 모드에서 ORDER BY 는 watermark_column 사용."""
+        job = self._make_job()
+        ch = MagicMock()
+        ch.execute.return_value = []  # no watermark → full copy
+
+        pg_conn = MagicMock()
+        tc = {
+            "source_table": "public.events",
+            "target_table": "default.events",
+            "timestamp_column": "created_at",
+            "watermark_column": "sync_id",
+            "order_by": ["sync_id"],
+            "engine": "MergeTree",
+        }
+        sync_cfg = {"source": "pg_src"}
+
+        with (
+            patch.object(job, "_pg_connect", return_value=pg_conn),
+            patch.object(job, "_ch_connect", return_value=ch),
+            patch.object(job, "_get_pg_columns", return_value=self.PG_COLS),
+        ):
+            stream_cursor = MagicMock()
+            stream_cursor.fetchmany.return_value = []
+            pg_conn.cursor.return_value = stream_cursor
+
+            job._sync_table(
+                {"host": "h", "port": 5432, "dbname": "src", "user": "u", "password": "p"},
+                {"host": "h", "port": 9000, "dbname": "tgt", "user": "default", "password": ""},
+                tc, sync_cfg,
+            )
+
+            query = stream_cursor.execute.call_args[0][0]
+            assert 'ORDER BY "sync_id"' in query

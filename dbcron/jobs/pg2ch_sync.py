@@ -567,6 +567,7 @@ class Pg2ChSyncJob(Job):
         src_table: str = tc["source_table"]
         tgt_table: str = tc["target_table"]
         ts_col: str | None = tc.get("timestamp_column")
+        wm_col: str | None = tc.get("watermark_column") or ts_col
         raw_since: str | None = tc.get("sync_since")
         sync_since: str | None = _resolve_sync_since(raw_since) if raw_since else None
         drop_cols = set(tc.get("drop_columns", []))
@@ -624,7 +625,7 @@ class Pg2ChSyncJob(Job):
             # 4) 동기화 모드 결정
             self._ensure_watermark_table(ch, tgt_db)
             wm_key = f"{sync_cfg['source']}.{src_table}"
-            watermark = self._get_watermark(ch, tgt_db, wm_key, ts_col) if ts_col else None
+            watermark = self._get_watermark(ch, tgt_db, wm_key, wm_col) if wm_col else None
 
             if watermark:
                 cutoff = watermark
@@ -637,15 +638,26 @@ class Pg2ChSyncJob(Job):
                     except (ValueError, TypeError):
                         pass  # 정수형 watermark — overlap 미적용
 
-                # sync_since 가 watermark 보다 크면 sync_since 우선
-                if sync_since and sync_since > cutoff:
-                    cutoff = sync_since
+                # WHERE 절 구성
+                conditions = [f'"{wm_col}" > %s']
+                params_list: list = [cutoff]
 
+                if sync_since and ts_col:
+                    if ts_col == wm_col:
+                        # 동일 컬럼: sync_since 가 cutoff 보다 크면 대체
+                        if sync_since > cutoff:
+                            params_list[0] = sync_since
+                    else:
+                        # 별도 컬럼: timestamp 필터 추가
+                        conditions.append(f'"{ts_col}" >= %s')
+                        params_list.append(sync_since)
+
+                where = " AND ".join(conditions)
                 query = (
                     f'SELECT {col_list_pg} FROM "{src_schema}"."{src_name}" '
-                    f'WHERE "{ts_col}" > %s ORDER BY "{ts_col}"'
+                    f'WHERE {where} ORDER BY "{wm_col}"'
                 )
-                params: tuple | None = (cutoff,)
+                params: tuple | None = tuple(params_list)
                 self.logger.info(
                     "%s: incremental from %s (overlap %dm)",
                     src_table,
@@ -660,7 +672,7 @@ class Pg2ChSyncJob(Job):
                 query = (
                     f'SELECT {col_list_pg} FROM "{src_schema}"."{src_name}"'
                 )
-                if sync_since:
+                if sync_since and ts_col:
                     query += f' WHERE "{ts_col}" >= %s'
                     params = (sync_since,)
                     self.logger.info(
@@ -668,8 +680,9 @@ class Pg2ChSyncJob(Job):
                     )
                 else:
                     params = None
-                if ts_col:
-                    query += f' ORDER BY "{ts_col}"'
+                order_col = wm_col or ts_col
+                if order_col:
+                    query += f' ORDER BY "{order_col}"'
 
             # 5) 스트리밍 전송
             transformer = self._build_transformer(ch_columns)
@@ -689,8 +702,8 @@ class Pg2ChSyncJob(Job):
             total_rows = 0
             max_wm = None
             wm_idx = (
-                col_names.index(ts_col)
-                if ts_col and ts_col in col_names
+                col_names.index(wm_col)
+                if wm_col and wm_col in col_names
                 else None
             )
 
@@ -718,8 +731,8 @@ class Pg2ChSyncJob(Job):
             pg_conn.rollback()  # read 트랜잭션 정리
 
             # 6) Watermark 저장
-            if ts_col and max_wm is not None:
-                self._save_watermark(ch, tgt_db, wm_key, ts_col, max_wm)
+            if wm_col and max_wm is not None:
+                self._save_watermark(ch, tgt_db, wm_key, wm_col, max_wm)
                 self.logger.info("%s: watermark → %s", src_table, max_wm)
 
             # 7) Source retention purge
