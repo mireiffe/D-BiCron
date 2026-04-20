@@ -234,6 +234,52 @@ class TestBuildTransformer:
         assert fn(("3.14",)) == (3.14,)
         assert fn((None,)) == (None,)
 
+    def test_numeric_to_int_override(self):
+        """PG numeric (Decimal) overridden to Int64 should cast Decimal → int."""
+        from decimal import Decimal
+
+        columns = [{"name": "n", "pg_type": "numeric", "ch_type": "Int64"}]
+        fn = Pg2ChSyncJob._build_transformer(columns)
+        assert fn is not None
+        assert fn((Decimal("42"),)) == (42,)
+        assert fn((Decimal("1.7"),)) == (1,)  # truncates toward zero
+        assert fn((None,)) == (0,)  # non-nullable null coerce
+
+    def test_numeric_to_nullable_int_override(self):
+        """PG numeric → Nullable(Int64) should cast Decimal → int, pass None."""
+        from decimal import Decimal
+
+        columns = [{"name": "n", "pg_type": "numeric", "ch_type": "Nullable(Int64)"}]
+        fn = Pg2ChSyncJob._build_transformer(columns)
+        assert fn is not None
+        assert fn((Decimal("42"),)) == (42,)
+        assert fn((None,)) == (None,)
+
+    def test_numeric_to_float_override(self):
+        """PG numeric overridden to Float64 should cast Decimal → float."""
+        from decimal import Decimal
+
+        columns = [{"name": "x", "pg_type": "numeric", "ch_type": "Float64"}]
+        fn = Pg2ChSyncJob._build_transformer(columns)
+        assert fn is not None
+        assert fn((Decimal("3.14"),)) == (3.14,)
+
+    def test_numeric_to_decimal_passthrough(self):
+        """PG numeric → Decimal passes Decimal through (no value conversion)."""
+        from decimal import Decimal
+
+        columns = [{"name": "amt", "pg_type": "numeric", "ch_type": "Nullable(Decimal(18,4))"}]
+        fn = Pg2ChSyncJob._build_transformer(columns)
+        # Nullable: no null coerce, no value transform → None returned
+        assert fn is None
+
+        # Non-nullable: null coerce to 0, but Decimal passes through unchanged
+        columns = [{"name": "amt", "pg_type": "numeric", "ch_type": "Decimal(18,4)"}]
+        fn = Pg2ChSyncJob._build_transformer(columns)
+        assert fn is not None
+        assert fn((Decimal("123.45"),)) == (Decimal("123.45"),)
+        assert fn((None,)) == (0,)
+
 
 # ── 6. run() validation ─────────────────────────────────────────
 
