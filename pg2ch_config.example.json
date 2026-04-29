@@ -1,5 +1,6 @@
 {
   "_comment": "PostgreSQL → ClickHouse 동기화 설정. source/target 은 databases.json 의 DB ID",
+  "_label": "shop orders",
   "source": "my_postgres",
   "target": "my_clickhouse",
   "ch_native_port": 9000,

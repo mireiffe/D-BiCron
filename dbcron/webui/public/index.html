@@ -927,6 +927,62 @@ let jobsCache = [];
 function openCronGuide() { document.getElementById("cron-guide-modal").style.display = ""; }
 function closeCronGuide() { document.getElementById("cron-guide-modal").style.display = "none"; }
 
+// Config dropdown cache: defaultPath → [{path, label}]
+const configCandidatesCache = {};
+async function loadConfigCandidates(defaultPath) {
+  if (configCandidatesCache[defaultPath]) return configCandidatesCache[defaultPath];
+  try {
+    const list = await api("/api/configs?default=" + encodeURIComponent(defaultPath));
+    configCandidatesCache[defaultPath] = list;
+    return list;
+  } catch {
+    return [];
+  }
+}
+function configOptionLabel(c) { return c.label ? "[" + c.label + "] " + c.path : c.path; }
+
+async function populateConfigSelect(sel, defaultPath, currentValue) {
+  const list = await loadConfigCandidates(defaultPath);
+  clearEl(sel);
+  let foundCurrent = false;
+  for (const c of list) {
+    const opt = makeEl("option", { value: c.path }, configOptionLabel(c));
+    if (c.path === currentValue) { opt.selected = true; foundCurrent = true; }
+    sel.appendChild(opt);
+  }
+  if (currentValue && !foundCurrent) {
+    const opt = makeEl("option", { value: currentValue }, currentValue);
+    opt.selected = true;
+    sel.appendChild(opt);
+  }
+  if (!sel.options.length) {
+    const opt = makeEl("option", { value: defaultPath }, defaultPath);
+    sel.appendChild(opt);
+  }
+}
+
+function makeArgInput(key, def, currentVal, idAttr, widthHint) {
+  const val = currentVal != null ? currentVal : def;
+  if (key === "config" && typeof def === "string") {
+    const attrs = { style: "width:" + (widthHint === "wide" ? "240px" : "200px") };
+    if (idAttr) attrs.id = idAttr;
+    const sel = makeEl("select", attrs);
+    sel.appendChild(makeEl("option", { value: String(val) }, String(val)));
+    populateConfigSelect(sel, def, val);
+    return { el: sel, isNum: false };
+  }
+  const isNum = typeof def === "number";
+  const attrs = {
+    type: isNum ? "number" : "text",
+    value: String(val),
+    style: isNum ? "width:60px" : ("width:" + (widthHint === "wide" ? "160px" : "120px")),
+  };
+  if (idAttr) attrs.id = idAttr;
+  const inp = makeEl("input", attrs);
+  if (isNum) inp.min = "1";
+  return { el: inp, isNum };
+}
+
 function updateSchedArgs(restoreArgs) {
   const sel = document.getElementById("sched-job");
   const container = document.getElementById("sched-args-container");
@@ -934,18 +990,11 @@ function updateSchedArgs(restoreArgs) {
   const j = jobsCache.find(j => j.name === sel.value);
   if (!j || !j.defaultArgs) return;
   for (const [key, def] of Object.entries(j.defaultArgs)) {
-    const isNum = typeof def === "number";
     const val = restoreArgs && key in restoreArgs ? restoreArgs[key] : def;
-    const input = makeEl("input", {
-      type: isNum ? "number" : "text",
-      value: String(val),
-      id: "sched-arg-" + key,
-      style: isNum ? "width:60px" : "width:160px",
-    });
-    if (isNum) input.min = "1";
+    const { el } = makeArgInput(key, def, val, "sched-arg-" + key, "wide");
     container.appendChild(makeEl("div", { className: "field" }, [
       makeEl("span", { className: "field-label" }, key),
-      input,
+      el,
     ]));
   }
 }
@@ -1158,9 +1207,7 @@ async function loadJobs() {
     const actions = [];
     if (j.defaultArgs) {
       for (const [key, def] of Object.entries(j.defaultArgs)) {
-        const isNum = typeof def === "number";
-        const input = makeEl("input", { type: isNum ? "number" : "text", value: String(def), style: isNum ? "" : "width:120px" });
-        if (isNum) input.min = "1";
+        const { el: input, isNum } = makeArgInput(key, def, def, null, "card");
         argInputs[key] = { input, isNum, def };
         actions.push(makeEl("div", { className: "field-inline" }, [makeEl("label", null, key), input]));
       }
@@ -1286,10 +1333,20 @@ async function deleteSchedule(id) {
   loadSchedules();
 }
 
+const HISTORY_PAGE_SIZE = 100;
+let historyDisplayLimit = HISTORY_PAGE_SIZE;
+let historyObserver = null;
+
 async function loadHistory() {
-  const [running, list] = await Promise.all([api("/api/running"), api("/api/history")]);
+  const [running, page] = await Promise.all([
+    api("/api/running"),
+    api("/api/history?limit=" + historyDisplayLimit),
+  ]);
+  const total = page.total ?? 0;
+  const list = page.entries || [];
   const el = document.getElementById("history-list");
-  document.getElementById("history-count").textContent = running.length + list.length;
+  document.getElementById("history-count").textContent = running.length + total;
+  if (historyObserver) { historyObserver.disconnect(); historyObserver = null; }
   clearEl(el);
   if (!running.length && !list.length) { el.appendChild(makeEl("div", { className: "empty" }, "No runs yet")); return; }
 
@@ -1350,6 +1407,23 @@ async function loadHistory() {
     makeEl("thead", null, [makeEl("tr", null, [makeEl("th", null, "Job"), makeEl("th", null, "PID"), makeEl("th", null, "Status"), makeEl("th", null, "Output"), makeEl("th", null, "Time"), makeEl("th")])]),
     makeEl("tbody", null, [...runningRows, ...historyRows]),
   ]));
+
+  const remaining = total - list.length;
+  if (remaining > 0) {
+    const sentinel = makeEl("div", {
+      style: "padding:14px;text-align:center;color:var(--text-dim);font-size:11px;letter-spacing:1px",
+    }, "Loading more... (" + remaining + " remaining)");
+    el.appendChild(sentinel);
+    historyObserver = new IntersectionObserver((entries) => {
+      if (entries[0].isIntersecting) {
+        historyObserver.disconnect();
+        historyObserver = null;
+        historyDisplayLimit += HISTORY_PAGE_SIZE;
+        loadHistory();
+      }
+    }, { rootMargin: "300px" });
+    historyObserver.observe(sentinel);
+  }
 }
 
 async function loadTimeline() {

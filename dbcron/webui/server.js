@@ -553,9 +553,54 @@ app.delete("/api/running/:id", (req, res) => {
   res.json({ killed: r.runId, pid: r.pid });
 });
 
-// Run history
-app.get("/api/history", (_req, res) => {
-  res.json(runHistory);
+// Run history (supports ?limit=N&offset=M for lazy loading)
+app.get("/api/history", (req, res) => {
+  const limit = Number(req.query.limit) || 0;
+  const offset = Number(req.query.offset) || 0;
+  if (limit > 0) {
+    const slice = runHistory.slice(offset, offset + limit);
+    res.json({ total: runHistory.length, offset, limit, entries: slice });
+  } else {
+    res.json(runHistory);
+  }
+});
+
+// List candidate config files for a job's "config" arg.
+// Query: ?default=pg2ch_config.json
+// Returns: [{ path, label }] — files matching the same family prefix in PROJECT_ROOT.
+app.get("/api/configs", (req, res) => {
+  const defaultPath = String(req.query.default || "");
+  if (!defaultPath || !defaultPath.endsWith(".json")) {
+    return res.status(400).json({ error: "default param required and must end with .json" });
+  }
+  const baseName = path.basename(defaultPath);
+  const familyMatch = baseName.match(/^(.+?)_config\.json$/);
+  const family = familyMatch ? familyMatch[1] + "_" : baseName.replace(/\.json$/, "_");
+
+  const candidates = [];
+  try {
+    const entries = fs.readdirSync(PROJECT_ROOT);
+    for (const f of entries) {
+      if (!f.endsWith(".json")) continue;
+      if (f.endsWith(".example.json")) continue;
+      if (f !== baseName && !f.startsWith(family)) continue;
+      let label = null;
+      try {
+        const content = JSON.parse(fs.readFileSync(path.join(PROJECT_ROOT, f), "utf-8"));
+        if (content && typeof content._label === "string") label = content._label;
+      } catch {}
+      candidates.push({ path: f, label });
+    }
+  } catch (err) {
+    console.warn("Failed to scan configs:", err.message);
+  }
+  // Default file first, then alpha
+  candidates.sort((a, b) => {
+    if (a.path === baseName) return -1;
+    if (b.path === baseName) return 1;
+    return a.path.localeCompare(b.path);
+  });
+  res.json(candidates);
 });
 
 // SSE: real-time event stream for job state changes

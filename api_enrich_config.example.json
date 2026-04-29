@@ -1,4 +1,5 @@
 {
+  "_label": "product classifier",
   "source": "my_postgres",
   "target": "my_clickhouse",
   "api": {

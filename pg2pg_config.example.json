@@ -1,5 +1,6 @@
 {
   "_comment": "PostgreSQL → PostgreSQL 동기화 설정. source/target 은 databases.json 의 DB ID",
+  "_label": "main mirror",
   "source": "my_source_pg",
   "target": "my_target_pg",
   "defaults": {

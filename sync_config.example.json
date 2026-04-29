@@ -1,5 +1,6 @@
 {
   "_comment": "source/target 에 databases.json 의 DB ID(문자열) 또는 인라인 접속 정보(dict) 지정",
+  "_label": "device telemetry",
   "source": "source_db_id",
   "target": "target_db_id",
   "tables": [
