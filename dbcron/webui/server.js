@@ -4,12 +4,37 @@ const fs = require("fs");
 const { spawn, execFile, execFileSync } = require("child_process");
 const path = require("path");
 
+const PROJECT_ROOT = path.resolve(__dirname, "../..");
+
+function loadEnvFile(filePath) {
+  try {
+    const raw = fs.readFileSync(filePath, "utf-8");
+    for (const line of raw.split(/\r?\n/)) {
+      const trimmed = line.trim();
+      if (!trimmed || trimmed.startsWith("#")) continue;
+      const match = trimmed.match(/^(?:export\s+)?([A-Za-z_][A-Za-z0-9_]*)\s*=\s*(.*)$/);
+      if (!match) continue;
+      const [, key, rawValue] = match;
+      if (process.env[key] != null) continue;
+      let value = rawValue.trim();
+      const quote = value[0];
+      if ((quote === '"' || quote === "'") && value[value.length - 1] === quote) {
+        value = value.slice(1, -1);
+      } else {
+        value = value.replace(/\s+#.*$/, "");
+      }
+      process.env[key] = value;
+    }
+  } catch {}
+}
+
+loadEnvFile(path.join(PROJECT_ROOT, ".env"));
+
 const app = express();
 app.use(express.json());
 app.use(express.static(path.join(__dirname, "public")));
 
 const PORT = process.env.PORT || 3999;
-const PROJECT_ROOT = path.resolve(__dirname, "../..");
 const WEBHOOK_URL = process.env.WEBHOOK_URL || "";
 const JOB_TIMEOUT_MS = Number(process.env.JOB_TIMEOUT_MS) || 30 * 60_000; // 30min default
 const JOB_MAX_RETRIES = Number(process.env.JOB_MAX_RETRIES) || 0; // 0 = no retry
@@ -38,8 +63,23 @@ const SCHEDULES_FILE = path.join(DATA_DIR, "schedules.json");
 const RUNNING_FILE = path.join(DATA_DIR, "running.json");
 const HISTORY_FILE = path.join(DATA_DIR, "history.json");
 const DATABASES_FILE = path.join(DATA_DIR, "databases.json");
-const HISTORY_RETENTION_MS =
-  (Number(process.env.HISTORY_RETENTION_HOURS) || 168) * 3600_000;
+const DEFAULT_HISTORY_RETENTION_HOURS = 168;
+
+function readHistoryRetentionHours() {
+  const raw =
+    process.env.HISTORY_RETENTION_HOURS ??
+    process.env.History_retention_hours ??
+    process.env.history_retention_hours;
+  const hours = Number(raw);
+  if (raw != null && Number.isFinite(hours) && hours > 0) return hours;
+  if (raw != null) {
+    console.warn(`Invalid HISTORY_RETENTION_HOURS=${raw}; using ${DEFAULT_HISTORY_RETENTION_HOURS}h`);
+  }
+  return DEFAULT_HISTORY_RETENTION_HOURS;
+}
+
+const HISTORY_RETENTION_HOURS = readHistoryRetentionHours();
+const HISTORY_RETENTION_MS = HISTORY_RETENTION_HOURS * 3600_000;
 
 function loadSchedules() {
   try {
@@ -77,10 +117,15 @@ function saveHistory() {
 function pruneHistory() {
   const cutoff = Date.now() - HISTORY_RETENTION_MS;
   const before = runHistory.length;
-  while (runHistory.length && new Date(runHistory[runHistory.length - 1].finishedAt).getTime() < cutoff) {
-    runHistory.pop();
+  const retained = runHistory.filter((entry) => {
+    const finishedAt = Date.parse(entry?.finishedAt || "");
+    return !Number.isFinite(finishedAt) || finishedAt >= cutoff;
+  });
+  if (retained.length !== before) {
+    runHistory.length = 0;
+    runHistory.push(...retained);
+    saveHistory();
   }
-  if (runHistory.length !== before) saveHistory();
 }
 
 function loadRunning() {
@@ -136,7 +181,7 @@ if (persistedRunning.jobs.length) {
   saveRunning();
 }
 pruneHistory();
-console.log(`Loaded ${runHistory.length} history entry(ies), retention ${process.env.HISTORY_RETENTION_HOURS || 168}h`);
+console.log(`Loaded ${runHistory.length} history entry(ies), retention ${HISTORY_RETENTION_HOURS}h`);
 
 // Restore persisted schedules
 const persisted = loadSchedules();
@@ -292,6 +337,7 @@ function startJob(jobName, args = {}, _retryCount = 0, _scheduleId = null, _targ
       success: false, stdout: "", stderr: err.message,
       finishedAt: new Date().toISOString(),
     });
+    pruneHistory();
     saveHistory();
   });
 
@@ -312,6 +358,7 @@ function startJob(jobName, args = {}, _retryCount = 0, _scheduleId = null, _targ
       retryCount: _retryCount,
     };
     runHistory.unshift(entry);
+    pruneHistory();
     saveHistory();
     broadcastSSE("job_complete", { runId, jobName, scheduleId: _scheduleId, success: entry.success });
 
@@ -366,6 +413,7 @@ app.get("/api/jobs", (_req, res) => {
 
 // Job statistics derived from history
 app.get("/api/jobs/stats", (_req, res) => {
+  pruneHistory();
   const stats = {};
   for (const h of runHistory) {
     if (!stats[h.jobName]) {
@@ -555,6 +603,7 @@ app.delete("/api/running/:id", (req, res) => {
 
 // Run history (supports ?limit=N&offset=M for lazy loading)
 app.get("/api/history", (req, res) => {
+  pruneHistory();
   const limit = Number(req.query.limit) || 0;
   const offset = Number(req.query.offset) || 0;
   if (limit > 0) {
@@ -828,6 +877,7 @@ app.get("/api/metadata/drift", (_req, res) => {
 
 // Timeline: merged history + drift events
 app.get("/api/timeline", (_req, res) => {
+  pruneHistory();
   const events = [];
   // Job runs
   for (const h of runHistory) {
@@ -1011,6 +1061,8 @@ app.get("/api/pipeline-config", (_req, res) => {
 // Resolves each schedule's target DB/tables and current state
 // -------------------------------------------------------------------
 app.get("/api/schedule-status", (_req, res) => {
+  pruneHistory();
+
   // Build job scope lookup from AVAILABLE_JOBS
   const jobScopeMap = {};
   for (const j of AVAILABLE_JOBS) {
@@ -1121,4 +1173,3 @@ setInterval(pruneHistory, 3600_000);
 app.listen(PORT, "0.0.0.0", () => {
   console.log(`db_manager WebUI running on http://0.0.0.0:${PORT}`);
 });
-

@@ -116,9 +116,16 @@ def server_url():
     with open(os.path.join(data_dir, "schedules.json"), "w") as f:
         json.dump({"nextId": 1, "schedules": []}, f)
 
-    # history.json — empty
+    # history.json — seeded out of order to verify retention pruning scans all entries
+    recent_finished_at = time.strftime("%Y-%m-%dT%H:%M:%S.000Z", time.gmtime(time.time() - 3600))
+    old_finished_at = time.strftime("%Y-%m-%dT%H:%M:%S.000Z", time.gmtime(time.time() - 25 * 3600))
+    history_seed = [
+        {"runId": -1, "jobName": "seed_recent_a", "args": {}, "success": True, "stdout": "", "stderr": "", "finishedAt": recent_finished_at},
+        {"runId": -2, "jobName": "seed_expired_middle", "args": {}, "success": True, "stdout": "", "stderr": "", "finishedAt": old_finished_at},
+        {"runId": -3, "jobName": "seed_recent_b", "args": {}, "success": True, "stdout": "", "stderr": "", "finishedAt": recent_finished_at},
+    ]
     with open(os.path.join(data_dir, "history.json"), "w") as f:
-        json.dump([], f)
+        json.dump(history_seed, f)
 
     # running.json — empty
     with open(os.path.join(data_dir, "running.json"), "w") as f:
@@ -181,9 +188,9 @@ def server_url():
     mirror_root = os.path.join(tmp_dir, "project")
     os.makedirs(mirror_root, exist_ok=True)
 
-    # Symlink all top-level entries except data/
+    # Symlink all top-level entries except data/ and .env
     for entry in os.listdir(str(PROJECT_ROOT)):
-        if entry == "data":
+        if entry in ("data", ".env"):
             continue
         src = os.path.join(str(PROJECT_ROOT), entry)
         dst = os.path.join(mirror_root, entry)
@@ -192,6 +199,8 @@ def server_url():
 
     # Symlink our temp data dir as mirror_root/data
     os.symlink(data_dir, os.path.join(mirror_root, "data"))
+    with open(os.path.join(mirror_root, ".env"), "w") as f:
+        f.write("History_retention_hours=24\n")
 
     # The server resolves PROJECT_ROOT = path.resolve(__dirname, "../..").
     # __dirname = mirror_root/dbcron/webui (via symlink to real webui dir).
@@ -723,7 +732,11 @@ class TestPipelineCanvas:
         """GET /api/history returns 200 with an array."""
         r = client.get("/api/history")
         assert r.status_code == 200
-        assert isinstance(r.json(), list)
+        body = r.json()
+        assert isinstance(body, list)
+        run_ids = {entry["runId"] for entry in body}
+        assert -2 not in run_ids
+        assert {-1, -3}.issubset(run_ids)
 
     def test_events_sse(self, client: httpx.Client):
         """GET /api/events returns SSE stream with correct content-type."""
