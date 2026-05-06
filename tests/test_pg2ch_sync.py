@@ -904,6 +904,67 @@ class TestSourceRetentionIntegration:
             assert call_args[0][1] == "public"
             assert call_args[0][2] == "orders"
             assert call_args[0][3] == "updated_at"
+            assert call_args.kwargs["batch_size"] == 10_000
+
+    def test_source_retention_batch_size_overrides_default_cap(self):
+        """source_retention_batch_size 설정 시 10000 cap 대신 해당 값을 사용."""
+        job = self._make_job()
+        ch = MagicMock()
+        ch.execute.return_value = []  # watermark 없음
+
+        pg_conn = MagicMock()
+        pg_cols = [
+            {"name": "id", "pg_type": "integer", "nullable": False, "precision": None, "scale": None},
+            {"name": "updated_at", "pg_type": "timestamp without time zone", "nullable": False, "precision": None, "scale": None},
+        ]
+
+        tc = {
+            "source_table": "public.orders",
+            "target_table": "default.orders",
+            "timestamp_column": "updated_at",
+            "sync_since": "90d",
+            "source_retention": "180d",
+            "source_retention_batch_size": 50_000,
+            "batch_size": 100_000,
+            "order_by": ["id"],
+            "engine": "ReplacingMergeTree",
+        }
+        sync_cfg = {"source": "pg_src"}
+
+        with (
+            patch.object(job, "_pg_connect", return_value=pg_conn),
+            patch.object(job, "_ch_connect", return_value=ch),
+            patch.object(job, "_get_pg_columns", return_value=pg_cols),
+            patch.object(job, "_purge_source", return_value=42) as mock_purge,
+        ):
+            stream_cursor = MagicMock()
+            stream_cursor.fetchmany.return_value = []
+            pg_conn.cursor.return_value = stream_cursor
+
+            job._sync_table(
+                {"host": "h", "port": 5432, "dbname": "src", "user": "u", "password": "p"},
+                {"host": "h", "port": 9000, "dbname": "tgt", "user": "default", "password": ""},
+                tc, sync_cfg,
+            )
+
+            assert mock_purge.call_args.kwargs["batch_size"] == 50_000
+
+    def test_invalid_source_retention_batch_size_raises(self):
+        """source_retention_batch_size 는 양의 정수만 허용."""
+        job = self._make_job()
+        tc = {
+            "source_table": "public.orders",
+            "target_table": "default.orders",
+            "timestamp_column": "updated_at",
+            "sync_since": "90d",
+            "source_retention": "180d",
+            "source_retention_batch_size": 0,
+            "order_by": ["id"],
+            "engine": "ReplacingMergeTree",
+        }
+
+        with pytest.raises(ValueError, match="source_retention_batch_size"):
+            job._sync_table({}, {}, tc, {"source": "pg_src"})
 
     def test_no_purge_when_retention_not_set(self):
         """source_retention 미설정 시 _purge_source 미호출."""

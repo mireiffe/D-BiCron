@@ -15,6 +15,7 @@ PG 소스에서 CH 타겟으로 테이블 데이터를 동기화합니다.
   - Watermark 기반 증분 동기화 (timestamp / integer 모두 지원)
   - sync_since: timestamp_column 기반 하한 필터 (full copy / incremental 공통)
   - use_nullable: false 설정 시 PG nullable 컬럼을 CH Nullable 대신 기본값으로 대체
+  - source_retention_batch_size: source_retention 삭제 배치 크기 조절
 
 설정:
   PG2CH_CONFIG 환경변수로 JSON 설정 파일 경로 지정 (기본: pg2ch_config.json)
@@ -590,6 +591,7 @@ class Pg2ChSyncJob(Job):
         overlap_min: int = tc.get("overlap_minutes", 0)
         use_nullable: bool = tc.get("use_nullable", True)
         raw_retention: str | None = tc.get("source_retention")
+        purge_batch_size = min(batch_size, 10_000)
 
         if sync_since and not ts_col:
             raise ValueError(
@@ -599,6 +601,20 @@ class Pg2ChSyncJob(Job):
         if raw_retention:
             _validate_source_retention(src_table, raw_retention, raw_since, ts_col)
             retention_cutoff = _resolve_sync_since(raw_retention)
+            raw_purge_batch_size = tc.get("source_retention_batch_size")
+            if raw_purge_batch_size is not None:
+                try:
+                    purge_batch_size = int(raw_purge_batch_size)
+                except (TypeError, ValueError) as e:
+                    raise ValueError(
+                        f"{src_table}: source_retention_batch_size must be "
+                        "a positive integer"
+                    ) from e
+                if purge_batch_size <= 0:
+                    raise ValueError(
+                        f"{src_table}: source_retention_batch_size must be "
+                        "a positive integer"
+                    )
         else:
             retention_cutoff = None
 
@@ -760,7 +776,7 @@ class Pg2ChSyncJob(Job):
                     src_name,
                     ts_col,
                     retention_cutoff,
-                    batch_size=min(batch_size, 10_000),
+                    batch_size=purge_batch_size,
                 )
                 self.logger.info(
                     "%s: purged %d source rows", src_table, purged_rows

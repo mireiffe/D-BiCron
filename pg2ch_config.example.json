@@ -7,6 +7,7 @@
   "defaults": {
     "engine": "ReplacingMergeTree",
     "batch_size": 100000,
+    "source_retention_batch_size": 10000,
     "overlap_minutes": 0
   },
   "tables": [
