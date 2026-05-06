@@ -582,6 +582,28 @@ class TestRunning:
         assert r.status_code == 404
         assert "error" in r.json()
 
+    def test_run_history_includes_config_label(self, client: httpx.Client, tmp_path):
+        """Runs with a JSON config include that config's _label in API output."""
+        cfg_path = tmp_path / "labeled_config.json"
+        cfg_path.write_text(json.dumps({"_label": "Nightly Orders"}))
+
+        r = client.post("/api/jobs/pg2ch_sync/run", json={"config": str(cfg_path)})
+        assert r.status_code == 200
+        run_id = r.json()["runId"]
+
+        entry = None
+        deadline = time.monotonic() + 5
+        while time.monotonic() < deadline:
+            history = client.get("/api/history").json()
+            entry = next((h for h in history if h["runId"] == run_id), None)
+            if entry:
+                break
+            time.sleep(0.2)
+
+        assert entry is not None
+        assert entry["configPath"] == str(cfg_path)
+        assert entry["configLabel"] == "Nightly Orders"
+
 
 # ===================================================================
 # DATABASES

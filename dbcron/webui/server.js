@@ -274,6 +274,42 @@ function getAllCachedConnections() {
 // -------------------------------------------------------------------
 // Helpers
 // -------------------------------------------------------------------
+const configLabelCache = new Map();
+
+function resolveConfigPath(configPath) {
+  if (!configPath || typeof configPath !== "string" || !configPath.endsWith(".json")) return null;
+  return path.isAbsolute(configPath) ? configPath : path.join(PROJECT_ROOT, configPath);
+}
+
+function readConfigLabel(configPath) {
+  const resolved = resolveConfigPath(configPath);
+  if (!resolved) return null;
+  try {
+    const stat = fs.statSync(resolved);
+    const cached = configLabelCache.get(resolved);
+    if (cached && cached.mtimeMs === stat.mtimeMs) return cached.label;
+
+    const content = JSON.parse(fs.readFileSync(resolved, "utf-8"));
+    const label = typeof content?._label === "string" && content._label.trim()
+      ? content._label.trim()
+      : null;
+    configLabelCache.set(resolved, { mtimeMs: stat.mtimeMs, label });
+    return label;
+  } catch {
+    configLabelCache.delete(resolved);
+    return null;
+  }
+}
+
+function configMetaForArgs(args = {}) {
+  const configPath = typeof args.config === "string" ? args.config : null;
+  return { configPath, configLabel: readConfigLabel(configPath) };
+}
+
+function withConfigMeta(entry) {
+  return { ...entry, ...configMetaForArgs(entry.args || {}) };
+}
+
 function isJobRunning(jobName, args = {}) {
   for (const [, r] of runningJobs) {
     if (r.jobName !== jobName) continue;
@@ -573,7 +609,7 @@ app.delete("/api/schedules/:id", (req, res) => {
 app.get("/api/running", (_req, res) => {
   const list = [];
   for (const [, r] of runningJobs) {
-    list.push({ runId: r.runId, jobName: r.jobName, args: r.args, pid: r.pid, startedAt: r.startedAt, scheduleId: r.scheduleId || null, stdout: r.stdout, stderr: r.stderr });
+    list.push(withConfigMeta({ runId: r.runId, jobName: r.jobName, args: r.args, pid: r.pid, startedAt: r.startedAt, scheduleId: r.scheduleId || null, stdout: r.stdout, stderr: r.stderr }));
   }
   res.json(list);
 });
@@ -581,7 +617,7 @@ app.get("/api/running", (_req, res) => {
 app.get("/api/running/:id", (req, res) => {
   const r = runningJobs.get(Number(req.params.id));
   if (!r) return res.status(404).json({ error: "Not running" });
-  res.json({ runId: r.runId, jobName: r.jobName, args: r.args, pid: r.pid, startedAt: r.startedAt, scheduleId: r.scheduleId || null, stdout: r.stdout, stderr: r.stderr });
+  res.json(withConfigMeta({ runId: r.runId, jobName: r.jobName, args: r.args, pid: r.pid, startedAt: r.startedAt, scheduleId: r.scheduleId || null, stdout: r.stdout, stderr: r.stderr }));
 });
 
 // Kill a running job
@@ -607,10 +643,10 @@ app.get("/api/history", (req, res) => {
   const limit = Number(req.query.limit) || 0;
   const offset = Number(req.query.offset) || 0;
   if (limit > 0) {
-    const slice = runHistory.slice(offset, offset + limit);
+    const slice = runHistory.slice(offset, offset + limit).map(withConfigMeta);
     res.json({ total: runHistory.length, offset, limit, entries: slice });
   } else {
-    res.json(runHistory);
+    res.json(runHistory.map(withConfigMeta));
   }
 });
 
@@ -633,11 +669,7 @@ app.get("/api/configs", (req, res) => {
       if (!f.endsWith(".json")) continue;
       if (f.endsWith(".example.json")) continue;
       if (f !== baseName && !f.startsWith(family)) continue;
-      let label = null;
-      try {
-        const content = JSON.parse(fs.readFileSync(path.join(PROJECT_ROOT, f), "utf-8"));
-        if (content && typeof content._label === "string") label = content._label;
-      } catch {}
+      const label = readConfigLabel(f);
       candidates.push({ path: f, label });
     }
   } catch (err) {

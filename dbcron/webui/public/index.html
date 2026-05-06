@@ -323,6 +323,15 @@
       font-size: 11px; color: var(--cyan-dim); cursor: pointer;
     }
     .running-output:hover { color: var(--cyan); }
+    .run-job-cell { min-width: 170px; }
+    .run-job-main { display: flex; align-items: center; gap: 6px; flex-wrap: wrap; min-width: 0; }
+    .run-job-name { color: var(--text); white-space: nowrap; }
+    .config-label-badge {
+      display: inline-block; max-width: 180px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+      padding: 1px 7px; border-radius: 3px; border: 1px solid rgba(0, 229, 255, .35);
+      background: rgba(0, 229, 255, .08); color: var(--cyan);
+      font-family: var(--font-display); font-size: 10px; font-weight: 700; letter-spacing: .8px;
+    }
 
     .time-cell { white-space: nowrap; }
 
@@ -975,6 +984,19 @@ async function loadConfigCandidates(defaultPath) {
   }
 }
 function configOptionLabel(c) { return c.label ? c.label + " - " + c.path : c.path; }
+function runDisplayName(run) { return run.configLabel ? run.jobName + " - " + run.configLabel : run.jobName; }
+function makeRunJobCell(run) {
+  const children = [makeEl("span", { className: "run-job-name" }, run.jobName)];
+  if (run.configLabel) {
+    children.push(makeEl("span", {
+      className: "config-label-badge",
+      title: run.configPath ? run.configLabel + " (" + run.configPath + ")" : run.configLabel,
+    }, run.configLabel));
+  }
+  return makeEl("td", { className: "run-job-cell" }, [
+    makeEl("div", { className: "run-job-main" }, children),
+  ]);
+}
 
 async function populateConfigSelect(sel, defaultPath, currentValue) {
   const list = await loadConfigCandidates(defaultPath);
@@ -1075,7 +1097,7 @@ function openLogModal(h) {
   const modal = document.getElementById("log-modal");
   document.getElementById("log-modal-badge").className = `badge ${h.success ? "badge-ok" : "badge-fail"}`;
   document.getElementById("log-modal-badge").textContent = h.success ? "OK" : "FAIL";
-  document.getElementById("log-modal-job").textContent = h.jobName;
+  document.getElementById("log-modal-job").textContent = runDisplayName(h);
   document.getElementById("log-modal-time").textContent = new Date(h.finishedAt).toLocaleString();
   const content = document.getElementById("log-modal-content");
   content.className = "modal-log";
@@ -1091,7 +1113,7 @@ function openLiveLogModal(r) {
   const modal = document.getElementById("log-modal");
   document.getElementById("log-modal-badge").className = "badge badge-run";
   document.getElementById("log-modal-badge").textContent = "RUNNING";
-  document.getElementById("log-modal-job").textContent = r.jobName;
+  document.getElementById("log-modal-job").textContent = runDisplayName(r);
   document.getElementById("log-modal-time").textContent = new Date(r.startedAt).toLocaleString();
   const content = document.getElementById("log-modal-content");
   content.className = "modal-log modal-log-live";
@@ -1420,7 +1442,7 @@ async function loadHistory() {
       },
     }, "KILL");
     return makeEl("tr", { className: "running-row" }, [
-      makeEl("td", null, r.jobName),
+      makeRunJobCell(r),
       makePidCell(r.pid),
       makeEl("td", null, [makeEl("span", { className: "badge badge-run" }, [
         makeEl("span", { className: "spinner", style: "margin-right:4px;width:10px;height:10px;border-width:1.5px" }),
@@ -1436,7 +1458,7 @@ async function loadHistory() {
     const out = makeEl("td", { className: "output-cell", onClick: () => openLogModal(h) }, h.success ? (h.stdout || "-") : (h.stderr || "-"));
     out.title = "Click to view full log";
     return makeEl("tr", null, [
-      makeEl("td", null, h.jobName),
+      makeRunJobCell(h),
       makePidCell(h.pid),
       makeEl("td", null, [makeEl("span", { className: `badge ${h.success ? "badge-ok" : "badge-fail"}` }, h.success ? "OK" : "FAIL")]),
       out,
