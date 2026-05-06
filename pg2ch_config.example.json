@@ -8,7 +8,10 @@
     "engine": "ReplacingMergeTree",
     "batch_size": 100000,
     "source_retention_batch_size": 10000,
-    "overlap_minutes": 0
+    "overlap_minutes": 0,
+    "settings": {
+      "index_granularity": 8192
+    }
   },
   "tables": [
     {
@@ -19,7 +22,16 @@
       "source_retention": "180d",
       "engine": "ReplacingMergeTree(updated_at)",
       "order_by": ["id"],
+      "primary_key": ["id"],
       "partition_by": "toYYYYMM(created_at)",
+      "indexes": [
+        {
+          "name": "idx_status",
+          "column": "status",
+          "type": "set(1000)",
+          "granularity": 1
+        }
+      ],
       "drop_columns": ["internal_note", "debug_payload"],
       "column_overrides": {
         "status": "LowCardinality(String)",

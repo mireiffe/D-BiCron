@@ -10,7 +10,7 @@ PG 소스에서 CH 타겟으로 테이블 데이터를 동기화합니다.
 기능:
   - Column drop: 특정 소스 컬럼 제외
   - Column type override: LowCardinality, Decimal 등 CH 타입 직접 지정
-  - ORDER BY / PARTITION BY / ENGINE 설정
+  - ORDER BY / PRIMARY KEY / INDEX / PARTITION BY / ENGINE / SETTINGS 설정
   - 자동 테이블 생성 (CREATE TABLE IF NOT EXISTS)
   - Watermark 기반 증분 동기화 (timestamp / integer 모두 지원)
   - sync_since: timestamp_column 기반 하한 필터 (full copy / incremental 공통)
@@ -171,6 +171,122 @@ def _fmt_bytes(n: int) -> str:
     return f"{n:.1f} TB"
 
 
+def _quote_ch_identifier(name: str) -> str:
+    return f"`{name.replace('`', '``')}`"
+
+
+def _extract_ch_key_columns(expr: list[str] | tuple[str, ...] | str | None) -> set[str]:
+    if isinstance(expr, (list, tuple)):
+        return {str(col) for col in expr}
+    return set()
+
+
+def _format_ch_key_expr(expr: list[str] | tuple[str, ...] | str, *, name: str) -> str:
+    if isinstance(expr, str):
+        value = expr.strip()
+        if not value:
+            raise ValueError(f"{name} must not be empty")
+        return value
+    if isinstance(expr, (list, tuple)):
+        if not expr:
+            raise ValueError(f"{name} must not be empty")
+        return "(" + ", ".join(_quote_ch_identifier(str(col)) for col in expr) + ")"
+    raise ValueError(f"{name} must be a string or list of column names")
+
+
+def _format_ch_index_expr(index: dict) -> str:
+    if "expr" in index:
+        return str(index["expr"]).strip()
+    if "expression" in index:
+        return str(index["expression"]).strip()
+    if "column" in index:
+        return _quote_ch_identifier(str(index["column"]))
+    if "columns" in index:
+        columns = index["columns"]
+        if isinstance(columns, str):
+            return _quote_ch_identifier(columns)
+        if isinstance(columns, (list, tuple)) and columns:
+            quoted = ", ".join(_quote_ch_identifier(str(col)) for col in columns)
+            return f"({quoted})" if len(columns) > 1 else quoted
+    raise ValueError("index must define expr, expression, column, or columns")
+
+
+def _format_ch_index(index: dict | str) -> str:
+    if isinstance(index, str):
+        clause = index.strip()
+        if not clause:
+            raise ValueError("index clause must not be empty")
+        return clause if clause.upper().startswith("INDEX ") else f"INDEX {clause}"
+
+    if not isinstance(index, dict):
+        raise ValueError("index must be a string or object")
+
+    missing = [key for key in ("name", "type", "granularity") if key not in index]
+    if missing:
+        raise ValueError(f"index missing required field(s): {', '.join(missing)}")
+
+    expr = _format_ch_index_expr(index)
+    if not expr:
+        raise ValueError("index expression must not be empty")
+
+    return (
+        f"INDEX {_quote_ch_identifier(str(index['name']))} {expr} "
+        f"TYPE {index['type']} GRANULARITY {index['granularity']}"
+    )
+
+
+def _normalize_ch_indexes(indexes) -> list[dict | str]:
+    if not indexes:
+        return []
+    if isinstance(indexes, (dict, str)):
+        return [indexes]
+    if isinstance(indexes, (list, tuple)):
+        return list(indexes)
+    raise ValueError("indexes must be a string, object, or list")
+
+
+def _format_ch_setting_value(value) -> str:
+    if isinstance(value, bool):
+        return "1" if value else "0"
+    if isinstance(value, (int, float)):
+        return str(value)
+    if isinstance(value, str):
+        raw = value.strip()
+        if (
+            re.match(r"^-?\d+(\.\d+)?$", raw)
+            or raw.startswith("'")
+            or raw.startswith("[")
+            or raw.startswith("(")
+        ):
+            return raw
+        return "'" + raw.replace("\\", "\\\\").replace("'", "\\'") + "'"
+    raise ValueError(f"unsupported ClickHouse setting value: {value!r}")
+
+
+def _format_ch_settings(
+    settings: dict | list[str] | tuple[str, ...] | str | None,
+) -> str | None:
+    if not settings:
+        return None
+    if isinstance(settings, str):
+        clause = settings.strip()
+        if not clause:
+            return None
+        if clause.upper().startswith("SETTINGS "):
+            return clause[len("SETTINGS ") :].strip()
+        return clause
+    if isinstance(settings, (list, tuple)):
+        clauses = [str(item).strip() for item in settings if str(item).strip()]
+        return ", ".join(clauses) if clauses else None
+    if isinstance(settings, dict):
+        clauses = [
+            f"{key} = {_format_ch_setting_value(value)}"
+            for key, value in settings.items()
+        ]
+        return ", ".join(clauses) if clauses else None
+    raise ValueError("settings must be a string, list, or object")
+
+
 # ── Job ─────────────────────────────────────────────────────────
 
 
@@ -215,6 +331,10 @@ class Pg2ChSyncJob(Job):
 
         for tc in tables:
             merged = {**defaults, **tc}
+            if isinstance(defaults.get("settings"), dict) and isinstance(
+                tc.get("settings"), dict
+            ):
+                merged["settings"] = {**defaults["settings"], **tc["settings"]}
             try:
                 synced, purged = self._sync_table(src_db, tgt_db, merged, cfg)
                 total_rows += synced
@@ -442,20 +562,34 @@ class Pg2ChSyncJob(Job):
         db_name: str,
         table: str,
         columns: list[dict],
-        order_by: list[str],
+        order_by: list[str] | str,
         partition_by: str | None,
         engine: str,
+        primary_key: list[str] | str | None = None,
+        indexes: list[dict | str] | tuple[dict | str, ...] | None = None,
+        settings: dict | list[str] | tuple[str, ...] | str | None = None,
     ) -> None:
-        col_defs = ", ".join(f"`{c['name']}` {c['ch_type']}" for c in columns)
-        order_clause = ", ".join(f"`{c}`" for c in order_by)
+        definitions = [f"`{c['name']}` {c['ch_type']}" for c in columns]
+        definitions.extend(
+            _format_ch_index(index) for index in _normalize_ch_indexes(indexes)
+        )
+        col_defs = ", ".join(definitions)
 
         ddl = (
             f"CREATE TABLE IF NOT EXISTS `{db_name}`.`{table}` "
-            f"({col_defs}) ENGINE = {engine} "
-            f"ORDER BY ({order_clause})"
+            f"({col_defs}) ENGINE = {engine}"
         )
         if partition_by:
             ddl += f" PARTITION BY {partition_by}"
+        ddl += f" ORDER BY {_format_ch_key_expr(order_by, name='order_by')}"
+        if primary_key:
+            ddl += (
+                f" PRIMARY KEY "
+                f"{_format_ch_key_expr(primary_key, name='primary_key')}"
+            )
+        settings_clause = _format_ch_settings(settings)
+        if settings_clause:
+            ddl += f" SETTINGS {settings_clause}"
 
         self.logger.info("Ensuring table: %s.%s", db_name, table)
         self.logger.debug("DDL: %s", ddl)
@@ -584,7 +718,10 @@ class Pg2ChSyncJob(Job):
         sync_since: str | None = _resolve_sync_since(raw_since) if raw_since else None
         drop_cols = set(tc.get("drop_columns", []))
         col_overrides: dict = tc.get("column_overrides", {})
-        order_by: list[str] = tc["order_by"]
+        order_by: list[str] | str = tc["order_by"]
+        primary_key: list[str] | str | None = tc.get("primary_key")
+        indexes = tc.get("indexes") or tc.get("indices") or tc.get("index") or []
+        settings: dict | list[str] | str | None = tc.get("settings")
         partition_by: str | None = tc.get("partition_by")
         engine: str = tc.get("engine", "ReplacingMergeTree")
         batch_size: int = tc.get("batch_size", 100_000)
@@ -638,15 +775,27 @@ class Pg2ChSyncJob(Job):
                 raise ValueError(f"Table {src_table} not found or has no columns")
 
             # 2) CH 컬럼 매핑
+            key_columns = _extract_ch_key_columns(order_by) | _extract_ch_key_columns(
+                primary_key
+            )
             ch_columns = self._build_ch_columns(
-                pg_cols, drop_cols, col_overrides, order_by, use_nullable
+                pg_cols, drop_cols, col_overrides, list(key_columns), use_nullable
             )
             col_names = [c["name"] for c in ch_columns]
             col_list_pg = ", ".join(f'"{c}"' for c in col_names)
 
             # 3) CH 테이블 생성
             self._ensure_ch_table(
-                ch, tgt_db, tgt_name, ch_columns, order_by, partition_by, engine
+                ch,
+                tgt_db,
+                tgt_name,
+                ch_columns,
+                order_by,
+                partition_by,
+                engine,
+                primary_key=primary_key,
+                indexes=indexes,
+                settings=settings,
             )
 
             # 4) 동기화 모드 결정

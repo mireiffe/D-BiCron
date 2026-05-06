@@ -398,6 +398,44 @@ class TestWatermark:
         assert "`tgtdb`.`_pg2ch_watermarks`" in ddl
         assert "ReplacingMergeTree" in ddl
 
+    def test_ensure_ch_table_supports_indexes_primary_key_and_settings(self):
+        job = self._make_job()
+        ch = MagicMock()
+        columns = [
+            {"name": "a", "ch_type": "UInt64", "pg_type": "bigint"},
+            {"name": "b", "ch_type": "UInt64", "pg_type": "bigint"},
+            {"name": "x", "ch_type": "String", "pg_type": "text"},
+        ]
+
+        job._ensure_ch_table(
+            ch,
+            "tgtdb",
+            "events",
+            columns,
+            ["a", "b"],
+            "toYYYYMM(created_at)",
+            "MergeTree",
+            primary_key=["a", "b"],
+            indexes=[
+                {
+                    "name": "idx_x",
+                    "column": "x",
+                    "type": "set(1000)",
+                    "granularity": 1,
+                },
+                "INDEX idx_b b TYPE minmax GRANULARITY 2",
+            ],
+            settings={"index_granularity": 8192, "allow_nullable_key": False},
+        )
+
+        ddl = ch.execute.call_args[0][0]
+        assert "INDEX `idx_x` `x` TYPE set(1000) GRANULARITY 1" in ddl
+        assert "INDEX idx_b b TYPE minmax GRANULARITY 2" in ddl
+        assert "ORDER BY (`a`, `b`)" in ddl
+        assert "PRIMARY KEY (`a`, `b`)" in ddl
+        assert "PARTITION BY toYYYYMM(created_at)" in ddl
+        assert "SETTINGS index_granularity = 8192, allow_nullable_key = 0" in ddl
+
     def test_save_and_get_roundtrip(self):
         job = self._make_job()
         ch = MagicMock()
