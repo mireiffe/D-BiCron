@@ -1346,7 +1346,7 @@ async function loadSchedules() {
       }, s.paused ? "RESUME" : "PAUSE") : null;
       return makeEl("tr", { style: s.paused ? "opacity:0.5" : "" }, [
         makeEl("td", null, String(s.id)),
-        makeEl("td", null, s.jobName),
+        makeRunJobCell(s),
         makeEl("td", null, [makeEl("code", null, triggerText)]),
         makeEl("td", null, [
           pauseBtn,

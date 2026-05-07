@@ -494,7 +494,7 @@ app.post("/api/jobs/:name/run", (req, res) => {
 app.get("/api/schedules", (_req, res) => {
   const list = [];
   for (const [id, s] of scheduledTasks) {
-    list.push({ id, jobName: s.jobName, cron: s.cron, args: s.args, targets: s.targets || null, createdAt: s.createdAt, paused: !!s.paused, dependsOn: s.dependsOn || null });
+    list.push(withConfigMeta({ id, jobName: s.jobName, cron: s.cron, args: s.args, targets: s.targets || null, createdAt: s.createdAt, paused: !!s.paused, dependsOn: s.dependsOn || null }));
   }
   res.json(list);
 });
@@ -1181,18 +1181,19 @@ app.get("/api/schedule-status", (_req, res) => {
     const hasExplicitTargets = s.targets && s.targets.length > 0;
     const effectiveScope = hasExplicitTargets ? "targets" : scope;
 
-    result.push({
+    result.push(withConfigMeta({
       scheduleId: id,
       jobName: s.jobName,
       jobLabel: AVAILABLE_JOBS.find(j => j.name === s.jobName)?.label || s.jobName,
       cron: s.cron,
+      args: s.args,
       scope: effectiveScope,
       state,
       targets,
       lastRun: lastRunByJob[s.jobName] || null,
       running: runningByJob[s.jobName] || null,
       paused: !!s.paused,
-    });
+    }));
   }
 
   res.json(result);
