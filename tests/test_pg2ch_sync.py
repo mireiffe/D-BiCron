@@ -576,13 +576,14 @@ class TestSyncSince:
                 sync_cfg,
             )
 
-            # Verify the SELECT query includes WHERE ... >= sync_since
-            execute_calls = stream_cursor.execute.call_args_list
-            assert len(execute_calls) == 1
-            query = execute_calls[0][0][0]
-            params = execute_calls[0][0][1] if len(execute_calls[0][0]) > 1 else None
-            assert 'WHERE "updated_at" >= %s' in query
-            assert params == ("2025-01-01T00:00:00",)
+            direct_insert = [
+                call.args[0]
+                for call in ch.execute.call_args_list
+                if call.args and str(call.args[0]).startswith("INSERT INTO")
+            ][0]
+            assert "FROM postgresql(" in direct_insert
+            assert "WHERE `updated_at` >= '2025-01-01T00:00:00'" in direct_insert
+            stream_cursor.execute.assert_not_called()
 
     def test_sync_since_overrides_older_watermark(self):
         """When sync_since > watermark cutoff, sync_since should be used."""
@@ -1198,8 +1199,8 @@ class TestWatermarkColumn:
             None,  # _ensure_watermark_table
             [],  # _get_watermark → 없음 (full copy)
             None,  # TRUNCATE
-            None,  # INSERT rows
-            None,  # _save_watermark
+            None,  # direct INSERT rows
+            [(1, 200)],  # target count/max watermark
         ]
 
         pg_conn = MagicMock()
@@ -1331,6 +1332,7 @@ class TestWatermarkColumn:
             "watermark_column": "sync_id",
             "order_by": ["sync_id"],
             "engine": "MergeTree",
+            "full_copy_strategy": "python_stream",
         }
         sync_cfg = {"source": "pg_src"}
 

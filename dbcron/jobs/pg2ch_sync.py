@@ -287,6 +287,47 @@ def _format_ch_settings(
     raise ValueError("settings must be a string, list, or object")
 
 
+def _quote_ch_string(value) -> str:
+    return "'" + str(value).replace("\\", "\\\\").replace("'", "\\'") + "'"
+
+
+def _normalize_full_copy_strategy(value) -> str:
+    raw = str(value or "clickhouse_postgresql").strip().lower()
+    aliases = {
+        "direct": "clickhouse_postgresql",
+        "clickhouse_direct": "clickhouse_postgresql",
+        "postgresql": "clickhouse_postgresql",
+        "postgresql_table_function": "clickhouse_postgresql",
+        "python": "python_stream",
+        "stream": "python_stream",
+    }
+    strategy = aliases.get(raw, raw)
+    if strategy not in {"clickhouse_postgresql", "python_stream"}:
+        raise ValueError(
+            "full_copy_strategy must be 'clickhouse_postgresql' or 'python_stream'"
+        )
+    return strategy
+
+
+def _ch_default_expr(ch_type: str) -> str | None:
+    base = _unwrap_ch_type(ch_type)
+    if base == "String":
+        return "''"
+    if base == "UUID":
+        return "toUUID('00000000-0000-0000-0000-000000000000')"
+    if base == "Date":
+        return "toDate('1970-01-01')"
+    if base == "DateTime" or base.startswith("DateTime("):
+        return "toDateTime('1970-01-01 00:00:00')"
+    if base.startswith("DateTime64"):
+        m = re.match(r"DateTime64\((\d+)", base)
+        scale = m.group(1) if m else "6"
+        return f"toDateTime64('1970-01-01 00:00:00', {scale})"
+    if base.startswith(("Int", "UInt", "Float", "Decimal")):
+        return "0"
+    return None
+
+
 # ── Job ─────────────────────────────────────────────────────────
 
 
@@ -595,6 +636,100 @@ class Pg2ChSyncJob(Job):
         self.logger.debug("DDL: %s", ddl)
         ch.execute(ddl)
 
+    # ── direct full copy ──────────────────────────────────────────
+
+    @staticmethod
+    def _postgresql_table_function(src_cfg: dict, src_schema: str, src_name: str, tc: dict) -> str:
+        host = (
+            tc.get("clickhouse_postgresql_host")
+            or tc.get("postgres_host_for_clickhouse")
+            or src_cfg["host"]
+        )
+        port = (
+            tc.get("clickhouse_postgresql_port")
+            or tc.get("postgres_port_for_clickhouse")
+            or src_cfg.get("port", 5432)
+        )
+        host_port = f"{host}:{int(port)}"
+        args = [
+            host_port,
+            src_cfg["dbname"],
+            src_name,
+            src_cfg.get("user", ""),
+            src_cfg.get("password", ""),
+            src_schema,
+        ]
+        return "postgresql(" + ", ".join(_quote_ch_string(arg) for arg in args) + ")"
+
+    @staticmethod
+    def _direct_select_exprs(columns: list[dict]) -> str:
+        exprs = []
+        for col in columns:
+            quoted = _quote_ch_identifier(col["name"])
+            if col["ch_type"].startswith("Nullable("):
+                exprs.append(quoted)
+                continue
+
+            default_expr = _ch_default_expr(col["ch_type"])
+            if default_expr is None:
+                exprs.append(quoted)
+            else:
+                exprs.append(f"ifNull({quoted}, {default_expr}) AS {quoted}")
+        return ", ".join(exprs)
+
+    def _full_copy_via_clickhouse_postgresql(
+        self,
+        ch,
+        src_cfg: dict,
+        src_schema: str,
+        src_name: str,
+        tgt_db: str,
+        tgt_name: str,
+        ch_columns: list[dict],
+        col_names: list[str],
+        ts_col: str | None,
+        sync_since: str | None,
+        wm_col: str | None,
+        tc: dict,
+        sync_cfg: dict,
+    ) -> tuple[int, object | None]:
+        col_insert = ", ".join(_quote_ch_identifier(c) for c in col_names)
+        source = self._postgresql_table_function(src_cfg, src_schema, src_name, tc)
+        query = (
+            f"INSERT INTO `{tgt_db}`.`{tgt_name}` ({col_insert}) "
+            f"SELECT {self._direct_select_exprs(ch_columns)} FROM {source}"
+        )
+
+        if sync_since and ts_col:
+            query += f" WHERE {_quote_ch_identifier(ts_col)} >= {_quote_ch_string(sync_since)}"
+
+        query_settings = tc.get("full_copy_query_settings")
+        if query_settings is None:
+            query_settings = sync_cfg.get("full_copy_query_settings")
+        settings_clause = _format_ch_settings(query_settings)
+        if settings_clause:
+            query += f" SETTINGS {settings_clause}"
+
+        self.logger.info("%s.%s: direct full copy via ClickHouse postgresql()", src_schema, src_name)
+        ch.execute(query)
+
+        count_expr = "count()"
+        max_expr = (
+            f", max({_quote_ch_identifier(wm_col)})"
+            if wm_col and wm_col in col_names
+            else ""
+        )
+        stats = ch.execute(
+            f"SELECT {count_expr}{max_expr} FROM `{tgt_db}`.`{tgt_name}`"
+        )
+        if not stats:
+            return 0, None
+
+        row = stats[0]
+        total_rows = int(row[0] or 0)
+        max_wm = row[1] if max_expr and len(row) > 1 else None
+        return total_rows, max_wm
+
     # ── row transform ────────────────────────────────────────────
 
     @staticmethod
@@ -728,6 +863,13 @@ class Pg2ChSyncJob(Job):
         overlap_min: int = tc.get("overlap_minutes", 0)
         use_nullable: bool = tc.get("use_nullable", True)
         raw_retention: str | None = tc.get("source_retention")
+        full_copy_strategy = _normalize_full_copy_strategy(
+            tc.get("full_copy_strategy", sync_cfg.get("full_copy_strategy"))
+        )
+        full_copy_fallback = tc.get(
+            "full_copy_fallback_to_python",
+            sync_cfg.get("full_copy_fallback_to_python", True),
+        )
         purge_batch_size = min(batch_size, 10_000)
 
         if sync_since and not ts_col:
@@ -803,6 +945,10 @@ class Pg2ChSyncJob(Job):
             wm_key = f"{sync_cfg['source']}.{src_table}"
             watermark = self._get_watermark(ch, tgt_db, wm_key, wm_col) if wm_col else None
 
+            direct_full_copy_done = False
+            total_rows = 0
+            max_wm = None
+
             if watermark:
                 cutoff = watermark
                 if overlap_min:
@@ -860,50 +1006,78 @@ class Pg2ChSyncJob(Job):
                 if order_col:
                     query += f' ORDER BY "{order_col}"'
 
+                if full_copy_strategy == "clickhouse_postgresql":
+                    try:
+                        total_rows, max_wm = self._full_copy_via_clickhouse_postgresql(
+                            ch,
+                            src_cfg,
+                            src_schema,
+                            src_name,
+                            tgt_db,
+                            tgt_name,
+                            ch_columns,
+                            col_names,
+                            ts_col,
+                            sync_since,
+                            wm_col,
+                            tc,
+                            sync_cfg,
+                        )
+                        direct_full_copy_done = True
+                    except Exception as e:
+                        if not full_copy_fallback:
+                            raise
+                        self.logger.warning(
+                            "%s: direct full copy failed; falling back to "
+                            "python_stream: %s",
+                            src_table,
+                            e,
+                        )
+                        ch.execute(f"TRUNCATE TABLE IF EXISTS `{tgt_db}`.`{tgt_name}`")
+
             # 5) 스트리밍 전송
-            transformer = self._build_transformer(ch_columns)
-            col_insert = ", ".join(f"`{c}`" for c in col_names)
-            insert_sql = (
-                f"INSERT INTO `{tgt_db}`.`{tgt_name}` ({col_insert}) VALUES"
-            )
-
-            cursor = pg_conn.cursor(name="pg2ch_stream")
-            cursor.itersize = batch_size
-
-            if params:
-                cursor.execute(query, params)
-            else:
-                cursor.execute(query)
-
-            total_rows = 0
-            max_wm = None
-            wm_idx = (
-                col_names.index(wm_col)
-                if wm_col and wm_col in col_names
-                else None
-            )
-
-            while True:
-                rows = cursor.fetchmany(batch_size)
-                if not rows:
-                    break
-
-                if wm_idx is not None:
-                    for row in rows:
-                        val = row[wm_idx]
-                        if val is not None and (max_wm is None or val > max_wm):
-                            max_wm = val
-
-                if transformer:
-                    rows = [transformer(r) for r in rows]
-
-                ch.execute(insert_sql, rows, types_check=True)
-                total_rows += len(rows)
-                self.logger.info(
-                    "%s: batch %d rows (total %d)", src_table, len(rows), total_rows
+            if not direct_full_copy_done:
+                transformer = self._build_transformer(ch_columns)
+                col_insert = ", ".join(f"`{c}`" for c in col_names)
+                insert_sql = (
+                    f"INSERT INTO `{tgt_db}`.`{tgt_name}` ({col_insert}) VALUES"
                 )
 
-            cursor.close()
+                cursor = pg_conn.cursor(name="pg2ch_stream")
+                cursor.itersize = batch_size
+
+                if params:
+                    cursor.execute(query, params)
+                else:
+                    cursor.execute(query)
+
+                wm_idx = (
+                    col_names.index(wm_col)
+                    if wm_col and wm_col in col_names
+                    else None
+                )
+
+                while True:
+                    rows = cursor.fetchmany(batch_size)
+                    if not rows:
+                        break
+
+                    if wm_idx is not None:
+                        for row in rows:
+                            val = row[wm_idx]
+                            if val is not None and (max_wm is None or val > max_wm):
+                                max_wm = val
+
+                    if transformer:
+                        rows = [transformer(r) for r in rows]
+
+                    ch.execute(insert_sql, rows, types_check=True)
+                    total_rows += len(rows)
+                    self.logger.info(
+                        "%s: batch %d rows (total %d)", src_table, len(rows), total_rows
+                    )
+
+                cursor.close()
             pg_conn.rollback()  # read 트랜잭션 정리
 
             # 6) Watermark 저장

@@ -6,6 +6,8 @@
   "ch_native_port": 9000,
   "defaults": {
     "engine": "ReplacingMergeTree",
+    "full_copy_strategy": "clickhouse_postgresql",
+    "full_copy_fallback_to_python": true,
     "batch_size": 100000,
     "source_retention_batch_size": 10000,
     "overlap_minutes": 0,
