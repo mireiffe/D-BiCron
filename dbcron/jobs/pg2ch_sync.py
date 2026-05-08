@@ -26,7 +26,7 @@ from __future__ import annotations
 
 import json
 import re
-from datetime import datetime, timedelta
+from datetime import date, datetime, timedelta, timezone
 
 from ..db import get_database
 from .base import Job, JobResult
@@ -742,7 +742,7 @@ class Pg2ChSyncJob(Job):
         _CH_DEFAULTS: dict[str, object] = {
             "String": "",
             "UUID": "00000000-0000-0000-0000-000000000000",
-            "Date": "1970-01-01",
+            "Date": date(1970, 1, 1),
         }
         null_coerce: dict[int, object] = {}
         for i, col in enumerate(columns):
@@ -756,7 +756,13 @@ class Pg2ChSyncJob(Job):
                 elif base.startswith(("Int", "UInt", "Float", "Decimal")):
                     null_coerce[i] = 0
                 elif base.startswith("DateTime"):
-                    null_coerce[i] = "1970-01-01 00:00:00"
+                    # clickhouse-driver expects datetime objects for DateTime/DateTime64
+                    # under types_check=True; tz-aware iff the CH type carries a tz.
+                    null_coerce[i] = (
+                        datetime(1970, 1, 1, tzinfo=timezone.utc)
+                        if "'" in ch_type
+                        else datetime(1970, 1, 1)
+                    )
 
             if pg_t in ("json", "jsonb"):
 
