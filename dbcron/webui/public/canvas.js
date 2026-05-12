@@ -29,13 +29,14 @@ function shouldIncludeTable(tableName, dbCfg) {
 }
 
 // Layout constants
-const TABLE_W_MIN = 200, TABLE_H = 36, TABLE_PAD = 10;
-function calcTableW(label) { return Math.max(TABLE_W_MIN, label.length * 7.5 + 90); }
-const DB_PAD_TOP = 48, DB_PAD_X = 24, DB_PAD_BOTTOM = 24;
-const EP_W = 150, EP_H = 40;
-const DB_GAP = 200;
+const TABLE_W_MIN = 205, TABLE_H = 40, TABLE_PAD = 16;
+function calcTableW(label) { return Math.max(TABLE_W_MIN, label.length * 7.2 + 96); }
+const DB_PAD_TOP = 58, DB_PAD_X = 28, DB_PAD_BOTTOM = 28;
+const SCHEMA_PAD_TOP = 36, SCHEMA_PAD_X = 18, SCHEMA_PAD_BOTTOM = 18;
+const EP_W = 168, EP_H = 52;
+const DB_GAP = 420, SCHEMA_GAP_X = 285, SCHEMA_GAP_Y = 230;
 
-let svgEl, gRoot, zoomBehavior;
+let svgEl, gRoot, zoomBehavior, forceSim, minimapFrame, minimapLastRender = 0;
 
 // ── Helpers ────────────────────────────────────────────────────
 
@@ -53,10 +54,64 @@ function _el(tag, attrs, children) {
 }
 
 function formatCount(n) {
+  n = Number(n) || 0;
   if (n >= 1e9) return (n / 1e9).toFixed(1) + "B";
   if (n >= 1e6) return (n / 1e6).toFixed(1) + "M";
   if (n >= 1e3) return (n / 1e3).toFixed(1) + "K";
   return String(n);
+}
+
+function getPrimaryKeyColumns(pk) {
+  if (!pk) return [];
+  if (Array.isArray(pk)) return pk;
+  return pk.columns || [];
+}
+
+function getForeignKeyColumns(fk) {
+  if (!fk) return [];
+  if (Array.isArray(fk.columns)) return fk.columns;
+  if (fk.column) return [fk.column];
+  return [];
+}
+
+function getForeignKeyRefColumns(fk) {
+  if (!fk) return [];
+  if (Array.isArray(fk.ref_columns)) return fk.ref_columns;
+  if (fk.ref_column) return [fk.ref_column];
+  return [];
+}
+
+function getDbConfig(dbKey) {
+  return CS.databases.find(d => d.id === dbKey) || {};
+}
+
+function getDatabaseName(dbKey, dbInfo, dbCfg) {
+  return dbInfo?.database || dbCfg?.dbname || dbCfg?.database || dbKey;
+}
+
+function positionKey(d) {
+  return d.posKey || d.key;
+}
+
+function readSavedPosition(...keys) {
+  for (const key of keys) {
+    const p = CS.nodePositions[key];
+    if (p && Number.isFinite(p.x) && Number.isFinite(p.y)) return p;
+  }
+  return null;
+}
+
+function rememberNodePosition(d) {
+  CS.nodePositions[positionKey(d)] = { x: d.x, y: d.y };
+  savePositions();
+}
+
+function resolveFkRefKey(node, fk) {
+  const ref = fk.ref_table || "";
+  if (!ref) return null;
+  if (ref.includes(".")) return `${node.dbKey}:${ref}`;
+  const refSchema = fk.ref_schema || node.data.schema || "main";
+  return `${node.dbKey}:${refSchema}.${ref}`;
 }
 
 // ── Initialization ─────────────────────────────────────────────
@@ -74,6 +129,8 @@ function canvasInit() {
       const k = event.transform.k;
       gRoot.selectAll("g.table-node .row-badge-g").style("display", k < 0.5 ? "none" : null);
       gRoot.selectAll("text.conn-label").style("display", k < 0.4 ? "none" : null);
+      gRoot.selectAll("g.schema-group .schema-count").style("display", k < 0.45 ? "none" : null);
+      gRoot.selectAll("g.entry-point .entry-type-label").style("display", k < 0.55 ? "none" : null);
       updateMinimap(event.transform);
     });
   svgEl.call(zoomBehavior);
@@ -148,12 +205,13 @@ async function loadCanvasData() {
   renderJobOverlay();
   initJobSSE();
   requestAnimationFrame(() => canvasFit());
+  setTimeout(() => canvasFit(), 900);
 }
 
 // ── Layout computation ─────────────────────────────────────────
 
 function computeLayout() {
-  const layout = { entryPoints: [], dbContainers: [], tableNodes: [], connections: [], gapColumns: [] };
+  const layout = { entryPoints: [], dbContainers: [], schemaGroups: [], tableNodes: [], connections: [], gapColumns: [] };
   if (!CS.metadata) return layout;
 
   const cfg = CS.pipelineConfig || { databases: {}, entry_points: [], pipelines: [] };
@@ -168,33 +226,21 @@ function computeLayout() {
     ? [...rawDbKeys].sort((a, b) => (orderMap.get(a) ?? Infinity) - (orderMap.get(b) ?? Infinity))
     : topoSortDBs(rawDbKeys, pipeConns, epConns);
 
+  const dbIndex = new Map(dbKeys.map((k, i) => [k, i]));
+  const dbCenters = {};
+  const canvasMidY = 320;
+  dbKeys.forEach((dbKey, i) => {
+    dbCenters[dbKey] = {
+      x: 420 + i * DB_GAP,
+      y: canvasMidY + (i % 2 ? 70 : -40),
+    };
+  });
+
   // Connected pairs for y-ordering
   const connectedPairs = pipeConns.map(c => ({
     fromDb: c.from.db, fromKey: `${c.from.schema}.${c.from.table}`,
     toDb: c.to.db, toKey: `${c.to.schema}.${c.to.table}`, label: c.label || "",
   }));
-
-  // Pre-compute max table width per DB for container sizing
-  const dbMaxW = {};
-  for (const dbKey of dbKeys) {
-    const db = CS.metadata.databases[dbKey];
-    if (!db || !db.tables) { dbMaxW[dbKey] = TABLE_W_MIN; continue; }
-    const dbCfg = CS.databases.find(d => d.id === dbKey) || {};
-    let mw = TABLE_W_MIN;
-    for (const tData of Object.values(db.tables)) {
-      if (!shouldIncludeTable(tData.table, dbCfg)) continue;
-      mw = Math.max(mw, calcTableW(tData.table));
-    }
-    dbMaxW[dbKey] = mw;
-  }
-
-  // DB container x positions (variable width per DB)
-  let dbX = 380;
-  const dbPositions = {};
-  for (const dbKey of dbKeys) {
-    dbPositions[dbKey] = dbX;
-    dbX += dbMaxW[dbKey] + DB_PAD_X * 2 + DB_GAP;
-  }
 
   for (const dbKey of dbKeys) {
     const db = CS.metadata.databases[dbKey];
@@ -202,7 +248,8 @@ function computeLayout() {
 
     const dbLabel = cfg.databases?.[dbKey]?.label || dbKey;
     const dbColor = cfg.databases?.[dbKey]?.color || "#00e5ff";
-    const dbCfg = CS.databases.find(d => d.id === dbKey) || {};
+    const dbCfg = getDbConfig(dbKey);
+    const databaseName = getDatabaseName(dbKey, db, dbCfg);
     const allTableKeys = Object.keys(db.tables).filter(tKey => {
       const tData = db.tables[tKey];
       return tData && shouldIncludeTable(tData.table, dbCfg);
@@ -222,54 +269,90 @@ function computeLayout() {
     const unconnected = allTableKeys.filter(k => !connectedSet.has(k));
     const orderedKeys = [...connectedOrder.filter(k => allTableKeys.includes(k)), ...unconnected];
 
-    const containerX = dbPositions[dbKey];
-    const containerW = dbMaxW[dbKey];
-    let y = DB_PAD_TOP;
-
+    const groups = new Map();
     for (const tKey of orderedKeys) {
       const tData = db.tables[tKey];
       if (!tData) continue;
-      const nodeKey = `${dbKey}:${tKey}`;
-      const saved = CS.nodePositions[nodeKey];
-      layout.tableNodes.push({
-        key: nodeKey, dbKey, tKey,
-        label: tData.table,
-        rowCount: tData.estimated_row_count,
-        x: saved ? saved.x : containerX + DB_PAD_X,
-        y: saved ? saved.y : y,
-        w: containerW, h: TABLE_H,
-        data: tData, dbColor,
-      });
-      y += TABLE_H + TABLE_PAD;
+      const schema = tData.schema || (tKey.includes(".") ? tKey.split(".")[0] : "main");
+      if (!groups.has(schema)) groups.set(schema, []);
+      groups.get(schema).push(tKey);
     }
 
-    layout.dbContainers.push({
-      key: dbKey, label: dbLabel, color: dbColor,
-      x: containerX, y: 0,
-      w: containerW + DB_PAD_X * 2,
-      h: Math.max(y + DB_PAD_BOTTOM, DB_PAD_TOP + TABLE_H + DB_PAD_BOTTOM),
-    });
-  }
+    const groupEntries = [...groups.entries()];
+    const schemaCols = Math.min(2, Math.max(1, groupEntries.length));
+    const dbCenter = dbCenters[dbKey] || { x: 420, y: canvasMidY };
 
-  // Compute gap columns between DB containers for arrow routing
-  const sortedContainers = [...layout.dbContainers].sort((a, b) => a.x - b.x);
-  for (let i = 0; i < sortedContainers.length - 1; i++) {
-    const left = sortedContainers[i];
-    const right = sortedContainers[i + 1];
-    layout.gapColumns.push({ midX: (left.x + left.w + right.x) / 2 });
+    layout.dbContainers.push({
+      key: dbKey, label: dbLabel, databaseName, color: dbColor,
+      type: "database",
+      x: dbCenter.x - 160, y: dbCenter.y - 120, w: 320, h: 240,
+    });
+
+    groupEntries.forEach(([schema, tableKeys], schemaIdx) => {
+      const col = schemaIdx % schemaCols;
+      const row = Math.floor(schemaIdx / schemaCols);
+      const colOffset = (col - (schemaCols - 1) / 2) * SCHEMA_GAP_X;
+      const rowOffset = (row - Math.max(0, Math.ceil(groupEntries.length / schemaCols) - 1) / 2) * SCHEMA_GAP_Y;
+      const groupX = dbCenter.x + colOffset;
+      const groupY = dbCenter.y + rowOffset;
+      const groupKey = `${dbKey}:${schema}`;
+
+      layout.schemaGroups.push({
+        key: groupKey, dbKey, label: schema, databaseName,
+        color: dbColor, type: "schema",
+        x: groupX - 120, y: groupY - 80, w: 240, h: 160,
+        tableCount: tableKeys.length,
+      });
+
+      tableKeys.forEach((tKey, tableIdx) => {
+        const tData = db.tables[tKey];
+        if (!tData) return;
+        const nodeKey = `${dbKey}:${tKey}`;
+        const label = tData.table || tKey.split(".").pop();
+        const w = calcTableW(label);
+        const saved = readSavedPosition(nodeKey);
+        const seedX = groupX - w / 2 + ((tableIdx % 3) - 1) * 34;
+        const seedY = groupY - TABLE_H / 2 + (tableIdx - (tableKeys.length - 1) / 2) * (TABLE_H + TABLE_PAD);
+        layout.tableNodes.push({
+          key: nodeKey, posKey: nodeKey, type: "table",
+          dbKey, tKey, groupKey,
+          label,
+          schemaLabel: schema,
+          databaseName,
+          rowCount: tData.estimated_row_count ?? tData.row_count ?? 0,
+          x: saved ? saved.x : seedX,
+          y: saved ? saved.y : seedY,
+          w, h: TABLE_H,
+          clusterX: groupX - w / 2,
+          clusterY: groupY - TABLE_H / 2,
+          data: tData, dbColor,
+        });
+      });
+    });
   }
 
   // Entry points
   if (cfg.entry_points) {
-    let epY = 30;
-    for (const ep of cfg.entry_points) {
+    for (const [idx, ep] of cfg.entry_points.entries()) {
+      const targetDbIndexes = (ep.targets || [])
+        .map(t => dbIndex.get(t.db))
+        .filter(v => Number.isFinite(v));
+      const targetIdx = targetDbIndexes.length ? Math.min(...targetDbIndexes) : 0;
+      const anchor = dbCenters[dbKeys[targetIdx]] || { x: 420, y: canvasMidY };
+      const saved = readSavedPosition(`entry:${ep.id}`, ep.id);
       layout.entryPoints.push({
-        key: ep.id, name: ep.name,
+        key: ep.id, posKey: `entry:${ep.id}`,
+        type: "entry-point",
+        entryType: ep.type || "api",
+        name: ep.name,
         description: ep.description || "",
-        type: ep.type || "api",
-        x: 50, y: epY, w: EP_W, h: EP_H,
+        targets: ep.targets || [],
+        x: saved ? saved.x : anchor.x - 350 - (idx % 2) * 70,
+        y: saved ? saved.y : anchor.y - 120 + idx * 88,
+        w: EP_W, h: EP_H,
+        clusterX: anchor.x - 360,
+        clusterY: anchor.y - 80 + idx * 76,
       });
-      epY += EP_H + 20;
     }
   }
 
@@ -295,13 +378,14 @@ function computeLayout() {
 
   for (const n of layout.tableNodes) {
     for (const fk of n.data.foreign_keys || []) {
-      const rk = `${n.dbKey}:${fk.ref_table}`;
+      const rk = resolveFkRefKey(n, fk);
       if (nodeMap[rk]) {
         layout.connections.push({ key: `fk:${n.key}->${rk}:${fk.name}`, type: "fk", source: n, target: nodeMap[rk], label: fk.name });
       }
     }
   }
 
+  recomputeGroupBounds(layout);
   return layout;
 }
 
@@ -350,22 +434,72 @@ function topoSortDBs(dbKeys, pipeConns, epConns) {
   return sorted;
 }
 
+function recomputeGroupBounds(layout) {
+  if (!layout) return;
+
+  for (const group of layout.schemaGroups || []) {
+    const children = layout.tableNodes.filter(n => n.groupKey === group.key);
+    if (!children.length) continue;
+    let minX = Infinity, minY = Infinity, maxX = -Infinity, maxY = -Infinity;
+    for (const c of children) {
+      minX = Math.min(minX, c.x);
+      minY = Math.min(minY, c.y);
+      maxX = Math.max(maxX, c.x + c.w);
+      maxY = Math.max(maxY, c.y + c.h);
+    }
+    group.x = minX - SCHEMA_PAD_X;
+    group.y = minY - SCHEMA_PAD_TOP;
+    group.w = Math.max(220, maxX - minX + SCHEMA_PAD_X * 2);
+    group.h = Math.max(110, maxY - minY + SCHEMA_PAD_TOP + SCHEMA_PAD_BOTTOM);
+    group.tableCount = children.length;
+  }
+
+  for (const container of layout.dbContainers || []) {
+    const groups = (layout.schemaGroups || []).filter(g => g.dbKey === container.key);
+    const children = groups.length ? groups : layout.tableNodes.filter(n => n.dbKey === container.key);
+    if (!children.length) continue;
+    let minX = Infinity, minY = Infinity, maxX = -Infinity, maxY = -Infinity;
+    for (const c of children) {
+      minX = Math.min(minX, c.x);
+      minY = Math.min(minY, c.y);
+      maxX = Math.max(maxX, c.x + c.w);
+      maxY = Math.max(maxY, c.y + c.h);
+    }
+    container.x = minX - DB_PAD_X;
+    container.y = minY - DB_PAD_TOP;
+    container.w = Math.max(280, maxX - minX + DB_PAD_X * 2);
+    container.h = Math.max(170, maxY - minY + DB_PAD_TOP + DB_PAD_BOTTOM);
+  }
+
+  const sortedContainers = [...(layout.dbContainers || [])].sort((a, b) => a.x - b.x);
+  layout.gapColumns = [];
+  for (let i = 0; i < sortedContainers.length - 1; i++) {
+    const left = sortedContainers[i];
+    const right = sortedContainers[i + 1];
+    layout.gapColumns.push({ midX: (left.x + left.w + right.x) / 2 });
+  }
+}
+
 // ── Rendering ──────────────────────────────────────────────────
 
 function renderCanvas() {
   if (!CS.layout) return;
+  if (forceSim) forceSim.stop();
   gRoot.selectAll("*").remove();
 
   const containerLayer = gRoot.append("g").attr("class", "layer-containers");
+  const schemaLayer = gRoot.append("g").attr("class", "layer-schema-groups");
   const connLayer = gRoot.append("g").attr("class", "layer-connections");
   const nodeLayer = gRoot.append("g").attr("class", "layer-nodes");
   const epLayer = gRoot.append("g").attr("class", "layer-entrypoints");
 
   renderDBContainers(containerLayer, CS.layout.dbContainers);
+  renderSchemaGroups(schemaLayer, CS.layout.schemaGroups || []);
   renderTableNodes(nodeLayer, CS.layout.tableNodes);
   renderEntryPoints(epLayer, CS.layout.entryPoints);
   renderConnections(connLayer, CS.layout.connections);
   renderMinimap();
+  startForceLayout();
 }
 
 function renderDBContainers(layer, containers) {
@@ -399,22 +533,72 @@ function renderDBContainers(layer, containers) {
     .attr("stroke", d => d.color).attr("stroke-width", 1).attr("opacity", 0.3);
 
   // DB title
-  g.append("text").attr("x", d => d.w / 2).attr("y", 22)
+  g.append("text").attr("class", "db-title")
+    .attr("x", d => d.w / 2).attr("y", 22)
     .attr("text-anchor", "middle").attr("font-family", "'Rajdhani', sans-serif")
     .attr("font-size", 15).attr("font-weight", 700).attr("fill", d => d.color)
     .attr("letter-spacing", 3).text(d => d.label.toUpperCase());
+
+  g.append("text").attr("class", "db-subtitle")
+    .attr("x", d => d.w / 2).attr("y", 40)
+    .attr("text-anchor", "middle").attr("font-family", "'Fira Code', monospace")
+    .attr("font-size", 9).attr("fill", "rgba(228,226,240,0.48)")
+    .text(d => d.databaseName && d.databaseName !== d.key ? d.databaseName : "");
+}
+
+function renderSchemaGroups(layer, groups) {
+  const g = layer.selectAll("g.schema-group")
+    .data(groups, d => d.key).join("g")
+    .attr("class", "schema-group")
+    .attr("transform", d => `translate(${d.x},${d.y})`);
+
+  g.append("rect").attr("class", "schema-shadow")
+    .attr("x", 2).attr("y", 2)
+    .attr("width", d => d.w).attr("height", d => d.h).attr("rx", 4)
+    .attr("fill", d => d.color + "06").attr("stroke", d => d.color)
+    .attr("stroke-width", 1).attr("opacity", 0.2);
+
+  g.append("rect").attr("class", "schema-main")
+    .attr("width", d => d.w).attr("height", d => d.h).attr("rx", 4)
+    .attr("fill", "rgba(18,18,42,0.34)").attr("stroke", d => d.color)
+    .attr("stroke-width", 1.4).attr("stroke-dasharray", "7,5").attr("opacity", 0.78);
+
+  g.append("text").attr("class", "schema-title")
+    .attr("x", 12).attr("y", 22)
+    .attr("font-family", "'Rajdhani', sans-serif").attr("font-size", 12)
+    .attr("font-weight", 700).attr("letter-spacing", 1.6)
+    .attr("fill", d => d.color)
+    .text(d => d.label.toUpperCase());
+
+  g.append("text").attr("class", "schema-count")
+    .attr("x", d => d.w - 12).attr("y", 22)
+    .attr("text-anchor", "end")
+    .attr("font-family", "'Fira Code', monospace").attr("font-size", 9)
+    .attr("fill", "rgba(228,226,240,0.48)")
+    .text(d => `${d.tableCount || 0} tables`);
 }
 
 function renderTableNodes(layer, nodes) {
   const drag = d3.drag()
-    .on("start", function () { d3.select(this).raise(); })
-    .on("drag", function (event, d) {
-      d.x = event.x; d.y = event.y;
-      d3.select(this).attr("transform", `translate(${d.x},${d.y})`);
-      updateConnections();
-      updateContainerBounds();
+    .on("start", function (event, d) {
+      d3.select(this).raise();
+      if (!event.active && forceSim) forceSim.alphaTarget(0.25).restart();
+      d.fx = d.x;
+      d.fy = d.y;
     })
-    .on("end", (_e, d) => { CS.nodePositions[d.key] = { x: d.x, y: d.y }; savePositions(); });
+    .on("drag", function (event, d) {
+      d.fx = event.x;
+      d.fy = event.y;
+      d.x = event.x;
+      d.y = event.y;
+      updateGraphPositions();
+    })
+    .on("end", (event, d) => {
+      if (!event.active && forceSim) forceSim.alphaTarget(0);
+      d.fx = null;
+      d.fy = null;
+      rememberNodePosition(d);
+    });
 
   const g = layer.selectAll("g.table-node")
     .data(nodes, d => d.key).join("g")
@@ -495,54 +679,78 @@ function renderTableNodes(layer, nodes) {
 }
 
 function renderEntryPoints(layer, entryPoints) {
+  const drag = d3.drag()
+    .on("start", function (event, d) {
+      d3.select(this).raise();
+      if (!event.active && forceSim) forceSim.alphaTarget(0.25).restart();
+      d.fx = d.x;
+      d.fy = d.y;
+    })
+    .on("drag", function (event, d) {
+      d.fx = event.x;
+      d.fy = event.y;
+      d.x = event.x;
+      d.y = event.y;
+      updateGraphPositions();
+    })
+    .on("end", (event, d) => {
+      if (!event.active && forceSim) forceSim.alphaTarget(0);
+      d.fx = null;
+      d.fy = null;
+      rememberNodePosition(d);
+    });
+
   const g = layer.selectAll("g.entry-point")
     .data(entryPoints, d => d.key).join("g")
     .attr("class", "entry-point")
     .attr("transform", d => `translate(${d.x},${d.y})`)
+    .call(drag).style("cursor", "pointer")
+    .on("click", (_event, d) => openEntryPointPanel(d))
     .on("mouseenter", (event, d) => {
       const tip = document.getElementById("canvas-tooltip");
       while (tip.firstChild) tip.removeChild(tip.firstChild);
       const b = document.createElement("strong"); b.textContent = d.name; tip.appendChild(b);
       tip.appendChild(document.createElement("br"));
-      const sp = document.createElement("span"); sp.style.color = "#7b7898"; sp.textContent = d.description; tip.appendChild(sp);
+      const sp = document.createElement("span"); sp.style.color = "#7b7898"; sp.textContent = d.description || (d.entryType || "api").toUpperCase(); tip.appendChild(sp);
       tip.style.left = (event.pageX + 12) + "px"; tip.style.top = (event.pageY - 8) + "px"; tip.style.display = "";
     })
     .on("mouseleave", hideTooltip);
 
-  g.each(function (d) {
-    const el = d3.select(this);
-    const cx = EP_W / 2, cy = EP_H / 2;
-    if (d.type === "api") {
-      const r = EP_H / 2;
-      const pts = Array.from({ length: 6 }, (_, i) => {
-        const a = Math.PI / 3 * i - Math.PI / 6;
-        return `${cx + r * Math.cos(a)},${cy + r * Math.sin(a)}`;
-      }).join(" ");
-      el.append("polygon").attr("points", pts)
-        .attr("fill", "rgba(255,45,138,0.12)").attr("stroke", "#ff2d8a").attr("stroke-width", 2.5);
-    } else if (d.type === "service") {
-      el.append("polygon")
-        .attr("points", `${cx},${cy - EP_H / 2} ${cx + EP_W / 3},${cy} ${cx},${cy + EP_H / 2} ${cx - EP_W / 3},${cy}`)
-        .attr("fill", "rgba(255,45,138,0.12)").attr("stroke", "#ff2d8a").attr("stroke-width", 2.5);
-    } else if (d.type === "file") {
-      el.append("rect").attr("x", cx - EP_W / 3).attr("y", 0).attr("width", EP_W * 2 / 3).attr("height", EP_H)
-        .attr("rx", 3).attr("fill", "rgba(255,45,138,0.12)").attr("stroke", "#ff2d8a").attr("stroke-width", 2.5);
-    } else {
-      el.append("circle").attr("cx", cx).attr("cy", cy).attr("r", EP_H / 2 - 2)
-        .attr("fill", "rgba(255,45,138,0.12)").attr("stroke", "#ff2d8a").attr("stroke-width", 2.5);
-    }
-  });
+  g.append("rect").attr("class", "entry-shadow")
+    .attr("x", 3).attr("y", 3)
+    .attr("width", EP_W).attr("height", EP_H).attr("rx", 4)
+    .attr("fill", "rgba(255,45,138,0.08)").attr("stroke", "#ff2d8a")
+    .attr("stroke-width", 1).attr("opacity", 0.22);
 
-  g.append("text").attr("x", EP_W / 2).attr("y", EP_H / 2 + 1)
+  g.append("rect").attr("class", "entry-main")
+    .attr("width", EP_W).attr("height", EP_H).attr("rx", 4)
+    .attr("fill", "rgba(32,20,54,0.92)").attr("stroke", "#ff2d8a").attr("stroke-width", 2.5);
+
+  g.append("rect").attr("class", "entry-accent")
+    .attr("x", 1).attr("y", 4).attr("width", 4).attr("height", EP_H - 8)
+    .attr("rx", 2).attr("fill", "#ff2d8a").attr("opacity", 0.9);
+
+  g.append("circle").attr("cx", 22).attr("cy", EP_H / 2).attr("r", 11)
+    .attr("fill", "rgba(255,45,138,0.15)").attr("stroke", "#ff2d8a").attr("stroke-width", 1.6);
+
+  g.append("text").attr("x", 22).attr("y", EP_H / 2 + 1)
     .attr("dominant-baseline", "middle").attr("text-anchor", "middle")
+    .attr("font-family", "'Rajdhani', sans-serif").attr("font-size", 9).attr("font-weight", 700)
+    .attr("fill", "#ff2d8a")
+    .text(d => (d.entryType || "api").slice(0, 3).toUpperCase());
+
+  g.append("text").attr("x", 42).attr("y", 22)
+    .attr("dominant-baseline", "middle")
     .attr("font-family", "'Rajdhani', sans-serif").attr("font-size", 12).attr("font-weight", 700)
-    .attr("fill", "#ff2d8a").attr("letter-spacing", 1)
+    .attr("fill", "#f0eef8").attr("letter-spacing", 1)
+    .attr("text-anchor", "start")
     .text(d => d.name.length > 16 ? d.name.slice(0, 14) + ".." : d.name);
 
-  g.append("text").attr("x", EP_W / 2).attr("y", EP_H + 14)
-    .attr("text-anchor", "middle").attr("font-family", "'Fira Code', monospace")
+  g.append("text").attr("class", "entry-type-label")
+    .attr("x", 42).attr("y", 38)
+    .attr("text-anchor", "start").attr("font-family", "'Fira Code', monospace")
     .attr("font-size", 9).attr("fill", "rgba(255,45,138,0.65)")
-    .text(d => d.type.toUpperCase());
+    .text(d => (d.targets || []).length + " targets");
 }
 
 function renderConnections(layer, connections) {
@@ -580,58 +788,55 @@ function renderConnections(layer, connections) {
     .attr("font-family", "'Fira Code', monospace").attr("font-size", 9)
     .attr("fill", "rgba(255,208,0,0.75)").attr("text-anchor", "middle")
     .each(function (d) {
-      const sx = d.source.x + d.source.w, sy = d.source.y + d.source.h / 2;
-      const tx = d.target.x, ty = d.target.y + d.target.h / 2;
-      d3.select(this).attr("x", (sx + tx) / 2).attr("y", (sy + ty) / 2 - 6);
+      const m = connectionMidpoint(d);
+      d3.select(this).attr("x", m.x).attr("y", m.y - 6);
     })
     .text(d => d.label);
 }
 
-function arrowPath(conn) {
+function connectionEndpoints(conn) {
   const s = conn.source, t = conn.target;
-  const sy = s.y + s.h / 2;
-  const ty = t.y + t.h / 2;
+  const scx = s.x + (s.w || 0) / 2;
+  const scy = s.y + (s.h || 0) / 2;
+  const tcx = t.x + (t.w || 0) / 2;
+  const tcy = t.y + (t.h || 0) / 2;
+  const dx = tcx - scx;
+  const dy = tcy - scy;
 
-  // Same-DB FK: compact right-side bump curve
-  if (conn.type === "fk" && s.dbKey && s.dbKey === t.dbKey) {
-    const rightEdge = Math.max(s.x + s.w, t.x + t.w);
-    const dist = Math.abs(sy - ty);
-    const bump = Math.min(60, Math.max(25, dist * 0.35));
-    return `M${s.x + s.w},${sy} C${rightEdge + bump},${sy} ${rightEdge + bump},${ty} ${t.x + t.w},${ty}`;
+  if (Math.abs(dx) >= Math.abs(dy)) {
+    return {
+      sx: dx >= 0 ? s.x + (s.w || 0) : s.x,
+      sy: scy,
+      tx: dx >= 0 ? t.x : t.x + (t.w || 0),
+      ty: tcy,
+      axis: "x",
+      dir: dx >= 0 ? 1 : -1,
+    };
   }
+  return {
+    sx: scx,
+    sy: dy >= 0 ? s.y + (s.h || 0) : s.y,
+    tx: tcx,
+    ty: dy >= 0 ? t.y : t.y + (t.h || 0),
+    axis: "y",
+    dir: dy >= 0 ? 1 : -1,
+  };
+}
 
-  const sx = s.x + (s.w || 0);
-  const tx = t.x;
+function connectionMidpoint(conn) {
+  const p = connectionEndpoints(conn);
+  return { x: (p.sx + p.tx) / 2, y: (p.sy + p.ty) / 2 };
+}
 
-  if (tx > sx + 10) {
-    // Forward connection — route through gap columns
-    const gaps = CS.layout?.gapColumns || [];
-    const relevant = gaps.filter(g => g.midX > sx && g.midX < tx);
+function arrowPath(conn) {
+  const p = connectionEndpoints(conn);
+  const dist = Math.hypot(p.tx - p.sx, p.ty - p.sy);
+  const bend = Math.min(210, Math.max(60, dist * 0.42));
 
-    if (relevant.length <= 1) {
-      // Adjacent or single gap: simple S-curve
-      const mx = relevant.length === 1 ? relevant[0].midX : (sx + tx) / 2;
-      return `M${sx},${sy} C${mx},${sy} ${mx},${ty} ${tx},${ty}`;
-    }
-
-    // Multiple gaps: control points in first and last gap
-    const cx1 = relevant[0].midX;
-    const cx2 = relevant[relevant.length - 1].midX;
-    return `M${sx},${sy} C${cx1},${sy} ${cx2},${ty} ${tx},${ty}`;
+  if (p.axis === "x") {
+    return `M${p.sx},${p.sy} C${p.sx + bend * p.dir},${p.sy} ${p.tx - bend * p.dir},${p.ty} ${p.tx},${p.ty}`;
   }
-
-  // Backward connection — route above all containers
-  const containers = CS.layout?.dbContainers || [];
-  let topY = Math.min(sy, ty);
-  for (const c of containers) {
-    if (c.x + c.w > Math.min(tx, sx) - 10 && c.x < Math.max(tx, sx) + 10) {
-      topY = Math.min(topY, c.y);
-    }
-  }
-  topY -= 40;
-  const loopOut = 50;
-  return `M${sx},${sy} C${sx + loopOut},${sy} ${sx + loopOut},${topY} ${(sx + tx) / 2},${topY}` +
-    ` C${tx - loopOut},${topY} ${tx - loopOut},${ty} ${tx},${ty}`;
+  return `M${p.sx},${p.sy} C${p.sx},${p.sy + bend * p.dir} ${p.tx},${p.ty - bend * p.dir} ${p.tx},${p.ty}`;
 }
 
 function updateConnections() {
@@ -641,36 +846,146 @@ function updateConnections() {
   gRoot.selectAll("text.conn-label")
     .data(CS.layout.connections.filter(d => d.type === "pipeline" && d.label), d => d.key)
     .each(function (d) {
-      const sx = d.source.x + d.source.w, sy = d.source.y + d.source.h / 2;
-      const tx = d.target.x, ty = d.target.y + d.target.h / 2;
-      d3.select(this).attr("x", (sx + tx) / 2).attr("y", (sy + ty) / 2 - 6);
+      const m = connectionMidpoint(d);
+      d3.select(this).attr("x", m.x).attr("y", m.y - 6);
     });
 }
 
 function updateContainerBounds() {
   if (!CS.layout) return;
-  for (const container of CS.layout.dbContainers) {
-    const children = CS.layout.tableNodes.filter(n => n.dbKey === container.key);
-    if (!children.length) continue;
-    let minX = Infinity, minY = Infinity, maxX = -Infinity, maxY = -Infinity;
-    for (const c of children) {
-      minX = Math.min(minX, c.x);
-      minY = Math.min(minY, c.y);
-      maxX = Math.max(maxX, c.x + c.w);
-      maxY = Math.max(maxY, c.y + c.h);
-    }
-    container.x = minX - DB_PAD_X;
-    container.y = minY - DB_PAD_TOP;
-    container.w = maxX - minX + DB_PAD_X * 2;
-    container.h = maxY - minY + DB_PAD_TOP + DB_PAD_BOTTOM;
+  recomputeGroupBounds(CS.layout);
+
+  const schemaSel = gRoot.selectAll("g.schema-group").data(CS.layout.schemaGroups || [], d => d.key);
+  schemaSel.attr("transform", d => `translate(${d.x},${d.y})`);
+  schemaSel.select(".schema-shadow").attr("width", d => d.w).attr("height", d => d.h);
+  schemaSel.select(".schema-main").attr("width", d => d.w).attr("height", d => d.h);
+  schemaSel.select(".schema-count").attr("x", d => d.w - 12).text(d => `${d.tableCount || 0} tables`);
+
+  const dbSel = gRoot.selectAll("g.db-container").data(CS.layout.dbContainers, d => d.key);
+  dbSel.attr("transform", d => `translate(${d.x},${d.y})`);
+  dbSel.select(".container-shadow").attr("width", d => d.w).attr("height", d => d.h);
+  dbSel.select(".container-main").attr("width", d => d.w).attr("height", d => d.h);
+  dbSel.select(".container-header").attr("width", d => d.w - 3);
+  dbSel.select(".container-sep").attr("x2", d => d.w - 10);
+  dbSel.select(".db-title").attr("x", d => d.w / 2);
+  dbSel.select(".db-subtitle").attr("x", d => d.w / 2);
+}
+
+function startForceLayout() {
+  if (!CS.layout) return;
+  const nodes = [...CS.layout.tableNodes, ...CS.layout.entryPoints];
+  if (!nodes.length) return;
+
+  for (const n of nodes) {
+    if (!Number.isFinite(n.x)) n.x = n.clusterX || 0;
+    if (!Number.isFinite(n.y)) n.y = n.clusterY || 0;
   }
-  const sel = gRoot.selectAll("g.db-container").data(CS.layout.dbContainers, d => d.key);
-  sel.attr("transform", d => `translate(${d.x},${d.y})`);
-  sel.select(".container-shadow").attr("width", d => d.w).attr("height", d => d.h);
-  sel.select(".container-main").attr("width", d => d.w).attr("height", d => d.h);
-  sel.select(".container-header").attr("width", d => d.w - 3);
-  sel.select(".container-sep").attr("x2", d => d.w - 10);
-  sel.select("text").attr("x", d => d.w / 2);
+
+  forceSim = d3.forceSimulation(nodes)
+    .alpha(0.92)
+    .alphaMin(0.018)
+    .velocityDecay(0.34)
+    .force("link", d3.forceLink(CS.layout.connections)
+      .distance(d => d.type === "entry" ? 250 : d.type === "fk" ? 135 : 285)
+      .strength(d => d.type === "fk" ? 0.12 : 0.24))
+    .force("charge", d3.forceManyBody()
+      .strength(d => d.type === "entry-point" ? -620 : -420)
+      .distanceMin(80)
+      .distanceMax(900))
+    .force("clusterX", d3.forceX(d => d.clusterX ?? d.x).strength(d => d.type === "entry-point" ? 0.11 : 0.07))
+    .force("clusterY", d3.forceY(d => d.clusterY ?? d.y).strength(d => d.type === "entry-point" ? 0.11 : 0.07))
+    .force("rectCollide", forceRectCollide(24, 0.72))
+    .on("tick", updateGraphPositions)
+    .on("end", () => {
+      updateGraphPositions();
+      queueMinimapRender();
+    });
+}
+
+function forceRectCollide(padding, strength) {
+  let nodes = [];
+  let maxHalfW = 120;
+  let maxHalfH = 40;
+
+  function force(alpha) {
+    const tree = d3.quadtree(nodes, d => d.x + (d.w || 0) / 2, d => d.y + (d.h || 0) / 2);
+    for (const node of nodes) {
+      const nx = node.x + (node.w || 0) / 2;
+      const ny = node.y + (node.h || 0) / 2;
+      const reachX = (node.w || 0) / 2 + maxHalfW + padding;
+      const reachY = (node.h || 0) / 2 + maxHalfH + padding;
+
+      tree.visit((quad, x0, y0, x1, y1) => {
+        if (!quad.length) {
+          let q = quad;
+          do {
+            const other = q.data;
+            if (other && other.index > node.index) {
+              const ox = other.x + (other.w || 0) / 2;
+              const oy = other.y + (other.h || 0) / 2;
+              let dx = nx - ox;
+              let dy = ny - oy;
+              if (dx === 0 && dy === 0) {
+                dx = (node.index - other.index) || 0.1;
+                dy = (other.index - node.index) || 0.1;
+              }
+              const overlapX = ((node.w || 0) + (other.w || 0)) / 2 + padding - Math.abs(dx);
+              const overlapY = ((node.h || 0) + (other.h || 0)) / 2 + padding - Math.abs(dy);
+              if (overlapX > 0 && overlapY > 0) {
+                if (overlapX < overlapY) {
+                  const dir = dx < 0 ? -1 : 1;
+                  const push = Math.min(overlapX, 80) * strength * alpha;
+                  node.vx += dir * push;
+                  other.vx -= dir * push;
+                } else {
+                  const dir = dy < 0 ? -1 : 1;
+                  const push = Math.min(overlapY, 80) * strength * alpha;
+                  node.vy += dir * push;
+                  other.vy -= dir * push;
+                }
+              }
+            }
+            q = q.next;
+          } while (q);
+        }
+        return x0 > nx + reachX || x1 < nx - reachX || y0 > ny + reachY || y1 < ny - reachY;
+      });
+    }
+  }
+
+  force.initialize = function (_nodes) {
+    nodes = _nodes || [];
+    maxHalfW = Math.max(80, ...nodes.map(n => (n.w || 0) / 2));
+    maxHalfH = Math.max(32, ...nodes.map(n => (n.h || 0) / 2));
+  };
+
+  return force;
+}
+
+function updateGraphPositions() {
+  if (!CS.layout) return;
+  gRoot.selectAll("g.table-node")
+    .data(CS.layout.tableNodes, d => d.key)
+    .attr("transform", d => `translate(${d.x},${d.y})`);
+  gRoot.selectAll("g.entry-point")
+    .data(CS.layout.entryPoints, d => d.key)
+    .attr("transform", d => `translate(${d.x},${d.y})`);
+  updateContainerBounds();
+  updateConnections();
+  updateJobOverlayPositions();
+  queueMinimapRender();
+}
+
+function queueMinimapRender() {
+  if (minimapFrame) return;
+  const now = (typeof performance !== "undefined" && performance.now) ? performance.now() : Date.now();
+  const delay = Math.max(0, 120 - (now - minimapLastRender));
+  minimapFrame = setTimeout(() => {
+    minimapFrame = null;
+    minimapLastRender = (typeof performance !== "undefined" && performance.now) ? performance.now() : Date.now();
+    renderMinimap();
+    if (svgEl && svgEl.node()) updateMinimap(d3.zoomTransform(svgEl.node()));
+  }, delay);
 }
 
 // ── Tooltip ────────────────────────────────────────────────────
@@ -687,7 +1002,8 @@ function showTooltip(event, d) {
   tip.appendChild(rows);
   tip.appendChild(document.createElement("br"));
   const pk = document.createElement("span"); pk.className = "tt-pk";
-  pk.textContent = "PK: " + (d.data.primary_key ? d.data.primary_key.columns.join(", ") : "-");
+  const pkCols = getPrimaryKeyColumns(d.data.primary_key);
+  pk.textContent = "PK: " + (pkCols.length ? pkCols.join(", ") : "-");
   tip.appendChild(pk);
   tip.style.left = (event.pageX + 14) + "px";
   tip.style.top = (event.pageY - 10) + "px";
@@ -719,9 +1035,9 @@ function openDetailPanel(node) {
 
   // Columns
   const cols = node.data.columns || [];
-  const pkCols = new Set((node.data.primary_key?.columns) || []);
+  const pkCols = new Set(getPrimaryKeyColumns(node.data.primary_key));
   const fkColSet = new Set();
-  for (const fk of node.data.foreign_keys || []) for (const c of fk.columns) fkColSet.add(c);
+  for (const fk of node.data.foreign_keys || []) for (const c of getForeignKeyColumns(fk)) fkColSet.add(c);
 
   if (cols.length) {
     const sec = _makeSection("Columns");
@@ -782,8 +1098,8 @@ function openDetailPanel(node) {
     for (const fk of fks) {
       tbody.appendChild(_el("tr", null, [
         _el("td", null, fk.name),
-        _el("td", { style: { color: "#ff2d8a" } }, fk.columns.join(", ")),
-        _el("td", { style: { color: "#7b7898" } }, fk.ref_table + "(" + fk.ref_columns.join(", ") + ")"),
+        _el("td", { style: { color: "#ff2d8a" } }, getForeignKeyColumns(fk).join(", ")),
+        _el("td", { style: { color: "#7b7898" } }, fk.ref_table + "(" + getForeignKeyRefColumns(fk).join(", ") + ")"),
       ]));
     }
     tbl.appendChild(tbody);
@@ -926,7 +1242,9 @@ function openDetailPanel(node) {
     .select(".node-main")
     .attr("stroke-width", d => d.key === node.key ? 3.5 : connectedKeys.has(d.key) ? 3 : 2.5);
   gRoot.selectAll("g.entry-point")
-    .attr("opacity", d => connectedKeys.has(d.key) ? 1 : 0.15);
+    .attr("opacity", d => connectedKeys.has(d.key) ? 1 : 0.15)
+    .select(".entry-main")
+    .attr("stroke-width", d => connectedKeys.has(d.key) ? 3 : 2.5);
   gRoot.selectAll("path.connection")
     .attr("opacity", d => connectedEdges.has(d.key) ? 1 : 0.06);
 }
@@ -937,7 +1255,8 @@ function closeDetailPanel() {
   // Restore full opacity
   gRoot.selectAll("g.table-node").attr("opacity", 1)
     .select(".node-main").attr("stroke-width", 2.5);
-  gRoot.selectAll("g.entry-point").attr("opacity", 1);
+  gRoot.selectAll("g.entry-point").attr("opacity", 1)
+    .select(".entry-main").attr("stroke-width", 2.5);
   gRoot.selectAll("path.connection")
     .attr("opacity", d => d.type === "fk" ? 0.5 : 0.9);
 }
@@ -1014,8 +1333,8 @@ function openComparePanel(nodeB) {
   ]));
   tbody.appendChild(_el("tr", null, [
     _el("td", { style: { color: "#7b7898" } }, "PK"),
-    _el("td", null, nodeA.data.primary_key?.columns.join(", ") || "-"),
-    _el("td", null, nodeB.data.primary_key?.columns.join(", ") || "-"),
+    _el("td", null, getPrimaryKeyColumns(nodeA.data.primary_key).join(", ") || "-"),
+    _el("td", null, getPrimaryKeyColumns(nodeB.data.primary_key).join(", ") || "-"),
   ]));
   tbl.appendChild(tbody);
   summSec.appendChild(tbl);
@@ -1054,6 +1373,77 @@ function openComparePanel(nodeB) {
     .attr("opacity", d => (d.key === nodeA.key || d.key === nodeB.key) ? 1 : 0.15)
     .select(".node-main")
     .attr("stroke-width", d => (d.key === nodeA.key || d.key === nodeB.key) ? 3.5 : 2.5);
+}
+
+// ── Entry point detail panel ───────────────────────────────────
+
+function openEntryPointPanel(entry) {
+  const panel = document.getElementById("detail-panel");
+  const dbTag = document.getElementById("detail-db-tag");
+  const tblName = document.getElementById("detail-table-name");
+  const rowCount = document.getElementById("detail-row-count");
+  const content = document.getElementById("detail-content");
+  CS.selectedTable = null;
+
+  dbTag.textContent = (entry.entryType || "api").toUpperCase();
+  dbTag.style.borderColor = "#ff2d8a";
+  dbTag.style.color = "#ff2d8a";
+  dbTag.style.background = "rgba(255,45,138,.1)";
+  tblName.textContent = entry.name;
+  rowCount.textContent = `${(entry.targets || []).length} targets`;
+
+  while (content.firstChild) content.removeChild(content.firstChild);
+
+  const infoSec = _makeSection("Entry Point");
+  const infoWrap = _el("div", { style: { fontSize: "12px", lineHeight: "1.8" } });
+  infoWrap.appendChild(_infoRow("ID", entry.key, "#ff2d8a"));
+  infoWrap.appendChild(_infoRow("Type", entry.entryType || "api", "#ff2d8a"));
+  if (entry.description) infoWrap.appendChild(_infoRow("Description", entry.description));
+  infoSec.appendChild(infoWrap);
+  content.appendChild(infoSec);
+
+  const targetConns = (CS.layout?.connections || []).filter(c => c.type === "entry" && c.source.key === entry.key);
+  if (targetConns.length) {
+    const targetSec = _makeSection("Targets");
+    const tbl = _el("table", { className: "detail-tbl" });
+    const thead = _el("thead");
+    thead.appendChild(_el("tr", null, [_el("th", null, "Database"), _el("th", null, "Schema"), _el("th", null, "Table"), _el("th", null, "Rows")]));
+    tbl.appendChild(thead);
+    const tbody = _el("tbody");
+    for (const c of targetConns) {
+      const t = c.target;
+      const tr = _el("tr", { style: { cursor: "pointer" } }, [
+        _el("td", { style: { color: t.dbColor } }, t.dbKey),
+        _el("td", { style: { color: "#7b7898" } }, t.schemaLabel || t.data.schema || "-"),
+        _el("td", null, t.label),
+        _el("td", { style: { color: "#c8ff00" } }, formatCount(t.rowCount)),
+      ]);
+      tr.addEventListener("click", () => openDetailPanel(t));
+      tbody.appendChild(tr);
+    }
+    tbl.appendChild(tbody);
+    targetSec.appendChild(tbl);
+    content.appendChild(targetSec);
+  }
+
+  panel.classList.add("open");
+
+  const connectedKeys = new Set([entry.key]);
+  const connectedEdges = new Set();
+  for (const c of targetConns) {
+    connectedKeys.add(c.target.key);
+    connectedEdges.add(c.key);
+  }
+  gRoot.selectAll("g.table-node")
+    .attr("opacity", d => connectedKeys.has(d.key) ? 1 : 0.15)
+    .select(".node-main")
+    .attr("stroke-width", d => connectedKeys.has(d.key) ? 3 : 2.5);
+  gRoot.selectAll("g.entry-point")
+    .attr("opacity", d => d.key === entry.key ? 1 : 0.15)
+    .select(".entry-main")
+    .attr("stroke-width", d => d.key === entry.key ? 3.5 : 2.5);
+  gRoot.selectAll("path.connection")
+    .attr("opacity", d => connectedEdges.has(d.key) ? 1 : 0.06);
 }
 
 // ── Connection (arrow) detail panel ────────────────────────────
@@ -1156,7 +1546,8 @@ function canvasZoomOut() { svgEl.transition().duration(300).call(zoomBehavior.sc
 
 function canvasFit() {
   if (!CS.layout) return;
-  const nodes = [...CS.layout.tableNodes, ...CS.layout.entryPoints, ...CS.layout.dbContainers];
+  recomputeGroupBounds(CS.layout);
+  const nodes = [...CS.layout.tableNodes, ...CS.layout.entryPoints, ...(CS.layout.schemaGroups || []), ...CS.layout.dbContainers];
   if (!nodes.length) return;
 
   let minX = Infinity, minY = Infinity, maxX = -Infinity, maxY = -Infinity;
@@ -1183,6 +1574,7 @@ function autoArrange() {
   updateContainerBounds();
   renderJobOverlay();
   requestAnimationFrame(() => canvasFit());
+  setTimeout(() => canvasFit(), 900);
   if (typeof toast === "function") toast("Layout arranged", true);
 }
 
@@ -1238,7 +1630,8 @@ function renderMinimap() {
   if (!CS.layout) return;
   const mmSvg = d3.select("#minimap-svg");
   mmSvg.selectAll("*").remove();
-  const nodes = [...CS.layout.tableNodes, ...CS.layout.entryPoints, ...CS.layout.dbContainers];
+  recomputeGroupBounds(CS.layout);
+  const nodes = [...CS.layout.tableNodes, ...CS.layout.entryPoints, ...(CS.layout.schemaGroups || []), ...CS.layout.dbContainers];
   if (!nodes.length) return;
 
   let minX = Infinity, minY = Infinity, maxX = -Infinity, maxY = -Infinity;
@@ -1255,10 +1648,18 @@ function renderMinimap() {
     mmSvg.append("rect").attr("x", c.x).attr("y", c.y).attr("width", c.w).attr("height", c.h)
       .attr("fill", "none").attr("stroke", c.color).attr("stroke-width", 2).attr("opacity", 0.4);
   }
+  for (const s of CS.layout.schemaGroups || []) {
+    mmSvg.append("rect").attr("x", s.x).attr("y", s.y).attr("width", s.w).attr("height", s.h)
+      .attr("fill", "none").attr("stroke", s.color).attr("stroke-width", 1).attr("opacity", 0.28);
+  }
   // Table nodes as small dots
   for (const n of CS.layout.tableNodes) {
     mmSvg.append("rect").attr("x", n.x).attr("y", n.y).attr("width", n.w).attr("height", n.h)
       .attr("fill", n.dbColor).attr("opacity", 0.5).attr("rx", 2);
+  }
+  for (const n of CS.layout.entryPoints) {
+    mmSvg.append("rect").attr("x", n.x).attr("y", n.y).attr("width", n.w).attr("height", n.h)
+      .attr("fill", "#ff2d8a").attr("opacity", 0.45).attr("rx", 4);
   }
   // Viewport rect
   mmSvg.append("rect").attr("class", "minimap-viewport").attr("x", 0).attr("y", 0).attr("width", 0).attr("height", 0);
@@ -1293,6 +1694,7 @@ function canvasSearch(query) {
   if (!q) {
     gRoot.selectAll("g.table-node").attr("opacity", 1);
     gRoot.selectAll("g.db-container").attr("opacity", 1);
+    gRoot.selectAll("g.schema-group").attr("opacity", 1);
     gRoot.selectAll("g.entry-point").attr("opacity", 1);
     gRoot.selectAll("path.connection").attr("opacity", d => d.type === "fk" ? 0.5 : 0.9);
     if (countEl) countEl.textContent = "";
@@ -1301,12 +1703,15 @@ function canvasSearch(query) {
 
   let matchCount = 0;
   gRoot.selectAll("g.table-node").attr("opacity", function (d) {
-    const match = d.label.toLowerCase().includes(q) || d.tKey.toLowerCase().includes(q) || d.dbKey.toLowerCase().includes(q);
+    const haystack = [d.label, d.tKey, d.dbKey, d.schemaLabel, d.databaseName].join(" ").toLowerCase();
+    const match = haystack.includes(q);
     if (match) matchCount++;
     return match ? 1 : 0.15;
   });
+  gRoot.selectAll("g.schema-group").attr("opacity", d =>
+    [d.label, d.dbKey, d.databaseName].join(" ").toLowerCase().includes(q) ? 1 : 0.12);
   gRoot.selectAll("g.entry-point").attr("opacity", d =>
-    d.name.toLowerCase().includes(q) ? 1 : 0.15);
+    [d.name, d.entryType, d.description].join(" ").toLowerCase().includes(q) ? 1 : 0.15);
   gRoot.selectAll("path.connection").attr("opacity", 0.1);
   if (countEl) countEl.textContent = matchCount ? matchCount + " found" : "no results";
 }
@@ -1404,7 +1809,8 @@ function renderJobOverlay() {
     const gy = container.y + 14;
 
     const g = overlay.append("g")
-      .attr("class", "job-status-icon")
+      .datum({ node: container, pillW })
+      .attr("class", "job-status-icon job-db-status")
       .attr("transform", `translate(${gx}, ${gy})`);
 
     // Background pill
@@ -1445,7 +1851,8 @@ function renderJobOverlay() {
     const color = JOB_COLORS[worst];
 
     const g = overlay.append("g")
-      .attr("class", "job-status-icon")
+      .datum({ node })
+      .attr("class", "job-status-icon job-table-status")
       .attr("transform", `translate(${node.x + node.w + 4}, ${node.y + TABLE_H / 2})`);
 
     if (worst === "running") {
@@ -1492,24 +1899,24 @@ function renderJobOverlay() {
     if (!sched || sched.state === "scheduled") continue;
 
     const color = JOB_COLORS[sched.state];
-    const sx = conn.source.x + conn.source.w, sy = conn.source.y + conn.source.h / 2;
-    const tx = conn.target.x, ty = conn.target.y + conn.target.h / 2;
-    const mx = (sx + tx) / 2, my = (sy + ty) / 2;
+    const mid = connectionMidpoint(conn);
 
     if (sched.state === "running") {
       // Overlay animated dashed line on top of the pipeline
       overlay.append("path")
+        .datum(conn)
         .attr("d", arrowPath(conn))
         .attr("fill", "none").attr("stroke", color).attr("stroke-width", 3)
         .attr("stroke-dasharray", "8,6").attr("opacity", 0.7)
-        .attr("class", "job-running-dash")
+        .attr("class", "job-running-dash job-conn-line")
         .style("pointer-events", "none");
     }
 
     // State badge on midpoint
     const badge = overlay.append("g")
-      .attr("class", "job-status-icon")
-      .attr("transform", `translate(${mx}, ${my + 10})`);
+      .datum({ conn })
+      .attr("class", "job-status-icon job-conn-badge")
+      .attr("transform", `translate(${mid.x}, ${mid.y + 10})`);
     badge.append("rect")
       .attr("x", -20).attr("y", -7).attr("width", 40).attr("height", 14).attr("rx", 7)
       .attr("fill", color + "20").attr("stroke", color).attr("stroke-width", 1);
@@ -1520,6 +1927,22 @@ function renderJobOverlay() {
       .attr("fill", color)
       .text(sched.state === "running" ? "SYNC" : "FAIL");
   }
+  updateJobOverlayPositions();
+}
+
+function updateJobOverlayPositions() {
+  if (!gRoot || !CS.layout) return;
+  gRoot.selectAll(".job-db-status")
+    .attr("transform", d => `translate(${d.node.x + d.node.w - d.pillW - 6}, ${d.node.y + 14})`);
+  gRoot.selectAll(".job-table-status")
+    .attr("transform", d => `translate(${d.node.x + d.node.w + 4}, ${d.node.y + d.node.h / 2})`);
+  gRoot.selectAll(".job-conn-line")
+    .attr("d", d => arrowPath(d));
+  gRoot.selectAll(".job-conn-badge")
+    .attr("transform", d => {
+      const m = connectionMidpoint(d.conn);
+      return `translate(${m.x}, ${m.y + 10})`;
+    });
 }
 
 function toggleJobOverlay(visible) {

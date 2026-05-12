@@ -45,48 +45,51 @@ function topoSortDBs(dbKeys, pipeConns, epConns) {
   return sorted;
 }
 
-// ── Extract arrowPath (with mock CS.layout) ──────────────────
+// ── Extract arrowPath ────────────────────────────────────────
 
-let mockLayout = { gapColumns: [], dbContainers: [] };
+function connectionEndpoints(conn) {
+  const s = conn.source, t = conn.target;
+  const scx = s.x + (s.w || 0) / 2;
+  const scy = s.y + (s.h || 0) / 2;
+  const tcx = t.x + (t.w || 0) / 2;
+  const tcy = t.y + (t.h || 0) / 2;
+  const dx = tcx - scx;
+  const dy = tcy - scy;
+
+  if (Math.abs(dx) >= Math.abs(dy)) {
+    return {
+      sx: dx >= 0 ? s.x + (s.w || 0) : s.x,
+      sy: scy,
+      tx: dx >= 0 ? t.x : t.x + (t.w || 0),
+      ty: tcy,
+      axis: "x",
+      dir: dx >= 0 ? 1 : -1,
+    };
+  }
+  return {
+    sx: scx,
+    sy: dy >= 0 ? s.y + (s.h || 0) : s.y,
+    tx: tcx,
+    ty: dy >= 0 ? t.y : t.y + (t.h || 0),
+    axis: "y",
+    dir: dy >= 0 ? 1 : -1,
+  };
+}
+
+function connectionMidpoint(conn) {
+  const p = connectionEndpoints(conn);
+  return { x: (p.sx + p.tx) / 2, y: (p.sy + p.ty) / 2 };
+}
 
 function arrowPath(conn) {
-  const s = conn.source, t = conn.target;
-  const sy = s.y + s.h / 2;
-  const ty = t.y + t.h / 2;
+  const p = connectionEndpoints(conn);
+  const dist = Math.hypot(p.tx - p.sx, p.ty - p.sy);
+  const bend = Math.min(210, Math.max(60, dist * 0.42));
 
-  if (conn.type === "fk" && s.dbKey && s.dbKey === t.dbKey) {
-    const rightEdge = Math.max(s.x + s.w, t.x + t.w);
-    const dist = Math.abs(sy - ty);
-    const bump = Math.min(60, Math.max(25, dist * 0.35));
-    return `M${s.x + s.w},${sy} C${rightEdge + bump},${sy} ${rightEdge + bump},${ty} ${t.x + t.w},${ty}`;
+  if (p.axis === "x") {
+    return `M${p.sx},${p.sy} C${p.sx + bend * p.dir},${p.sy} ${p.tx - bend * p.dir},${p.ty} ${p.tx},${p.ty}`;
   }
-
-  const sx = s.x + (s.w || 0);
-  const tx = t.x;
-
-  if (tx > sx + 10) {
-    const gaps = mockLayout.gapColumns || [];
-    const relevant = gaps.filter(g => g.midX > sx && g.midX < tx);
-    if (relevant.length <= 1) {
-      const mx = relevant.length === 1 ? relevant[0].midX : (sx + tx) / 2;
-      return `M${sx},${sy} C${mx},${sy} ${mx},${ty} ${tx},${ty}`;
-    }
-    const cx1 = relevant[0].midX;
-    const cx2 = relevant[relevant.length - 1].midX;
-    return `M${sx},${sy} C${cx1},${sy} ${cx2},${ty} ${tx},${ty}`;
-  }
-
-  const containers = mockLayout.dbContainers || [];
-  let topY = Math.min(sy, ty);
-  for (const c of containers) {
-    if (c.x + c.w > Math.min(tx, sx) - 10 && c.x < Math.max(tx, sx) + 10) {
-      topY = Math.min(topY, c.y);
-    }
-  }
-  topY -= 40;
-  const loopOut = 50;
-  return `M${sx},${sy} C${sx + loopOut},${sy} ${sx + loopOut},${topY} ${(sx + tx) / 2},${topY}` +
-    ` C${tx - loopOut},${topY} ${tx - loopOut},${ty} ${tx},${ty}`;
+  return `M${p.sx},${p.sy} C${p.sx},${p.sy + bend * p.dir} ${p.tx},${p.ty - bend * p.dir} ${p.tx},${p.ty}`;
 }
 
 // ══════════════════════════════════════════════════════════════
@@ -178,83 +181,68 @@ console.log("topoSortDBs:");
 
 console.log("\narrowPath:");
 
-// Test: forward connection with no gaps (adjacent DBs)
+// Test: rightward connection uses nearest horizontal sides
 {
-  mockLayout = { gapColumns: [], dbContainers: [] };
   const conn = {
     type: "pipeline",
     source: { x: 100, y: 50, w: 200, h: 36 },
     target: { x: 500, y: 100, w: 200, h: 36 },
   };
   const path = arrowPath(conn);
-  assert(path.startsWith("M300,68"), "forward no-gap: starts at source right edge");
-  assert(path.includes("C400,"), "forward no-gap: control at midpoint x=400");
-  console.log(`  forward no-gap: ${path.slice(0, 50)}...`);
+  assert(path.startsWith("M300,68"), "rightward: starts at source right edge");
+  assert(path.endsWith("500,118"), "rightward: ends at target left edge");
+  console.log(`  rightward: ${path.slice(0, 55)}...`);
 }
 
-// Test: forward connection through single gap
+// Test: leftward connection uses nearest horizontal sides
 {
-  mockLayout = { gapColumns: [{ midX: 450 }], dbContainers: [] };
+  const conn = {
+    type: "pipeline",
+    source: { x: 500, y: 100, w: 200, h: 36 },
+    target: { x: 100, y: 50, w: 200, h: 36 },
+  };
+  const path = arrowPath(conn);
+  assert(path.startsWith("M500,118"), "leftward: starts at source left edge");
+  assert(path.endsWith("300,68"), "leftward: ends at target right edge");
+  console.log(`  leftward: ${path.slice(0, 55)}...`);
+}
+
+// Test: vertical connection uses top/bottom sides
+{
   const conn = {
     type: "pipeline",
     source: { x: 100, y: 50, w: 200, h: 36 },
-    target: { x: 600, y: 100, w: 200, h: 36 },
+    target: { x: 120, y: 250, w: 200, h: 36 },
   };
   const path = arrowPath(conn);
-  assert(path.includes("C450,"), "single gap: control at gap midX=450");
-  console.log(`  single gap: ${path.slice(0, 50)}...`);
+  assert(path.startsWith("M200,86"), "vertical: starts at source bottom center");
+  assert(path.endsWith("220,250"), "vertical: ends at target top center");
+  console.log(`  vertical: ${path.slice(0, 55)}...`);
 }
 
-// Test: forward connection through multiple gaps
+// Test: FK same-DB connection still routes between nearest sides
 {
-  mockLayout = { gapColumns: [{ midX: 400 }, { midX: 600 }, { midX: 800 }], dbContainers: [] };
-  const conn = {
-    type: "pipeline",
-    source: { x: 100, y: 50, w: 200, h: 36 },
-    target: { x: 900, y: 100, w: 200, h: 36 },
-  };
-  const path = arrowPath(conn);
-  assert(path.includes("C400,"), "multi-gap: first control at gap 400");
-  assert(path.includes("800,"), "multi-gap: second control at gap 800");
-  console.log(`  multi-gap: ${path.slice(0, 60)}...`);
-}
-
-// Test: FK same-DB connection — uses right-side bump
-{
-  mockLayout = { gapColumns: [], dbContainers: [] };
   const conn = {
     type: "fk",
     source: { x: 400, y: 50, w: 200, h: 36, dbKey: "pg" },
     target: { x: 400, y: 150, w: 200, h: 36, dbKey: "pg" },
   };
   const path = arrowPath(conn);
-  // Source exits right (600), target enters right (600), bump goes beyond 600
-  assert(path.startsWith("M600,68"), "fk: starts at source right edge");
-  assert(path.endsWith(",168"), "fk: ends at target center-y");
-  // Bump should push control points beyond rightEdge (600)
-  const match = path.match(/C(\d+)/);
-  assert(match && parseInt(match[1]) > 600, "fk: control point is right of edge");
+  assert(path.startsWith("M500,86"), "fk: starts at source bottom center");
+  assert(path.endsWith("500,150"), "fk: ends at target top center");
   console.log(`  fk same-db: ${path.slice(0, 60)}...`);
 }
 
-// Test: backward connection — routes above
+// Test: connectionMidpoint returns midpoint of routed endpoints
 {
-  mockLayout = {
-    gapColumns: [],
-    dbContainers: [
-      { x: 100, y: 0, w: 250, h: 300, key: "a" },
-      { x: 500, y: 0, w: 250, h: 300, key: "b" },
-    ],
-  };
   const conn = {
     type: "pipeline",
-    source: { x: 500, y: 150, w: 200, h: 36 },
-    target: { x: 100, y: 100, w: 200, h: 36 },
+    source: { x: 100, y: 50, w: 200, h: 36 },
+    target: { x: 500, y: 100, w: 200, h: 36 },
   };
-  const path = arrowPath(conn);
-  // Should route above (negative y or at least above container top y=0)
-  assert(path.includes("-40"), "backward: routes above containers (y = -40)");
-  console.log(`  backward: ${path.slice(0, 70)}...`);
+  const mid = connectionMidpoint(conn);
+  assertDeepEqual(mid, { x: 400, y: 93 }, "midpoint uses routed endpoints");
+  console.log(`  midpoint: ${JSON.stringify(mid)}`);
 }
 
 // ══════════════════════════════════════════════════════════════
