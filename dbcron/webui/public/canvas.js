@@ -35,6 +35,7 @@ const DB_PAD_TOP = 58, DB_PAD_X = 28, DB_PAD_BOTTOM = 28;
 const SCHEMA_PAD_TOP = 36, SCHEMA_PAD_X = 18, SCHEMA_PAD_BOTTOM = 18;
 const EP_W = 168, EP_H = 52;
 const DB_GAP = 420, SCHEMA_GAP_X = 285, SCHEMA_GAP_Y = 230;
+const DB_COLLIDE_PAD = 56;
 
 let svgEl, gRoot, zoomBehavior, forceSim, minimapFrame, minimapLastRender = 0;
 
@@ -480,6 +481,77 @@ function recomputeGroupBounds(layout) {
   }
 }
 
+function containerOverlapMoves(containers, padding) {
+  const moves = new Map();
+  const addMove = (key, dx, dy) => {
+    const cur = moves.get(key) || { x: 0, y: 0 };
+    cur.x += dx;
+    cur.y += dy;
+    moves.set(key, cur);
+  };
+
+  for (let i = 0; i < containers.length; i++) {
+    for (let j = i + 1; j < containers.length; j++) {
+      const a = containers[i];
+      const b = containers[j];
+      const ax = a.x + a.w / 2;
+      const ay = a.y + a.h / 2;
+      const bx = b.x + b.w / 2;
+      const by = b.y + b.h / 2;
+      let dx = ax - bx;
+      let dy = ay - by;
+      if (dx === 0 && dy === 0) {
+        dx = i < j ? -0.1 : 0.1;
+        dy = i < j ? -0.1 : 0.1;
+      }
+
+      const overlapX = (a.w + b.w) / 2 + padding - Math.abs(dx);
+      const overlapY = (a.h + b.h) / 2 + padding - Math.abs(dy);
+      if (overlapX <= 0 || overlapY <= 0) continue;
+
+      if (overlapX < overlapY) {
+        const dir = dx < 0 ? -1 : 1;
+        const push = overlapX / 2 + 1;
+        addMove(a.key, dir * push, 0);
+        addMove(b.key, -dir * push, 0);
+      } else {
+        const dir = dy < 0 ? -1 : 1;
+        const push = overlapY / 2 + 1;
+        addMove(a.key, 0, dir * push);
+        addMove(b.key, 0, -dir * push);
+      }
+    }
+  }
+
+  return moves;
+}
+
+function shiftDbMembers(layout, dbKey, dx, dy, shiftAnchors) {
+  if (!dx && !dy) return;
+  for (const node of layout.tableNodes || []) {
+    if (node.dbKey !== dbKey) continue;
+    node.x += dx;
+    node.y += dy;
+    if (shiftAnchors) {
+      node.clusterX = (Number.isFinite(node.clusterX) ? node.clusterX : node.x - dx) + dx;
+      node.clusterY = (Number.isFinite(node.clusterY) ? node.clusterY : node.y - dy) + dy;
+    }
+  }
+}
+
+function separateDbContainers(layout, padding, iterations) {
+  if (!layout) return;
+  for (let i = 0; i < iterations; i++) {
+    recomputeGroupBounds(layout);
+    const moves = containerOverlapMoves(layout.dbContainers || [], padding);
+    if (!moves.size) break;
+    for (const [dbKey, move] of moves) {
+      shiftDbMembers(layout, dbKey, move.x, move.y, true);
+    }
+  }
+  recomputeGroupBounds(layout);
+}
+
 // ── Rendering ──────────────────────────────────────────────────
 
 function renderCanvas() {
@@ -895,8 +967,10 @@ function startForceLayout() {
     .force("clusterX", d3.forceX(d => d.clusterX ?? d.x).strength(d => d.type === "entry-point" ? 0.11 : 0.07))
     .force("clusterY", d3.forceY(d => d.clusterY ?? d.y).strength(d => d.type === "entry-point" ? 0.11 : 0.07))
     .force("rectCollide", forceRectCollide(24, 0.72))
+    .force("dbCollide", forceDbContainerCollide(CS.layout, DB_COLLIDE_PAD, 1.35))
     .on("tick", updateGraphPositions)
     .on("end", () => {
+      separateDbContainers(CS.layout, DB_COLLIDE_PAD, 10);
       updateGraphPositions();
       queueMinimapRender();
     });
@@ -959,6 +1033,23 @@ function forceRectCollide(padding, strength) {
     maxHalfH = Math.max(32, ...nodes.map(n => (n.h || 0) / 2));
   };
 
+  return force;
+}
+
+function forceDbContainerCollide(layout, padding, strength) {
+  function force(alpha) {
+    if (!layout) return;
+    recomputeGroupBounds(layout);
+    const moves = containerOverlapMoves(layout.dbContainers || [], padding);
+    for (const [dbKey, move] of moves) {
+      for (const node of layout.tableNodes || []) {
+        if (node.dbKey !== dbKey) continue;
+        node.vx += move.x * strength * alpha;
+        node.vy += move.y * strength * alpha;
+      }
+    }
+  }
+  force.initialize = function () {};
   return force;
 }
 

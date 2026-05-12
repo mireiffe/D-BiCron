@@ -92,6 +92,51 @@ function arrowPath(conn) {
   return `M${p.sx},${p.sy} C${p.sx},${p.sy + bend * p.dir} ${p.tx},${p.ty - bend * p.dir} ${p.tx},${p.ty}`;
 }
 
+function containerOverlapMoves(containers, padding) {
+  const moves = new Map();
+  const addMove = (key, dx, dy) => {
+    const cur = moves.get(key) || { x: 0, y: 0 };
+    cur.x += dx;
+    cur.y += dy;
+    moves.set(key, cur);
+  };
+
+  for (let i = 0; i < containers.length; i++) {
+    for (let j = i + 1; j < containers.length; j++) {
+      const a = containers[i];
+      const b = containers[j];
+      const ax = a.x + a.w / 2;
+      const ay = a.y + a.h / 2;
+      const bx = b.x + b.w / 2;
+      const by = b.y + b.h / 2;
+      let dx = ax - bx;
+      let dy = ay - by;
+      if (dx === 0 && dy === 0) {
+        dx = i < j ? -0.1 : 0.1;
+        dy = i < j ? -0.1 : 0.1;
+      }
+
+      const overlapX = (a.w + b.w) / 2 + padding - Math.abs(dx);
+      const overlapY = (a.h + b.h) / 2 + padding - Math.abs(dy);
+      if (overlapX <= 0 || overlapY <= 0) continue;
+
+      if (overlapX < overlapY) {
+        const dir = dx < 0 ? -1 : 1;
+        const push = overlapX / 2 + 1;
+        addMove(a.key, dir * push, 0);
+        addMove(b.key, -dir * push, 0);
+      } else {
+        const dir = dy < 0 ? -1 : 1;
+        const push = overlapY / 2 + 1;
+        addMove(a.key, 0, dir * push);
+        addMove(b.key, 0, -dir * push);
+      }
+    }
+  }
+
+  return moves;
+}
+
 // ══════════════════════════════════════════════════════════════
 // topoSortDBs tests
 // ══════════════════════════════════════════════════════════════
@@ -243,6 +288,44 @@ console.log("\narrowPath:");
   const mid = connectionMidpoint(conn);
   assertDeepEqual(mid, { x: 400, y: 93 }, "midpoint uses routed endpoints");
   console.log(`  midpoint: ${JSON.stringify(mid)}`);
+}
+
+// ══════════════════════════════════════════════════════════════
+// containerOverlapMoves tests
+// ══════════════════════════════════════════════════════════════
+
+console.log("\ncontainerOverlapMoves:");
+
+// Test: overlapping DB boxes push apart on the shallow axis
+{
+  const moves = containerOverlapMoves([
+    { key: "a", x: 0, y: 0, w: 100, h: 100 },
+    { key: "b", x: 80, y: 0, w: 100, h: 100 },
+  ], 10);
+  assertDeepEqual(moves.get("a"), { x: -16, y: 0 }, "horizontal overlap: a moves left");
+  assertDeepEqual(moves.get("b"), { x: 16, y: 0 }, "horizontal overlap: b moves right");
+  console.log(`  horizontal overlap: a=${JSON.stringify(moves.get("a"))}, b=${JSON.stringify(moves.get("b"))}`);
+}
+
+// Test: vertically overlapping DB boxes push apart vertically
+{
+  const moves = containerOverlapMoves([
+    { key: "a", x: 0, y: 0, w: 100, h: 100 },
+    { key: "b", x: 0, y: 70, w: 100, h: 100 },
+  ], 10);
+  assertDeepEqual(moves.get("a"), { x: 0, y: -21 }, "vertical overlap: a moves up");
+  assertDeepEqual(moves.get("b"), { x: 0, y: 21 }, "vertical overlap: b moves down");
+  console.log(`  vertical overlap: a=${JSON.stringify(moves.get("a"))}, b=${JSON.stringify(moves.get("b"))}`);
+}
+
+// Test: boxes outside padding do not move
+{
+  const moves = containerOverlapMoves([
+    { key: "a", x: 0, y: 0, w: 100, h: 100 },
+    { key: "b", x: 120, y: 0, w: 100, h: 100 },
+  ], 10);
+  assert(moves.size === 0, "no overlap: no moves");
+  console.log("  no overlap: no moves");
 }
 
 // ══════════════════════════════════════════════════════════════
