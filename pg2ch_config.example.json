@@ -13,6 +13,7 @@
     "batch_size": 100000,
     "source_retention_batch_size": 10000,
     "overlap_minutes": 0,
+    "watermark_overlap": 0,
     "settings": {
       "index_granularity": 8192
     }
@@ -51,6 +52,7 @@
       "target_table": "default.event_logs",
       "timestamp_column": "created_at",
       "watermark_column": "sync_id",
+      "watermark_overlap": 100000,
       "engine": "MergeTree",
       "order_by": ["event_type", "created_at"],
       "partition_by": "toYYYYMMDD(created_at)",

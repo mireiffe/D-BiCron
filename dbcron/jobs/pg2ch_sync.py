@@ -5,7 +5,8 @@ PG 소스에서 CH 타겟으로 테이블 데이터를 동기화합니다.
 동작 모드:
   - Full copy: watermark 이력이 없으면 대상 테이블 TRUNCATE 후 전체 복사
   - Incremental: 기존 watermark 이후 변경분만 전송
-    (ReplacingMergeTree 사용 시 overlap_minutes 로 중복 허용, merge 시 자동 제거)
+    (ReplacingMergeTree 사용 시 overlap_minutes 또는 watermark_overlap 으로
+     중복 허용, merge 시 자동 제거)
 
 기능:
   - Column drop: 특정 소스 컬럼 제외
@@ -26,6 +27,7 @@ from __future__ import annotations
 
 import json
 import re
+from decimal import Decimal, InvalidOperation
 from datetime import date, datetime, timedelta, timezone
 
 from ..db import get_database
@@ -116,6 +118,49 @@ def _resolve_sync_since(raw: str) -> str:
     if delta:
         return (datetime.now() - delta).isoformat()
     return raw
+
+
+def _parse_watermark_overlap(raw) -> Decimal | None:
+    """숫자형 watermark 의 lookback 크기를 Decimal 로 변환."""
+    if raw is None:
+        return None
+    if isinstance(raw, bool):
+        raise ValueError("watermark_overlap must be a non-negative number")
+
+    try:
+        value = Decimal(str(raw).strip())
+    except (InvalidOperation, ValueError) as e:
+        raise ValueError("watermark_overlap must be a non-negative number") from e
+
+    if not value.is_finite() or value < 0:
+        raise ValueError("watermark_overlap must be a non-negative number")
+    if value == 0:
+        return None
+    return value
+
+
+def _apply_watermark_overlap(src_table: str, watermark, raw_overlap):
+    """숫자형 watermark 에 watermark_overlap 을 적용한 cutoff 를 반환."""
+    overlap = _parse_watermark_overlap(raw_overlap)
+    if overlap is None:
+        return watermark
+
+    try:
+        value = Decimal(str(watermark).strip())
+    except (InvalidOperation, ValueError) as e:
+        raise ValueError(
+            f"{src_table}: watermark_overlap requires a numeric watermark value"
+        ) from e
+
+    if not value.is_finite():
+        raise ValueError(
+            f"{src_table}: watermark_overlap requires a numeric watermark value"
+        )
+
+    cutoff = value - overlap
+    if cutoff == cutoff.to_integral_value():
+        return int(cutoff)
+    return cutoff
 
 
 def _validate_source_retention(
@@ -867,6 +912,7 @@ class Pg2ChSyncJob(Job):
         engine: str = tc.get("engine", "ReplacingMergeTree")
         batch_size: int = tc.get("batch_size", 100_000)
         overlap_min: int = tc.get("overlap_minutes", 0)
+        watermark_overlap = tc.get("watermark_overlap", 0)
         use_nullable: bool = tc.get("use_nullable", True)
         raw_retention: str | None = tc.get("source_retention")
         full_copy_strategy = _normalize_full_copy_strategy(
@@ -957,14 +1003,21 @@ class Pg2ChSyncJob(Job):
 
             if watermark:
                 cutoff = watermark
+                applied_time_overlap = False
                 if overlap_min:
                     try:
                         wm_dt = datetime.fromisoformat(watermark)
                         cutoff = (
                             wm_dt - timedelta(minutes=overlap_min)
                         ).isoformat()
+                        applied_time_overlap = True
                     except (ValueError, TypeError):
-                        pass  # 정수형 watermark — overlap 미적용
+                        pass  # 숫자형 watermark 는 watermark_overlap 로 처리
+
+                if not applied_time_overlap:
+                    cutoff = _apply_watermark_overlap(
+                        src_table, watermark, watermark_overlap
+                    )
 
                 # WHERE 절 구성
                 conditions = [f'"{wm_col}" > %s']
@@ -987,10 +1040,11 @@ class Pg2ChSyncJob(Job):
                 )
                 params: tuple | None = tuple(params_list)
                 self.logger.info(
-                    "%s: incremental from %s (overlap %dm)",
+                    "%s: incremental from %s (time overlap %dm, watermark overlap %s)",
                     src_table,
                     cutoff,
                     overlap_min,
+                    watermark_overlap,
                 )
             else:
                 # Full copy

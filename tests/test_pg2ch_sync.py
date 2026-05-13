@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+from decimal import Decimal
 from datetime import datetime, timedelta
 from unittest.mock import MagicMock, patch
 
@@ -10,8 +11,10 @@ import pytest
 
 from dbcron.jobs.pg2ch_sync import (
     Pg2ChSyncJob,
+    _apply_watermark_overlap,
     _fmt_bytes,
     _parse_relative_to_timedelta,
+    _parse_watermark_overlap,
     _pg_type_to_ch,
     _resolve_sync_since,
     _unwrap_ch_type,
@@ -509,6 +512,38 @@ class TestResolveSyncSince:
         assert abs(datetime.fromisoformat(result) - expected) < timedelta(seconds=2)
 
 
+# ── 8-1. watermark_overlap ───────────────────────────────────────
+
+
+class TestWatermarkOverlap:
+    def test_parse_zero_as_disabled(self):
+        assert _parse_watermark_overlap(0) is None
+        assert _parse_watermark_overlap("0") is None
+
+    def test_parse_positive_number(self):
+        assert _parse_watermark_overlap("1000") == Decimal("1000")
+
+    def test_rejects_negative_number(self):
+        with pytest.raises(ValueError, match="non-negative number"):
+            _parse_watermark_overlap(-1)
+
+    def test_rejects_non_numeric_value(self):
+        with pytest.raises(ValueError, match="non-negative number"):
+            _parse_watermark_overlap("3d")
+
+    def test_apply_integer_overlap(self):
+        assert _apply_watermark_overlap("public.events", "1000", 50) == 950
+
+    def test_apply_decimal_overlap(self):
+        assert _apply_watermark_overlap("public.events", "1000.5", "0.5") == 1000
+
+    def test_apply_requires_numeric_watermark(self):
+        with pytest.raises(ValueError, match="requires a numeric watermark value"):
+            _apply_watermark_overlap(
+                "public.events", "2025-01-01T00:00:00", 100
+            )
+
+
 # ── 9. sync_since ────────────────────────────────────────────────
 
 
@@ -681,6 +716,52 @@ class TestSyncSince:
             execute_calls = stream_cursor.execute.call_args_list
             params = execute_calls[0][0][1]
             assert params == ("2025-06-01T00:00:00",)
+
+    def test_overlap_minutes_applied_to_timestamp_watermark(self):
+        """Timestamp watermark keeps using overlap_minutes."""
+        job = self._make_job()
+        ch = MagicMock()
+        ch.execute.side_effect = [
+            None,  # _ensure_ch_table
+            None,  # _ensure_watermark_table
+            [("2025-06-01T00:00:00",)],  # _get_watermark
+        ]
+
+        pg_conn = MagicMock()
+        pg_cols = [
+            {"name": "id", "pg_type": "integer", "nullable": False, "precision": None, "scale": None},
+            {"name": "updated_at", "pg_type": "timestamp without time zone", "nullable": False, "precision": None, "scale": None},
+        ]
+
+        tc = {
+            "source_table": "public.orders",
+            "target_table": "default.orders",
+            "timestamp_column": "updated_at",
+            "order_by": ["id"],
+            "engine": "ReplacingMergeTree",
+            "overlap_minutes": 30,
+            "watermark_overlap": 100,
+        }
+        sync_cfg = {"source": "pg_src"}
+
+        with (
+            patch.object(job, "_pg_connect", return_value=pg_conn),
+            patch.object(job, "_ch_connect", return_value=ch),
+            patch.object(job, "_get_pg_columns", return_value=pg_cols),
+        ):
+            stream_cursor = MagicMock()
+            stream_cursor.fetchmany.return_value = []
+            pg_conn.cursor.return_value = stream_cursor
+
+            job._sync_table(
+                {"host": "h", "port": 5432, "dbname": "src", "user": "u", "password": "p"},
+                {"host": "h", "port": 9000, "dbname": "tgt", "user": "default", "password": ""},
+                tc,
+                sync_cfg,
+            )
+
+            params = stream_cursor.execute.call_args[0][1]
+            assert params == ("2025-05-31T23:30:00",)
 
 
 # ── 10. default_args and scope, load_config ──────────────────────
@@ -1146,6 +1227,48 @@ class TestWatermarkColumn:
             where_part = query.split("WHERE", 1)[1]
             assert '"created_at"' not in where_part
             assert params == ("100",)
+
+    def test_watermark_overlap_applied_to_integer_watermark(self):
+        """숫자형 watermark 에 watermark_overlap 만큼 lookback 적용."""
+        job = self._make_job()
+        ch = MagicMock()
+        ch.execute.side_effect = [
+            None,  # _ensure_ch_table
+            None,  # _ensure_watermark_table
+            [("100",)],  # _get_watermark
+        ]
+
+        pg_conn = MagicMock()
+        tc = {
+            "source_table": "public.events",
+            "target_table": "default.events",
+            "timestamp_column": "created_at",
+            "watermark_column": "sync_id",
+            "watermark_overlap": 20,
+            "order_by": ["sync_id"],
+            "engine": "MergeTree",
+        }
+        sync_cfg = {"source": "pg_src"}
+
+        with (
+            patch.object(job, "_pg_connect", return_value=pg_conn),
+            patch.object(job, "_ch_connect", return_value=ch),
+            patch.object(job, "_get_pg_columns", return_value=self.PG_COLS),
+        ):
+            stream_cursor = MagicMock()
+            stream_cursor.fetchmany.return_value = []
+            pg_conn.cursor.return_value = stream_cursor
+
+            job._sync_table(
+                {"host": "h", "port": 5432, "dbname": "src", "user": "u", "password": "p"},
+                {"host": "h", "port": 9000, "dbname": "tgt", "user": "default", "password": ""},
+                tc, sync_cfg,
+            )
+
+            query = stream_cursor.execute.call_args[0][0]
+            params = stream_cursor.execute.call_args[0][1]
+            assert '"sync_id" > %s' in query
+            assert params == (80,)
 
     def test_watermark_column_with_sync_since_adds_both_conditions(self):
         """watermark_column != timestamp_column 일 때 sync_since 는 별도 AND 조건."""
