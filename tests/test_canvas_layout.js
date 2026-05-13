@@ -137,6 +137,30 @@ function containerOverlapMoves(containers, padding) {
   return moves;
 }
 
+function schemaOverlapMoves(layout, padding) {
+  const moves = new Map();
+  const addMove = (key, dx, dy) => {
+    const cur = moves.get(key) || { x: 0, y: 0 };
+    cur.x += dx;
+    cur.y += dy;
+    moves.set(key, cur);
+  };
+  const byDb = new Map();
+
+  for (const group of layout?.schemaGroups || []) {
+    const groups = byDb.get(group.dbKey) || [];
+    groups.push(group);
+    byDb.set(group.dbKey, groups);
+  }
+
+  for (const groups of byDb.values()) {
+    const groupMoves = containerOverlapMoves(groups, padding);
+    for (const [key, move] of groupMoves) addMove(key, move.x, move.y);
+  }
+
+  return moves;
+}
+
 // ══════════════════════════════════════════════════════════════
 // topoSortDBs tests
 // ══════════════════════════════════════════════════════════════
@@ -326,6 +350,37 @@ console.log("\ncontainerOverlapMoves:");
   ], 10);
   assert(moves.size === 0, "no overlap: no moves");
   console.log("  no overlap: no moves");
+}
+
+// ══════════════════════════════════════════════════════════════
+// schemaOverlapMoves tests
+// ══════════════════════════════════════════════════════════════
+
+console.log("\nschemaOverlapMoves:");
+
+// Test: overlapping schema groups in the same DB push apart
+{
+  const moves = schemaOverlapMoves({
+    schemaGroups: [
+      { key: "db:public", dbKey: "db", x: 0, y: 0, w: 100, h: 100 },
+      { key: "db:raw", dbKey: "db", x: 80, y: 0, w: 100, h: 100 },
+    ],
+  }, 10);
+  assertDeepEqual(moves.get("db:public"), { x: -16, y: 0 }, "same DB schema overlap: public moves left");
+  assertDeepEqual(moves.get("db:raw"), { x: 16, y: 0 }, "same DB schema overlap: raw moves right");
+  console.log(`  same DB overlap: public=${JSON.stringify(moves.get("db:public"))}, raw=${JSON.stringify(moves.get("db:raw"))}`);
+}
+
+// Test: overlapping schema groups in different DBs do not push each other
+{
+  const moves = schemaOverlapMoves({
+    schemaGroups: [
+      { key: "db1:public", dbKey: "db1", x: 0, y: 0, w: 100, h: 100 },
+      { key: "db2:public", dbKey: "db2", x: 80, y: 0, w: 100, h: 100 },
+    ],
+  }, 10);
+  assert(moves.size === 0, "different DB schemas: no moves");
+  console.log("  different DB overlap: no moves");
 }
 
 // ══════════════════════════════════════════════════════════════
