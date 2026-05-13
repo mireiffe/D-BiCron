@@ -324,8 +324,8 @@ function computeLayout() {
           x: saved ? saved.x : seedX,
           y: saved ? saved.y : seedY,
           w, h: TABLE_H,
-          clusterX: groupX - w / 2,
-          clusterY: groupY - TABLE_H / 2,
+          clusterX: saved ? saved.x : groupX - w / 2,
+          clusterY: saved ? saved.y : groupY - TABLE_H / 2,
           data: tData, dbColor,
         });
       });
@@ -351,8 +351,8 @@ function computeLayout() {
         x: saved ? saved.x : anchor.x - 350 - (idx % 2) * 70,
         y: saved ? saved.y : anchor.y - 120 + idx * 88,
         w: EP_W, h: EP_H,
-        clusterX: anchor.x - 360,
-        clusterY: anchor.y - 80 + idx * 76,
+        clusterX: saved ? saved.x : anchor.x - 360,
+        clusterY: saved ? saved.y : anchor.y - 80 + idx * 76,
       });
     }
   }
@@ -539,6 +539,47 @@ function shiftDbMembers(layout, dbKey, dx, dy, shiftAnchors) {
   }
 }
 
+function getDbMemberNodes(layout, dbKey) {
+  return (layout?.tableNodes || []).filter(node => node.dbKey === dbKey);
+}
+
+function pinDbMembers(layout, dbKey) {
+  const members = getDbMemberNodes(layout, dbKey);
+  return members.map(node => {
+    node.fx = node.x;
+    node.fy = node.y;
+    return {
+      node,
+      x: node.x,
+      y: node.y,
+      clusterX: node.clusterX,
+      clusterY: node.clusterY,
+    };
+  });
+}
+
+function movePinnedDbMembers(snapshot, dx, dy) {
+  for (const item of snapshot || []) {
+    const node = item.node;
+    node.x = item.x + dx;
+    node.y = item.y + dy;
+    node.fx = node.x;
+    node.fy = node.y;
+    node.clusterX = (Number.isFinite(item.clusterX) ? item.clusterX : item.x) + dx;
+    node.clusterY = (Number.isFinite(item.clusterY) ? item.clusterY : item.y) + dy;
+  }
+}
+
+function releaseDbMembers(snapshot, persist) {
+  for (const item of snapshot || []) {
+    const node = item.node;
+    node.fx = null;
+    node.fy = null;
+    if (persist) CS.nodePositions[positionKey(node)] = { x: node.x, y: node.y };
+  }
+  if (persist) savePositions();
+}
+
 function separateDbContainers(layout, padding, iterations) {
   if (!layout) return;
   for (let i = 0; i < iterations; i++) {
@@ -575,10 +616,36 @@ function renderCanvas() {
 }
 
 function renderDBContainers(layer, containers) {
+  const drag = d3.drag()
+    .on("start", function (event, d) {
+      d3.select(this).raise();
+      if (!event.active && forceSim) forceSim.alphaTarget(0.12).restart();
+      d._dragStart = {
+        x: event.x,
+        y: event.y,
+        members: pinDbMembers(CS.layout, d.key),
+      };
+    })
+    .on("drag", function (event, d) {
+      if (!d._dragStart) return;
+      movePinnedDbMembers(d._dragStart.members, event.x - d._dragStart.x, event.y - d._dragStart.y);
+      updateGraphPositions();
+    })
+    .on("end", function (event, d) {
+      if (d._dragStart) {
+        releaseDbMembers(d._dragStart.members, true);
+        d._dragStart = null;
+      }
+      if (!event.active && forceSim) forceSim.alphaTarget(0);
+      if (forceSim) forceSim.alpha(0.22).restart();
+    });
+
   const g = layer.selectAll("g.db-container")
     .data(containers, d => d.key).join("g")
     .attr("class", "db-container")
-    .attr("transform", d => `translate(${d.x},${d.y})`);
+    .attr("transform", d => `translate(${d.x},${d.y})`)
+    .call(drag)
+    .style("cursor", "move");
 
   // Offset shadow (neo-brutalist)
   g.append("rect").attr("class", "container-shadow")
@@ -622,7 +689,8 @@ function renderSchemaGroups(layer, groups) {
   const g = layer.selectAll("g.schema-group")
     .data(groups, d => d.key).join("g")
     .attr("class", "schema-group")
-    .attr("transform", d => `translate(${d.x},${d.y})`);
+    .attr("transform", d => `translate(${d.x},${d.y})`)
+    .style("pointer-events", "none");
 
   g.append("rect").attr("class", "schema-shadow")
     .attr("x", 2).attr("y", 2)
