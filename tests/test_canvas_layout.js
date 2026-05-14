@@ -15,6 +15,41 @@ function assertDeepEqual(actual, expected, msg) {
   assert(a === b, `${msg}\n    expected: ${b}\n    actual:   ${a}`);
 }
 
+// ── Extract table filter helpers ──────────────────────────────
+
+function globMatch(pattern, str) {
+  const re = new RegExp("^" + pattern.replace(/[.+^${}()|[\]\\]/g, "\\$&")
+    .replace(/\*/g, ".*").replace(/\?/g, ".") + "$");
+  return re.test(str);
+}
+
+function tableNameCandidates(tableName) {
+  if (!tableName.includes(".")) return [tableName];
+  return [tableName, tableName.split(".").pop()];
+}
+
+function tablePatternMatch(pattern, tableName) {
+  return tableNameCandidates(tableName).some(name => globMatch(pattern, name));
+}
+
+function shouldIncludeTable(tableName, dbCfg) {
+  const includes = dbCfg.include_tables || [];
+  const excludes = dbCfg.exclude_tables || [];
+  if (includes.length && !includes.some(pat => tablePatternMatch(pat, tableName))) return false;
+  if (excludes.length && excludes.some(pat => tablePatternMatch(pat, tableName))) return false;
+  return true;
+}
+
+const TABLE_COLLIDE_PAD = 18, SAME_SCHEMA_TABLE_COLLIDE_PAD = 8;
+const ENTRY_DB_COLLIDE_PAD = 34;
+
+function tableCollisionPadding(a, b) {
+  if (a?.type === "table" && b?.type === "table" && a.groupKey && a.groupKey === b.groupKey) {
+    return SAME_SCHEMA_TABLE_COLLIDE_PAD;
+  }
+  return TABLE_COLLIDE_PAD;
+}
+
 // ── Extract topoSortDBs ──────────────────────────────────────
 
 function topoSortDBs(dbKeys, pipeConns, epConns) {
@@ -161,11 +196,80 @@ function schemaOverlapMoves(layout, padding) {
   return moves;
 }
 
+function entryDbOverlapMoves(layout, padding) {
+  const entryMoves = new Map();
+  const dbMoves = new Map();
+  const addMove = (map, key, dx, dy) => {
+    const cur = map.get(key) || { x: 0, y: 0 };
+    cur.x += dx;
+    cur.y += dy;
+    map.set(key, cur);
+  };
+
+  const entries = layout?.entryPoints || [];
+  const containers = layout?.dbContainers || [];
+  for (const entry of entries) {
+    for (const db of containers) {
+      const ex = entry.x + entry.w / 2;
+      const ey = entry.y + entry.h / 2;
+      const dx = ex - (db.x + db.w / 2);
+      const dy = ey - (db.y + db.h / 2);
+      const overlapX = (entry.w + db.w) / 2 + padding - Math.abs(dx);
+      const overlapY = (entry.h + db.h) / 2 + padding - Math.abs(dy);
+      if (overlapX <= 0 || overlapY <= 0) continue;
+
+      if (overlapX < overlapY) {
+        const dir = dx < 0 ? -1 : 1;
+        const push = overlapX + 1;
+        addMove(entryMoves, entry.key, dir * push * 0.82, 0);
+        addMove(dbMoves, db.key, -dir * push * 0.18, 0);
+      } else {
+        const dir = dy < 0 ? -1 : 1;
+        const push = overlapY + 1;
+        addMove(entryMoves, entry.key, 0, dir * push * 0.82);
+        addMove(dbMoves, db.key, 0, -dir * push * 0.18);
+      }
+    }
+  }
+
+  return { entries: entryMoves, dbs: dbMoves };
+}
+
+// ══════════════════════════════════════════════════════════════
+// table filters tests
+// ══════════════════════════════════════════════════════════════
+
+console.log("table filters:");
+
+// Test: schema-qualified include matches full schema.table name
+{
+  const cfg = { include_tables: ["sales.*"] };
+  assert(shouldIncludeTable("sales.orders", cfg), "schema include: sales.orders included");
+  assert(!shouldIncludeTable("public.orders", cfg), "schema include: public.orders excluded");
+  console.log("  schema include: sales.*");
+}
+
+// Test: existing table-only filters still match schema-qualified names
+{
+  const cfg = { include_tables: ["orders"] };
+  assert(shouldIncludeTable("public.orders", cfg), "table-only include matches qualified table");
+  assert(!shouldIncludeTable("public.users", cfg), "table-only include rejects other tables");
+  console.log("  table-only include with qualified names");
+}
+
+// Test: schema-qualified exclude filters out a whole schema
+{
+  const cfg = { exclude_tables: ["archive.*"] };
+  assert(shouldIncludeTable("public.orders", cfg), "schema exclude keeps public.orders");
+  assert(!shouldIncludeTable("archive.orders", cfg), "schema exclude removes archive.orders");
+  console.log("  schema exclude: archive.*");
+}
+
 // ══════════════════════════════════════════════════════════════
 // topoSortDBs tests
 // ══════════════════════════════════════════════════════════════
 
-console.log("topoSortDBs:");
+console.log("\ntopoSortDBs:");
 
 // Test: linear pipeline A → B → C
 {
@@ -320,6 +424,21 @@ console.log("\narrowPath:");
 
 console.log("\ncontainerOverlapMoves:");
 
+// Test: same-schema table collision padding is tighter than generic padding
+{
+  const same = tableCollisionPadding(
+    { type: "table", groupKey: "db:public" },
+    { type: "table", groupKey: "db:public" },
+  );
+  const other = tableCollisionPadding(
+    { type: "table", groupKey: "db:public" },
+    { type: "table", groupKey: "db:raw" },
+  );
+  assert(same < other, "same-schema collision padding is tighter");
+  assertDeepEqual({ same, other }, { same: 8, other: 18 }, "collision padding values");
+  console.log(`  table collision padding: same=${same}, other=${other}`);
+}
+
 // Test: overlapping DB boxes push apart on the shallow axis
 {
   const moves = containerOverlapMoves([
@@ -381,6 +500,36 @@ console.log("\nschemaOverlapMoves:");
   }, 10);
   assert(moves.size === 0, "different DB schemas: no moves");
   console.log("  different DB overlap: no moves");
+}
+
+// ══════════════════════════════════════════════════════════════
+// entryDbOverlapMoves tests
+// ══════════════════════════════════════════════════════════════
+
+console.log("\nentryDbOverlapMoves:");
+
+// Test: an API node overlapping a DB box is pushed outside and nudges the DB away
+{
+  const moves = entryDbOverlapMoves({
+    entryPoints: [{ key: "api", x: 0, y: 0, w: 100, h: 50 }],
+    dbContainers: [{ key: "db", x: 80, y: 0, w: 200, h: 100 }],
+  }, ENTRY_DB_COLLIDE_PAD);
+  const apiMove = moves.entries.get("api");
+  const dbMove = moves.dbs.get("db");
+  assert(apiMove.x < 0 && apiMove.y === 0, "entry/db overlap: api moves left");
+  assert(dbMove.x > 0 && dbMove.y === 0, "entry/db overlap: db moves right");
+  assert(Math.abs(apiMove.x) > Math.abs(dbMove.x), "entry/db overlap: api gets the larger push");
+  console.log(`  overlap: api=${JSON.stringify(apiMove)}, db=${JSON.stringify(dbMove)}`);
+}
+
+// Test: an API node already outside DB padding is not moved
+{
+  const moves = entryDbOverlapMoves({
+    entryPoints: [{ key: "api", x: 0, y: 0, w: 100, h: 50 }],
+    dbContainers: [{ key: "db", x: 250, y: 0, w: 200, h: 100 }],
+  }, ENTRY_DB_COLLIDE_PAD);
+  assert(moves.entries.size === 0 && moves.dbs.size === 0, "entry/db no overlap: no moves");
+  console.log("  no overlap: no moves");
 }
 
 // ══════════════════════════════════════════════════════════════

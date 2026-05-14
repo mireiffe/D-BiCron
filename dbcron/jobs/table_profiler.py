@@ -49,7 +49,7 @@ class TableProfilerJob(Job):
                 with engine.connect() as conn:
                     for tbl_key, tbl in db_info.get("tables", {}).items():
                         schema, table = tbl["schema"], tbl["table"]
-                        if not table_filter(db_id, table, db_cfg):
+                        if not table_filter(db_id, tbl_key, db_cfg):
                             continue
                         cols = tbl.get("columns", [])[:10]  # first 10 columns only
                         profile = {"columns": {}}

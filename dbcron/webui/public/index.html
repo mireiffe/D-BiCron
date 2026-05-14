@@ -925,14 +925,14 @@
         </div>
         <div class="db-form-row">
           <div class="field">
-            <span class="field-label">Include Tables</span>
-            <textarea id="db-include-tables" rows="2" placeholder="users, orders, products_*"></textarea>
-            <div class="field-hint">Whitelist: comma-separated, glob patterns (*, ?) OK. Empty = all.</div>
+            <span class="field-label">Include Tables / Schemas</span>
+            <textarea id="db-include-tables" rows="2" placeholder="users, orders, products_*, sales.*"></textarea>
+            <div class="field-hint">Whitelist: comma-separated, glob patterns (*, ?) OK. Use schema.* for a schema. Empty = all.</div>
           </div>
           <div class="field">
-            <span class="field-label">Exclude Tables</span>
-            <textarea id="db-exclude-tables" rows="2" placeholder="_tmp_*, log_*"></textarea>
-            <div class="field-hint">Blacklist: comma-separated, glob patterns (*, ?) OK.</div>
+            <span class="field-label">Exclude Tables / Schemas</span>
+            <textarea id="db-exclude-tables" rows="2" placeholder="_tmp_*, log_*, archive.*"></textarea>
+            <div class="field-hint">Blacklist: comma-separated, glob patterns (*, ?) OK. Use schema.* for a schema.</div>
           </div>
         </div>
         <div style="display:flex;gap:8px;justify-content:flex-end">

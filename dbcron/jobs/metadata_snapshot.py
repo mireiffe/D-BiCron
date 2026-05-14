@@ -50,7 +50,7 @@ def collect_db_metadata(
 ) -> dict[str, dict]:
     """SQLAlchemy inspect() 로 메타데이터 수집. DB 종류 무관.
 
-    table_filter(db_id, table_name, db_cfg) 함수로 테이블 필터링.
+    table_filter(db_id, "schema.table", db_cfg) 함수로 테이블 필터링.
     """
     insp = inspect(engine)
     skip = SYSTEM_SCHEMAS.get(db_type, set())
@@ -61,9 +61,10 @@ def collect_db_metadata(
     with engine.connect() as conn:
         for schema in schemas:
             for tbl_name in insp.get_table_names(schema=schema):
-                if table_filter and not table_filter(db_id, tbl_name, db_cfg or {}):
+                qualified_name = f"{schema}.{tbl_name}"
+                if table_filter and not table_filter(db_id, qualified_name, db_cfg or {}):
                     continue
-                key = f"{schema}.{tbl_name}"
+                key = qualified_name
 
                 # columns
                 raw_cols = insp.get_columns(tbl_name, schema=schema)

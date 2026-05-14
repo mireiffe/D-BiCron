@@ -108,6 +108,21 @@ class TestShouldIncludeTable:
         assert should_include_table("order_archive", cfg) is False
         assert should_include_table("users", cfg) is False
 
+    def test_schema_qualified_include(self):
+        cfg = {"include_tables": ["sales.*"]}
+        assert should_include_table("sales.orders", cfg) is True
+        assert should_include_table("public.orders", cfg) is False
+
+    def test_table_pattern_matches_schema_qualified_name(self):
+        cfg = {"include_tables": ["orders"]}
+        assert should_include_table("public.orders", cfg) is True
+        assert should_include_table("public.users", cfg) is False
+
+    def test_schema_qualified_exclude(self):
+        cfg = {"exclude_tables": ["archive.*"]}
+        assert should_include_table("public.orders", cfg) is True
+        assert should_include_table("archive.orders", cfg) is False
+
 
 # ── resolve_targets ─────────────────────────────────────────────────
 
@@ -135,6 +150,13 @@ class TestResolveTargets:
         assert len(dbs) == 1
         assert filter_fn("pg_src", "orders", dbs[0]) is True
         assert filter_fn("pg_src", "users", dbs[0]) is False
+        assert filter_fn("pg_src", "public.orders", dbs[0]) is True
+
+    def test_db_plus_schema_target(self, tmp_data_dir):
+        dbs, filter_fn = resolve_targets([{"db": "pg_src", "table": "sales.*"}])
+        assert len(dbs) == 1
+        assert filter_fn("pg_src", "sales.orders", dbs[0]) is True
+        assert filter_fn("pg_src", "public.orders", dbs[0]) is False
 
     def test_escalation_db_overrides_table(self, tmp_data_dir):
         """If both db-only and db+table entries exist, db-only wins (all tables)."""
@@ -155,8 +177,9 @@ class TestResolveTargets:
 
     def test_missing_db_key_skipped(self, tmp_data_dir):
         targets = [{"table": "orders"}]  # no "db" key
-        dbs, _ = resolve_targets(targets)
+        dbs, filter_fn = resolve_targets(targets)
         assert dbs == []
+        assert filter_fn("pg_src", "orders", {}) is False
 
     def test_respects_include_exclude(self, tmp_data_dir):
         """Per-DB include/exclude filters are still applied even with targets."""

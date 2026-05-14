@@ -46,7 +46,7 @@ class FKIntegrityJob(Job):
             try:
                 with engine.connect() as conn:
                     for tbl_key, tbl in db_info.get("tables", {}).items():
-                        if not table_filter(db_id, tbl["table"], db_cfg):
+                        if not table_filter(db_id, tbl_key, db_cfg):
                             continue
                         for fk in tbl.get("foreign_keys", []):
                             ref_parts = fk["ref_table"].split(".")

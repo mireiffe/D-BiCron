@@ -33,6 +33,7 @@ class FreshnessCheckJob(Job):
         # targets로 DB/table 범위 필터
         databases, table_filter = self.resolve_databases()
         target_db_ids = {d["id"] for d in databases} if databases else None
+        db_cfg_by_id = {d["id"]: d for d in databases}
 
         stale = []
         total_checked = 0
@@ -45,7 +46,7 @@ class FreshnessCheckJob(Job):
                 continue
 
             for tkey, t_cur in db_cur.get("tables", {}).items():
-                if not table_filter(db_id, t_cur.get("table", tkey), {}):
+                if not table_filter(db_id, tkey, db_cfg_by_id.get(db_id, {})):
                     continue
                 t_prev = db_prev.get("tables", {}).get(tkey)
                 if not t_prev:

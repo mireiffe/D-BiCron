@@ -35,6 +35,7 @@ class SchemaDriftJob(Job):
         # targets로 DB/table 범위 필터
         databases, table_filter = self.resolve_databases()
         target_db_ids = {d["id"] for d in databases} if databases else None
+        db_cfg_by_id = {d["id"]: d for d in databases}
 
         changes = []
         breaking = 0
@@ -47,11 +48,12 @@ class SchemaDriftJob(Job):
                 changes.append(f"[NEW DB] {db_id}")
                 continue
 
+            db_cfg = db_cfg_by_id.get(db_id, {})
             cur_tables = {k: v for k, v in db_cur.get("tables", {}).items()
-                          if table_filter(db_id, v.get("table", k), {})}
+                          if table_filter(db_id, k, db_cfg)}
             prev_tables_raw = db_prev.get("tables", {})
             prev_tables = {k: v for k, v in prev_tables_raw.items()
-                           if table_filter(db_id, v.get("table", k), {})}
+                           if table_filter(db_id, k, db_cfg)}
 
             for tkey in cur_tables:
                 if tkey not in prev_tables:

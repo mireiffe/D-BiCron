@@ -115,6 +115,21 @@ def create_engine_for(db_cfg: dict) -> Engine:
 
 # ── 테이블 필터 ──────────────────────────────────────────────────
 
+def _table_name_candidates(table_name: str) -> tuple[str, ...]:
+    """Return names that table filter patterns may match.
+
+    A schema-qualified name like ``public.orders`` matches both the full name
+    and the unqualified table name so existing ``orders`` patterns keep working.
+    """
+    if "." not in table_name:
+        return (table_name,)
+    return (table_name, table_name.rsplit(".", 1)[1])
+
+
+def _matches_table_pattern(table_name: str, pattern: str) -> bool:
+    return any(fnmatch.fnmatch(candidate, pattern) for candidate in _table_name_candidates(table_name))
+
+
 def should_include_table(table_name: str, db_cfg: dict) -> bool:
     """db_cfg 의 include_tables / exclude_tables 설정에 따라 테이블 포함 여부를 판단한다.
 
@@ -122,16 +137,18 @@ def should_include_table(table_name: str, db_cfg: dict) -> bool:
     - exclude_tables 가 설정되면 매칭되는 테이블을 제외 (blacklist)
     - 둘 다 설정되면 include 먼저 적용 후 exclude 로 제외
     - 패턴은 fnmatch glob (*, ?) 지원
+    - schema 단위 필터는 schema.table 형태로 지정 (예: public.*)
+    - 기존 table-only 패턴도 계속 지원 (예: orders)
     """
     includes = db_cfg.get("include_tables") or []
     excludes = db_cfg.get("exclude_tables") or []
 
     if includes:
-        if not any(fnmatch.fnmatch(table_name, pat) for pat in includes):
+        if not any(_matches_table_pattern(table_name, pat) for pat in includes):
             return False
 
     if excludes:
-        if any(fnmatch.fnmatch(table_name, pat) for pat in excludes):
+        if any(_matches_table_pattern(table_name, pat) for pat in excludes):
             return False
 
     return True
@@ -141,13 +158,13 @@ def should_include_table(table_name: str, db_cfg: dict) -> bool:
 
 def resolve_targets(
     targets: list[dict] | None,
-) -> tuple[list[dict], "Callable[[str, str], bool]"]:
+) -> tuple[list[dict], "Callable[[str, str, dict], bool]"]:
     """Schedule targets 를 기반으로 (필터된 DB 목록, 테이블 필터 함수)를 반환한다.
 
     targets 형식:
       [{"db": "shop_db"}, {"db": "shop_db", "table": "orders"}, ...]
       - db만 지정: 해당 DB의 모든 테이블
-      - db+table 지정: 해당 테이블만
+      - db+table 지정: 해당 테이블만 (schema.table 도 가능)
 
     targets 가 None 이거나 비어 있으면 전체 DB + 기존 include/exclude 필터 사용.
     """
@@ -180,10 +197,12 @@ def resolve_targets(
         # 기존 per-DB 필터 먼저
         if not should_include_table(table_name, db_cfg):
             return False
+        if db_id not in db_tables:
+            return False
         allowed = db_tables.get(db_id)
         if allowed is None:
             return True  # DB 전체 지정
-        return table_name in allowed
+        return any(_matches_table_pattern(table_name, pat) for pat in allowed)
 
     return filtered_dbs, table_filter
 

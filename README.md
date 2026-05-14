@@ -44,12 +44,15 @@ uv run python scripts/seed.py
     "port": 5432,
     "dbname": "mydb",
     "user": "myuser",
-    "password": "mypassword"
+    "password": "mypassword",
+    "include_tables": ["public.*", "orders"],
+    "exclude_tables": ["archive.*", "tmp_*"]
   }
 ]
 ```
 
 지원 DB 타입: `postgresql`, `mssql`, `sqlite`, `clickhouse`
+`include_tables` / `exclude_tables` 는 comma/glob 패턴을 지원하며, `schema.*` 형식으로 schema 단위 필터링도 가능합니다.
 
 ## 환경 변수
 
