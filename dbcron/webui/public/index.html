@@ -994,8 +994,12 @@ const JOB_COLOR_PALETTE = [
 ];
 function jobColor(name) {
   if (!name) return JOB_COLOR_PALETTE[0];
-  let h = 0;
-  for (let i = 0; i < name.length; i++) h = (h * 31 + name.charCodeAt(i)) >>> 0;
+  // FNV-1a 32-bit — better distribution for short ASCII strings than h*31
+  let h = 0x811c9dc5;
+  for (let i = 0; i < name.length; i++) {
+    h ^= name.charCodeAt(i);
+    h = Math.imul(h, 0x01000193) >>> 0;
+  }
   return JOB_COLOR_PALETTE[h % JOB_COLOR_PALETTE.length];
 }
 function jobColorDot(name) {
