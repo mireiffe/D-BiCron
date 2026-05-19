@@ -816,6 +816,24 @@
       </div>
       <div class="card mag-card tab-panel tab-visible" id="tab-history">
         <div class="card-body">
+          <div id="history-filters" style="display:flex;gap:10px;align-items:end;flex-wrap:wrap;margin-bottom:10px">
+            <div class="field">
+              <span class="field-label">Filter Job</span>
+              <select id="history-filter-job" onchange="onHistoryFilterChange()" style="width:180px">
+                <option value="">All jobs</option>
+              </select>
+            </div>
+            <div class="field">
+              <span class="field-label">Filter Config</span>
+              <select id="history-filter-config" onchange="onHistoryFilterChange()" style="width:220px">
+                <option value="">All configs</option>
+              </select>
+            </div>
+            <div class="field">
+              <span class="field-label">&nbsp;</span>
+              <button class="btn btn-cyan btn-sm" onclick="resetHistoryFilters()">CLEAR</button>
+            </div>
+          </div>
           <div id="history-list"></div>
         </div>
       </div>
@@ -968,6 +986,27 @@ let liveLogInterval = null;
 let liveRunId = null;
 let jobsCache = [];
 
+// Per-job stable color: hash job name into a fixed palette so each job type is visually distinct.
+const JOB_COLOR_PALETTE = [
+  "#00e5ff", "#c8ff00", "#ff2d8a", "#ffd000",
+  "#a78bfa", "#34d399", "#f97316", "#60a5fa",
+  "#f472b6", "#facc15", "#22d3ee", "#a3e635",
+];
+function jobColor(name) {
+  if (!name) return JOB_COLOR_PALETTE[0];
+  let h = 0;
+  for (let i = 0; i < name.length; i++) h = (h * 31 + name.charCodeAt(i)) >>> 0;
+  return JOB_COLOR_PALETTE[h % JOB_COLOR_PALETTE.length];
+}
+function jobColorDot(name) {
+  return makeEl("span", {
+    style: "display:inline-block;width:8px;height:8px;border-radius:50%;flex-shrink:0;"
+      + "background:" + jobColor(name)
+      + ";box-shadow:0 0 6px " + jobColor(name) + "55",
+    title: name,
+  });
+}
+
 function openCronGuide() { document.getElementById("cron-guide-modal").style.display = ""; }
 function closeCronGuide() { document.getElementById("cron-guide-modal").style.display = "none"; }
 
@@ -986,7 +1025,10 @@ async function loadConfigCandidates(defaultPath) {
 function configOptionLabel(c) { return c.label ? c.label + " - " + c.path : c.path; }
 function runDisplayName(run) { return run.configLabel ? run.jobName + " - " + run.configLabel : run.jobName; }
 function makeRunJobCell(run) {
-  const children = [makeEl("span", { className: "run-job-name" }, run.jobName)];
+  const children = [
+    jobColorDot(run.jobName),
+    makeEl("span", { className: "run-job-name" }, run.jobName),
+  ];
   if (run.configLabel) {
     children.push(makeEl("span", {
       className: "config-label-badge",
@@ -1306,11 +1348,20 @@ async function loadJobs() {
         statsEl = makeEl("div", { style: "font-size:10px;margin-bottom:6px;display:flex;gap:10px" }, parts);
       }
     }
-    const children = [makeEl("div", { className: "job-name" }, j.label), makeEl("div", { className: "job-desc" }, j.description)];
+    const nameRow = makeEl("div", {
+      className: "job-name",
+      style: "display:flex;align-items:center;gap:6px",
+    }, [jobColorDot(j.name), document.createTextNode(j.label)]);
+    const children = [nameRow, makeEl("div", { className: "job-desc" }, j.description)];
     if (statsEl) children.push(statsEl);
     children.push(makeEl("div", { className: "job-actions" }, actions));
     const cardClass = j.bundled ? "job-card bundled" : "job-card";
-    container.appendChild(makeEl("div", { className: cardClass }, children));
+    const card = makeEl("div", { className: cardClass }, children);
+    const c = jobColor(j.name);
+    card.style.borderLeftColor = c;
+    card.style.borderColor = c + "55"; // 33% alpha hex
+    card.style.boxShadow = "3px 3px 0 " + c + "33";
+    container.appendChild(card);
   }
   bundledJobs.forEach(j => renderJobCard(j, bel));
   customJobs.forEach(j => renderJobCard(j, el));
@@ -1323,6 +1374,7 @@ async function loadJobs() {
   clearEl(depSel);
   depSel.appendChild(makeEl("option", { value: "" }, "None (cron)"));
   jobs.forEach(j => depSel.appendChild(makeEl("option", { value: j.name }, "after " + j.label)));
+  refreshHistoryJobOptions();
 }
 
 async function loadSchedules() {
@@ -1400,14 +1452,69 @@ async function deleteSchedule(id) {
 const HISTORY_PAGE_SIZE = 100;
 let historyDisplayLimit = HISTORY_PAGE_SIZE;
 let historyObserver = null;
+const historyFilters = { jobName: "", config: "" };
+const seenConfigs = new Map(); // path → label, accumulated across loads
+
+function onHistoryFilterChange() {
+  historyFilters.jobName = document.getElementById("history-filter-job").value || "";
+  historyFilters.config = document.getElementById("history-filter-config").value || "";
+  historyDisplayLimit = HISTORY_PAGE_SIZE;
+  loadHistory();
+}
+function resetHistoryFilters() {
+  document.getElementById("history-filter-job").value = "";
+  document.getElementById("history-filter-config").value = "";
+  onHistoryFilterChange();
+}
+function refreshHistoryJobOptions() {
+  const sel = document.getElementById("history-filter-job");
+  if (!sel) return;
+  const cur = historyFilters.jobName;
+  clearEl(sel);
+  sel.appendChild(makeEl("option", { value: "" }, "All jobs"));
+  for (const j of jobsCache) {
+    const opt = makeEl("option", { value: j.name }, j.label || j.name);
+    if (j.name === cur) opt.selected = true;
+    sel.appendChild(opt);
+  }
+}
+function refreshHistoryConfigOptions() {
+  const sel = document.getElementById("history-filter-config");
+  if (!sel) return;
+  const cur = historyFilters.config;
+  clearEl(sel);
+  sel.appendChild(makeEl("option", { value: "" }, "All configs"));
+  const sorted = [...seenConfigs.entries()].sort((a, b) => {
+    const la = a[1] || a[0], lb = b[1] || b[0];
+    return la.localeCompare(lb);
+  });
+  for (const [p, l] of sorted) {
+    const label = l ? l + " — " + p : p;
+    const opt = makeEl("option", { value: p }, label);
+    if (p === cur) opt.selected = true;
+    sel.appendChild(opt);
+  }
+}
 
 async function loadHistory() {
+  const params = new URLSearchParams({ limit: String(historyDisplayLimit) });
+  if (historyFilters.jobName) params.set("jobName", historyFilters.jobName);
+  if (historyFilters.config) params.set("config", historyFilters.config);
   const [running, page] = await Promise.all([
     api("/api/running"),
-    api("/api/history?limit=" + historyDisplayLimit),
+    api("/api/history?" + params.toString()),
   ]);
   const total = page.total ?? 0;
   const list = page.entries || [];
+  for (const e of list) {
+    const p = e?.args?.config;
+    if (typeof p === "string" && p) {
+      if (!seenConfigs.has(p) || (e.configLabel && !seenConfigs.get(p))) {
+        seenConfigs.set(p, e.configLabel || "");
+      }
+    }
+  }
+  refreshHistoryConfigOptions();
   const el = document.getElementById("history-list");
   document.getElementById("history-count").textContent = running.length + total;
   if (historyObserver) { historyObserver.disconnect(); historyObserver = null; }
@@ -1472,11 +1579,16 @@ async function loadHistory() {
     makeEl("tbody", null, [...runningRows, ...historyRows]),
   ]));
 
-  const remaining = total - list.length;
-  if (remaining > 0) {
+  const exactTotal = !page.totalTruncated;
+  const remaining = exactTotal ? Math.max(0, total - list.length) : null;
+  const hasMore = exactTotal ? remaining > 0 : list.length >= historyDisplayLimit;
+  if (hasMore) {
+    const label = remaining != null
+      ? "Loading more... (" + remaining + " remaining)"
+      : "Loading more...";
     const sentinel = makeEl("div", {
       style: "padding:14px;text-align:center;color:var(--text-dim);font-size:11px;letter-spacing:1px",
-    }, "Loading more... (" + remaining + " remaining)");
+    }, label);
     el.appendChild(sentinel);
     historyObserver = new IntersectionObserver((entries) => {
       if (entries[0].isIntersecting) {

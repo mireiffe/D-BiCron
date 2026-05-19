@@ -61,9 +61,11 @@ try {
 const DATA_DIR = path.join(PROJECT_ROOT, "data");
 const SCHEDULES_FILE = path.join(DATA_DIR, "schedules.json");
 const RUNNING_FILE = path.join(DATA_DIR, "running.json");
-const HISTORY_FILE = path.join(DATA_DIR, "history.json");
+const HISTORY_FILE = path.join(DATA_DIR, "history.json"); // legacy — migrated on boot
+const HISTORY_DIR = path.join(DATA_DIR, "history");
 const DATABASES_FILE = path.join(DATA_DIR, "databases.json");
 const DEFAULT_HISTORY_RETENTION_HOURS = 168;
+const HISTORY_RECENT_BUFFER_SIZE = 500;
 
 function readHistoryRetentionHours() {
   const raw =
@@ -100,32 +102,144 @@ function saveSchedules() {
   fs.writeFileSync(SCHEDULES_FILE, data, "utf-8");
 }
 
-function loadHistory() {
+function dayKeyFromTs(ts) {
+  const d = ts ? new Date(ts) : new Date();
+  if (isNaN(d.getTime())) return new Date().toISOString().slice(0, 10);
+  return d.toISOString().slice(0, 10);
+}
+
+function historyFileForDay(dayKey) {
+  return path.join(HISTORY_DIR, `${dayKey}.ndjson`);
+}
+
+function listHistoryDayKeysDesc() {
   try {
-    const raw = fs.readFileSync(HISTORY_FILE, "utf-8");
-    return JSON.parse(raw);
+    return fs
+      .readdirSync(HISTORY_DIR)
+      .filter((f) => /^\d{4}-\d{2}-\d{2}\.ndjson$/.test(f))
+      .map((f) => f.slice(0, 10))
+      .sort()
+      .reverse();
   } catch {
     return [];
   }
 }
 
-function saveHistory() {
-  fs.mkdirSync(DATA_DIR, { recursive: true });
-  fs.writeFileSync(HISTORY_FILE, JSON.stringify(runHistory, null, 2), "utf-8");
+function readHistoryFileLines(dayKey) {
+  try {
+    const raw = fs.readFileSync(historyFileForDay(dayKey), "utf-8");
+    const out = [];
+    for (const line of raw.split("\n")) {
+      if (!line) continue;
+      try { out.push(JSON.parse(line)); } catch {}
+    }
+    return out;
+  } catch {
+    return [];
+  }
+}
+
+function migrateLegacyHistory() {
+  fs.mkdirSync(HISTORY_DIR, { recursive: true });
+  let legacy = null;
+  try {
+    legacy = JSON.parse(fs.readFileSync(HISTORY_FILE, "utf-8"));
+  } catch {
+    return;
+  }
+  if (!Array.isArray(legacy) || !legacy.length) {
+    try { fs.renameSync(HISTORY_FILE, HISTORY_FILE + ".migrated.bak"); } catch {}
+    return;
+  }
+  // entries are stored newest-first in legacy; group by day, write oldest-first per file
+  const byDay = new Map();
+  for (const e of legacy) {
+    const k = dayKeyFromTs(e?.finishedAt);
+    if (!byDay.has(k)) byDay.set(k, []);
+    byDay.get(k).push(e);
+  }
+  for (const [day, entries] of byDay) {
+    entries.reverse(); // oldest first within the day
+    const lines = entries.map((e) => JSON.stringify(e)).join("\n") + "\n";
+    fs.appendFileSync(historyFileForDay(day), lines);
+  }
+  fs.renameSync(HISTORY_FILE, HISTORY_FILE + ".migrated.bak");
+  console.log(`Migrated ${legacy.length} history entries to ${HISTORY_DIR}`);
+}
+
+function loadRecentHistory(limit = HISTORY_RECENT_BUFFER_SIZE) {
+  const out = [];
+  for (const day of listHistoryDayKeysDesc()) {
+    const lines = readHistoryFileLines(day);
+    for (let i = lines.length - 1; i >= 0; i--) {
+      out.push(lines[i]);
+      if (out.length >= limit) return out;
+    }
+  }
+  return out;
+}
+
+function appendHistory(entry) {
+  fs.mkdirSync(HISTORY_DIR, { recursive: true });
+  const day = dayKeyFromTs(entry?.finishedAt);
+  fs.appendFileSync(historyFileForDay(day), JSON.stringify(entry) + "\n");
+  runHistory.unshift(entry);
+  if (runHistory.length > HISTORY_RECENT_BUFFER_SIZE) {
+    runHistory.length = HISTORY_RECENT_BUFFER_SIZE;
+  }
 }
 
 function pruneHistory() {
-  const cutoff = Date.now() - HISTORY_RETENTION_MS;
+  const cutoffMs = Date.now() - HISTORY_RETENTION_MS;
+  const cutoffDay = new Date(cutoffMs).toISOString().slice(0, 10);
+  let removed = 0;
+  for (const day of listHistoryDayKeysDesc()) {
+    if (day < cutoffDay) {
+      try { fs.unlinkSync(historyFileForDay(day)); removed++; } catch {}
+    }
+  }
+  if (removed) console.log(`Pruned ${removed} history file(s) older than ${cutoffDay}`);
+  // Also evict from in-memory buffer
   const before = runHistory.length;
-  const retained = runHistory.filter((entry) => {
-    const finishedAt = Date.parse(entry?.finishedAt || "");
-    return !Number.isFinite(finishedAt) || finishedAt >= cutoff;
+  const retained = runHistory.filter((e) => {
+    const finishedAt = Date.parse(e?.finishedAt || "");
+    return !Number.isFinite(finishedAt) || finishedAt >= cutoffMs;
   });
   if (retained.length !== before) {
     runHistory.length = 0;
     runHistory.push(...retained);
-    saveHistory();
   }
+}
+
+function readHistoryPage({ jobName, configPath, offset, limit }) {
+  const wantLimit = limit > 0 ? limit : Infinity;
+  const wantOffset = Math.max(0, offset || 0);
+  const entries = [];
+  let scanned = 0;
+  let matched = 0;
+  let truncated = false;
+  const SCAN_CAP = wantLimit === Infinity ? Infinity : (wantOffset + wantLimit) * 20 + 5000;
+
+  for (const day of listHistoryDayKeysDesc()) {
+    const lines = readHistoryFileLines(day);
+    for (let i = lines.length - 1; i >= 0; i--) {
+      const e = lines[i];
+      scanned++;
+      if (jobName && e?.jobName !== jobName) continue;
+      if (configPath && (e?.args?.config || "") !== configPath) continue;
+      matched++;
+      if (matched > wantOffset && entries.length < wantLimit) {
+        entries.push(e);
+      }
+      if (scanned >= SCAN_CAP && entries.length >= wantLimit) {
+        truncated = true;
+        break;
+      }
+    }
+    if (truncated) break;
+    if (scanned >= SCAN_CAP) { truncated = true; break; }
+  }
+  return { entries, matched, truncated };
 }
 
 function loadRunning() {
@@ -153,7 +267,8 @@ function isProcessAlive(pid) {
 // Runtime state
 const scheduledTasks = new Map(); // id -> { cron, jobName, args, task, createdAt }
 const runningJobs = new Map();    // runId -> { jobName, args, startedAt, stdout, stderr }
-const runHistory = loadHistory(); // persisted history (pruned by retention)
+migrateLegacyHistory();
+const runHistory = loadRecentHistory(); // in-memory ring buffer (recent N entries)
 
 // Restore running jobs from previous session
 const persistedRunning = loadRunning();
@@ -167,7 +282,7 @@ for (const r of persistedRunning.jobs) {
       recovered: true,
     });
   } else {
-    runHistory.unshift({
+    appendHistory({
       runId: r.runId, jobName: r.jobName, args: r.args, pid: r.pid,
       success: false, stdout: "", stderr: "(server restarted while job was running)",
       finishedAt: new Date().toISOString(),
@@ -181,7 +296,7 @@ if (persistedRunning.jobs.length) {
   saveRunning();
 }
 pruneHistory();
-console.log(`Loaded ${runHistory.length} history entry(ies), retention ${HISTORY_RETENTION_HOURS}h`);
+console.log(`Loaded ${runHistory.length} recent history entry(ies), retention ${HISTORY_RETENTION_HOURS}h`);
 
 // Restore persisted schedules
 const persisted = loadSchedules();
@@ -368,13 +483,11 @@ function startJob(jobName, args = {}, _retryCount = 0, _scheduleId = null, _targ
     clearTimeout(timeoutId);
     runningJobs.delete(runId);
     saveRunning();
-    runHistory.unshift({
+    appendHistory({
       runId, jobName, args, pid: proc.pid,
       success: false, stdout: "", stderr: err.message,
       finishedAt: new Date().toISOString(),
     });
-    pruneHistory();
-    saveHistory();
   });
 
   proc.stdout.on("data", (d) => (tracker.stdout += d));
@@ -393,9 +506,7 @@ function startJob(jobName, args = {}, _retryCount = 0, _scheduleId = null, _targ
       finishedAt: new Date().toISOString(),
       retryCount: _retryCount,
     };
-    runHistory.unshift(entry);
-    pruneHistory();
-    saveHistory();
+    appendHistory(entry);
     broadcastSSE("job_complete", { runId, jobName, scheduleId: _scheduleId, success: entry.success });
 
     // Trigger dependent jobs on success
@@ -447,9 +558,8 @@ app.get("/api/jobs", (_req, res) => {
   res.json(AVAILABLE_JOBS);
 });
 
-// Job statistics derived from history
+// Job statistics derived from history (recent buffer only — sufficient for UI badges)
 app.get("/api/jobs/stats", (_req, res) => {
-  pruneHistory();
   const stats = {};
   for (const h of runHistory) {
     if (!stats[h.jobName]) {
@@ -637,16 +747,25 @@ app.delete("/api/running/:id", (req, res) => {
   res.json({ killed: r.runId, pid: r.pid });
 });
 
-// Run history (supports ?limit=N&offset=M for lazy loading)
+// Run history (supports ?limit=N&offset=M&jobName=&config= for lazy loading + filtering)
 app.get("/api/history", (req, res) => {
-  pruneHistory();
   const limit = Number(req.query.limit) || 0;
   const offset = Number(req.query.offset) || 0;
+  const jobName = req.query.jobName ? String(req.query.jobName) : "";
+  const configPath = req.query.config ? String(req.query.config) : "";
+  const { entries, matched, truncated } = readHistoryPage({
+    jobName, configPath, offset, limit,
+  });
+  const enriched = entries.map(withConfigMeta);
   if (limit > 0) {
-    const slice = runHistory.slice(offset, offset + limit).map(withConfigMeta);
-    res.json({ total: runHistory.length, offset, limit, entries: slice });
+    res.json({
+      total: matched,
+      totalTruncated: truncated,
+      offset, limit,
+      entries: enriched,
+    });
   } else {
-    res.json(runHistory.map(withConfigMeta));
+    res.json(enriched);
   }
 });
 
@@ -907,9 +1026,8 @@ app.get("/api/metadata/drift", (_req, res) => {
   res.json({ drift, prev_snapshot_at: prev.snapshot_at, cur_snapshot_at: cur.snapshot_at });
 });
 
-// Timeline: merged history + drift events
+// Timeline: merged history + drift events (uses recent buffer)
 app.get("/api/timeline", (_req, res) => {
-  pruneHistory();
   const events = [];
   // Job runs
   for (const h of runHistory) {
@@ -1093,8 +1211,6 @@ app.get("/api/pipeline-config", (_req, res) => {
 // Resolves each schedule's target DB/tables and current state
 // -------------------------------------------------------------------
 app.get("/api/schedule-status", (_req, res) => {
-  pruneHistory();
-
   // Build job scope lookup from AVAILABLE_JOBS
   const jobScopeMap = {};
   for (const j of AVAILABLE_JOBS) {
