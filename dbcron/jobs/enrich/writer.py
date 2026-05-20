@@ -25,6 +25,7 @@ def ensure_target_table(
     order_by: list[str] | None,
     engine_clause: str | None,
     partition_by: str | None,
+    primary_key: list[str] | None = None,
 ) -> None:
     """타겟 테이블이 없으면 생성한다."""
     col_defs = ", ".join(f'"{n}" {t}' for n, t in columns.items())
@@ -36,6 +37,8 @@ def ensure_target_table(
             ddl += f" ORDER BY ({', '.join(order_by)})"
         else:
             ddl += " ORDER BY tuple()"
+        if primary_key:
+            ddl += f" PRIMARY KEY ({', '.join(primary_key)})"
         if partition_by:
             ddl += f" PARTITION BY {partition_by}"
     elif db_type == "mssql":
