@@ -95,6 +95,31 @@ def _unwrap_ch_type(ch_type: str) -> str:
     return s
 
 
+def _extract_ch_datetime_tz(ch_type: str) -> str | None:
+    """DateTime / DateTime64 타입 문자열에서 timezone 이름 추출. 없으면 None."""
+    base = _unwrap_ch_type(ch_type)
+    m = re.search(r"DateTime(?:64)?\([^)]*'([^']+)'\s*\)", base)
+    return m.group(1) if m else None
+
+
+def _ch_datetime_tzinfo(ch_type: str):
+    """naive PG timestamp 에 부착할 tzinfo.
+
+    CH 컬럼이 tz 를 가지면 그 tz 로, 그렇지 않으면 UTC 로 fallback.
+    (tz 없는 DateTime/DateTime64 에 naive datetime 을 그냥 넘기면
+     clickhouse-driver 가 system tz 로 해석해서 값이 흔들리므로 UTC 부착.)
+    """
+    tz_name = _extract_ch_datetime_tz(ch_type)
+    if not tz_name or tz_name.upper() == "UTC":
+        return timezone.utc
+    try:
+        from zoneinfo import ZoneInfo
+
+        return ZoneInfo(tz_name)
+    except Exception:
+        return timezone.utc
+
+
 _RELATIVE_RE = re.compile(r"^(\d+)\s*([dhm])$", re.IGNORECASE)
 
 
@@ -689,18 +714,23 @@ class Pg2ChSyncJob(Job):
                     null_coerce[i] = 0
                 elif base.startswith("DateTime"):
                     # clickhouse-driver expects datetime objects for DateTime/DateTime64
-                    # under types_check=True; tz-aware iff the CH type carries a tz.
+                    # under types_check=True. If the CH type carries a tz, attach the
+                    # *same* tz so the wall-clock value is preserved.
+                    tz_name = _extract_ch_datetime_tz(ch_type)
                     null_coerce[i] = (
-                        datetime(1970, 1, 1, tzinfo=timezone.utc)
-                        if "'" in ch_type
+                        datetime(1970, 1, 1, tzinfo=_ch_datetime_tzinfo(ch_type))
+                        if tz_name
                         else datetime(1970, 1, 1)
                     )
 
             if pg_t == "timestamp without time zone" and base.startswith("DateTime"):
                 # psycopg2 returns naive datetime for PG `timestamp`. clickhouse-driver
-                # interprets naive datetimes via the *system* tz, which shifts the value.
-                # Attach UTC explicitly so the wall-clock numbers are preserved verbatim.
-                def _tsconv(v, _tz=timezone.utc):
+                # interprets naive datetimes against the column's tz (or system tz),
+                # which shifts the wall-clock value. Attach the column's tz directly so
+                # the numbers users see in CH match what they see in PG.
+                _tz = _ch_datetime_tzinfo(ch_type)
+
+                def _tsconv(v, _tz=_tz):
                     if v is not None and getattr(v, "tzinfo", None) is None:
                         return v.replace(tzinfo=_tz)
                     return v
