@@ -6,7 +6,7 @@
   "ch_native_port": 9000,
   "defaults": {
     "engine": "ReplacingMergeTree",
-    "full_copy_strategy": "clickhouse_postgresql",
+    "full_copy_strategy": "python_stream",
     "full_copy_fallback_to_python": true,
     "clickhouse_postgresql_host": "postgres",
     "clickhouse_postgresql_port": 5432,

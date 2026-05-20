@@ -48,7 +48,7 @@ _PG_TO_CH: dict[str, str] = {
     "text": "String",
     "bytea": "String",
     "date": "Date",
-    "timestamp without time zone": "DateTime64(6)",
+    "timestamp without time zone": "DateTime64(6, 'UTC')",
     "timestamp with time zone": "DateTime64(6, 'UTC')",
     "time without time zone": "String",
     "time with time zone": "String",
@@ -293,7 +293,7 @@ def _quote_ch_string(value) -> str:
 
 
 def _normalize_full_copy_strategy(value) -> str:
-    raw = str(value or "clickhouse_postgresql").strip().lower()
+    raw = str(value or "python_stream").strip().lower()
     aliases = {
         "direct": "clickhouse_postgresql",
         "clickhouse_direct": "clickhouse_postgresql",
@@ -696,7 +696,18 @@ class Pg2ChSyncJob(Job):
                         else datetime(1970, 1, 1)
                     )
 
-            if pg_t in ("json", "jsonb"):
+            if pg_t == "timestamp without time zone" and base.startswith("DateTime"):
+                # psycopg2 returns naive datetime for PG `timestamp`. clickhouse-driver
+                # interprets naive datetimes via the *system* tz, which shifts the value.
+                # Attach UTC explicitly so the wall-clock numbers are preserved verbatim.
+                def _tsconv(v, _tz=timezone.utc):
+                    if v is not None and getattr(v, "tzinfo", None) is None:
+                        return v.replace(tzinfo=_tz)
+                    return v
+
+                transforms[i] = _tsconv
+
+            elif pg_t in ("json", "jsonb"):
 
                 def _jconv(v, _j=_json):
                     if v is not None and not isinstance(v, str):
