@@ -521,7 +521,7 @@ class Pg2ChSyncJob(Job):
     def _build_ch_columns(
         pg_cols: list[dict],
         drop_columns: set[str],
-        column_overrides: dict[str, str],
+        column_overrides: dict[str, str | dict],
         order_by: list[str],
         use_nullable: bool = True,
     ) -> list[dict]:
@@ -530,6 +530,13 @@ class Pg2ChSyncJob(Job):
         ORDER BY 컬럼은 Nullable 제거 (ClickHouse 제약).
         use_nullable=False 이면 모든 컬럼을 non-nullable 로 생성하고
         NULL 유입 시 타입별 기본값으로 대체한다.
+
+        column_overrides 값은 두 형태를 허용한다:
+          - 문자열: CH 타입 그대로 (예: "LowCardinality(String)")
+          - 객체: {"type": "DateTime64(3, 'UTC')", "parse_format": "%Y%m%d %H%M%S%f", ...}
+            추가 키:
+              parse_format: strptime 포맷. PG text → CH DateTime* 변환에 사용.
+              timezone: parse 결과에 부착할 tz (생략 시 CH 컬럼 tz → UTC fallback)
         """
         order_by_set = set(order_by)
         result = []
@@ -537,8 +544,18 @@ class Pg2ChSyncJob(Job):
             name = col["name"]
             if name in drop_columns:
                 continue
+            override_meta: dict | None = None
             if name in column_overrides:
-                ch_type = column_overrides[name]
+                ov = column_overrides[name]
+                if isinstance(ov, dict):
+                    if "type" not in ov:
+                        raise ValueError(
+                            f"column_overrides[{name}] must include 'type'"
+                        )
+                    ch_type = ov["type"]
+                    override_meta = {k: v for k, v in ov.items() if k != "type"}
+                else:
+                    ch_type = ov
             else:
                 nullable = use_nullable and col["nullable"] and name not in order_by_set
                 ch_type = _pg_type_to_ch(
@@ -547,9 +564,10 @@ class Pg2ChSyncJob(Job):
                     precision=col["precision"],
                     scale=col["scale"],
                 )
-            result.append(
-                {"name": name, "ch_type": ch_type, "pg_type": col["pg_type"]}
-            )
+            entry = {"name": name, "ch_type": ch_type, "pg_type": col["pg_type"]}
+            if override_meta:
+                entry["override"] = override_meta
+            result.append(entry)
         return result
 
     # ── CH DDL ───────────────────────────────────────────────────
@@ -723,7 +741,54 @@ class Pg2ChSyncJob(Job):
                         else datetime(1970, 1, 1)
                     )
 
-            if pg_t == "timestamp without time zone" and base.startswith("DateTime"):
+            override = col.get("override") or {}
+            parse_format = override.get("parse_format")
+
+            if (
+                parse_format
+                and pg_t in ("character varying", "character", "text")
+                and base.startswith("DateTime")
+            ):
+                # PG text → CH DateTime*: config 의 strptime 포맷으로 파싱.
+                # 실패 시 즉시 raise (엄격 모드).
+                _fmt = parse_format
+                _tz_override = override.get("timezone")
+                if _tz_override:
+                    try:
+                        from zoneinfo import ZoneInfo
+
+                        _tz = ZoneInfo(_tz_override)
+                    except Exception as _e:
+                        raise ValueError(
+                            f"column_overrides[{col['name']}].timezone "
+                            f"invalid: {_tz_override}"
+                        ) from _e
+                else:
+                    _tz = _ch_datetime_tzinfo(ch_type)
+                _col_name = col["name"]
+
+                def _dtparse(v, _fmt=_fmt, _tz=_tz, _name=_col_name):
+                    if v is None:
+                        return v
+                    if not isinstance(v, str):
+                        raise ValueError(
+                            f"{_name}: expected string for parse_format, "
+                            f"got {type(v).__name__}"
+                        )
+                    try:
+                        dt = datetime.strptime(v, _fmt)
+                    except ValueError as _e:
+                        raise ValueError(
+                            f"{_name}: failed to parse {v!r} with "
+                            f"format {_fmt!r}: {_e}"
+                        ) from _e
+                    if dt.tzinfo is None:
+                        dt = dt.replace(tzinfo=_tz)
+                    return dt
+
+                transforms[i] = _dtparse
+
+            elif pg_t == "timestamp without time zone" and base.startswith("DateTime"):
                 # psycopg2 returns naive datetime for PG `timestamp`. clickhouse-driver
                 # interprets naive datetimes against the column's tz (or system tz),
                 # which shifts the wall-clock value. Attach the column's tz directly so

@@ -58,7 +58,12 @@
       "partition_by": "toYYYYMMDD(created_at)",
       "drop_columns": [],
       "column_overrides": {
-        "event_type": "LowCardinality(String)"
+        "event_type": "LowCardinality(String)",
+        "occurred_at_str": {
+          "type": "DateTime64(3, 'UTC')",
+          "parse_format": "%Y%m%d %H%M%S%f",
+          "timezone": "Asia/Seoul"
+        }
       }
     }
   ]
