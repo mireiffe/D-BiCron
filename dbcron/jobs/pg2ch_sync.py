@@ -16,6 +16,8 @@ PG 소스에서 CH 타겟으로 테이블 데이터를 동기화합니다.
   - Watermark 기반 증분 동기화 (timestamp / integer 모두 지원)
   - sync_since: timestamp_column 기반 하한 필터 (full copy / incremental 공통)
   - use_nullable: false 설정 시 PG nullable 컬럼을 CH Nullable 대신 기본값으로 대체
+  - optimize_after_sync: 동기화 직후 OPTIMIZE TABLE ... FINAL 실행 (즉시 dedup)
+    optimize_partitions 로 일부 파티션만 제한 가능
 
 설정:
   PG2CH_CONFIG 환경변수로 JSON 설정 파일 경로 지정 (기본: pg2ch_config.json)
@@ -491,6 +493,50 @@ class Pg2ChSyncJob(Job):
             [(key, ts_col, val_str, datetime.now())],
         )
 
+    # ── post-sync optimize ──────────────────────────────────────
+
+    def _optimize_table(
+        self,
+        ch,
+        db_name: str,
+        table_name: str,
+        *,
+        partitions=None,
+        mutations_sync: int = 2,
+    ) -> None:
+        """OPTIMIZE TABLE ... FINAL 실행하여 즉시 merge/dedup.
+
+        partitions 가 주어지면 해당 파티션만, 아니면 전체 테이블을 대상으로 한다.
+        mutations_sync 는 ClickHouse SETTINGS 로 전달되어 동기 대기 여부를 결정한다
+        (0=async, 1=현재 서버 대기, 2=모든 replica 대기).
+        """
+        if partitions is None:
+            targets: list[str | None] = [None]
+        elif isinstance(partitions, (str, int)):
+            targets = [str(partitions)]
+        elif isinstance(partitions, (list, tuple)):
+            targets = [str(p) for p in partitions if p is not None and str(p) != ""]
+            if not targets:
+                targets = [None]
+        else:
+            raise ValueError(
+                "optimize_partitions must be a string, number, or list of those"
+            )
+
+        for partition in targets:
+            sql = f"OPTIMIZE TABLE `{db_name}`.`{table_name}`"
+            if partition is not None:
+                sql += f" PARTITION {_quote_ch_string(partition)}"
+            sql += " FINAL"
+            sql += f" SETTINGS mutations_sync = {int(mutations_sync)}"
+            self.logger.info(
+                "%s.%s: OPTIMIZE FINAL%s",
+                db_name,
+                table_name,
+                f" partition {partition}" if partition is not None else "",
+            )
+            ch.execute(sql)
+
     # ── PG schema introspection ──────────────────────────────────
 
     @staticmethod
@@ -907,6 +953,9 @@ class Pg2ChSyncJob(Job):
         overlap_min: int = tc.get("overlap_minutes", 0)
         watermark_overlap = tc.get("watermark_overlap", 0)
         use_nullable: bool = tc.get("use_nullable", True)
+        optimize_after_sync: bool = tc.get("optimize_after_sync", False)
+        optimize_partitions = tc.get("optimize_partitions")
+        optimize_mutations_sync: int = int(tc.get("optimize_mutations_sync", 2))
         full_copy_strategy = _normalize_full_copy_strategy(
             tc.get("full_copy_strategy", sync_cfg.get("full_copy_strategy"))
         )
@@ -1115,6 +1164,16 @@ class Pg2ChSyncJob(Job):
             if wm_col and max_wm is not None:
                 self._save_watermark(ch, tgt_db, wm_key, wm_col, max_wm)
                 self.logger.info("%s: watermark → %s", src_table, max_wm)
+
+            # 7) Post-sync OPTIMIZE (즉시 dedup / merge)
+            if optimize_after_sync:
+                self._optimize_table(
+                    ch,
+                    tgt_db,
+                    tgt_name,
+                    partitions=optimize_partitions,
+                    mutations_sync=optimize_mutations_sync,
+                )
 
             mode = "incremental" if watermark else "full copy"
             self.logger.info("%s: %s complete — %d rows", src_table, mode, total_rows)

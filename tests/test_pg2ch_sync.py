@@ -483,6 +483,73 @@ class TestWatermark:
         assert inserted[0][2] == "2026-01-01T12:00:00"
 
 
+# ── 7-1. _optimize_table ────────────────────────────────────────
+
+
+class TestOptimizeTable:
+    def _make_job(self):
+        return Pg2ChSyncJob(config=None)
+
+    def test_full_table_optimize(self):
+        job = self._make_job()
+        ch = MagicMock()
+        job._optimize_table(ch, "tgtdb", "events")
+        ch.execute.assert_called_once()
+        sql = ch.execute.call_args[0][0]
+        assert "OPTIMIZE TABLE `tgtdb`.`events`" in sql
+        assert "FINAL" in sql
+        assert "PARTITION" not in sql
+        assert "mutations_sync = 2" in sql
+
+    def test_single_partition(self):
+        job = self._make_job()
+        ch = MagicMock()
+        job._optimize_table(ch, "tgtdb", "events", partitions="202605")
+        sql = ch.execute.call_args[0][0]
+        assert "PARTITION '202605'" in sql
+        assert "FINAL" in sql
+
+    def test_multiple_partitions_run_separately(self):
+        job = self._make_job()
+        ch = MagicMock()
+        job._optimize_table(
+            ch, "tgtdb", "events", partitions=["202605", "202606"]
+        )
+        assert ch.execute.call_count == 2
+        first_sql = ch.execute.call_args_list[0][0][0]
+        second_sql = ch.execute.call_args_list[1][0][0]
+        assert "PARTITION '202605'" in first_sql
+        assert "PARTITION '202606'" in second_sql
+
+    def test_mutations_sync_override(self):
+        job = self._make_job()
+        ch = MagicMock()
+        job._optimize_table(ch, "tgtdb", "events", mutations_sync=0)
+        sql = ch.execute.call_args[0][0]
+        assert "mutations_sync = 0" in sql
+
+    def test_partition_quotes_escaped(self):
+        job = self._make_job()
+        ch = MagicMock()
+        job._optimize_table(ch, "tgtdb", "events", partitions="O'Brien")
+        sql = ch.execute.call_args[0][0]
+        assert "PARTITION 'O\\'Brien'" in sql
+
+    def test_invalid_partitions_type(self):
+        job = self._make_job()
+        ch = MagicMock()
+        with pytest.raises(ValueError):
+            job._optimize_table(ch, "tgtdb", "events", partitions={"bad": 1})
+
+    def test_empty_partition_list_runs_full_table(self):
+        job = self._make_job()
+        ch = MagicMock()
+        job._optimize_table(ch, "tgtdb", "events", partitions=[])
+        ch.execute.assert_called_once()
+        sql = ch.execute.call_args[0][0]
+        assert "PARTITION" not in sql
+
+
 # ── 8. _resolve_sync_since ───────────────────────────────────────
 
 

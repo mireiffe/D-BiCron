@@ -45,7 +45,10 @@
       },
       "batch_size": 50000,
       "overlap_minutes": 30,
-      "use_nullable": false
+      "use_nullable": false,
+      "optimize_after_sync": true,
+      "optimize_partitions": ["202605", "202606"],
+      "optimize_mutations_sync": 2
     },
     {
       "source_table": "public.event_logs",
