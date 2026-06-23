@@ -82,7 +82,7 @@ services:
       - |
         mkdir -p /opt/airflow/logs /opt/airflow/dags /opt/airflow/plugins /opt/airflow/config /opt/airflow/sql
         chown -R "${AIRFLOW_UID:-50000}:0" /opt/airflow/logs /opt/airflow/plugins
-        airflow db migrate
+        exec /entrypoint airflow db migrate
     restart: on-failure
 
   airflow-apiserver:
