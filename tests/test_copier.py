@@ -171,16 +171,18 @@ class TestQueryBuilders:
         assert p == ("2025-01-01T00:00:00",)
 
     def test_full_query_no_filter(self):
-        q, p = TableCopier._full_query("public", "orders", ["id", "name"], "id", None, None)
+        q, p = TableCopier._full_query("public", "orders", ["id", "name"], None, None)
         assert q.startswith('SELECT "id", "name" FROM "public"."orders"')
-        assert 'ORDER BY "id"' in q
+        # full copy 는 server-side cursor 의 blocking sort 를 피하려고 정렬하지 않는다.
+        assert "ORDER BY" not in q
         assert p is None
 
     def test_full_query_with_sync_since(self):
         q, p = TableCopier._full_query(
-            "public", "orders", ["id", "ts"], "ts", "ts", "2025-01-01T00:00:00"
+            "public", "orders", ["id", "ts"], "ts", "2025-01-01T00:00:00"
         )
         assert '"ts" >= %s' in q
+        assert "ORDER BY" not in q
         assert p == ("2025-01-01T00:00:00",)
 
 
@@ -267,6 +269,9 @@ class TestCopyFlow:
         assert result.watermark_after == "3"
         assert meta.started["watermark_column"] == "id"
         assert meta.started["watermark_before"] is None
+        # 첫 실행 full copy 는 ORDER BY 없이 스트리밍한다 (server-side cursor 의
+        # blocking sort 로 인한 선행 대기를 피하고, watermark 는 running max 로 추적).
+        assert "ORDER BY" not in pg.stream.query
 
     def test_append_incremental_uses_cutoff(self):
         cfg = _cfg(sync_mode="append", watermark_column="id")

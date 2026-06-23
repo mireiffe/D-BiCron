@@ -186,9 +186,8 @@ class TableCopier:
                     f"TRUNCATE TABLE IF EXISTS "
                     f"{quote_ch_identifier(tgt_db)}.{quote_ch_identifier(tgt_name)}"
                 )
-            order_col = wm_col or ts_col
             query, params = self._full_query(
-                src_schema, src_name, col_names, order_col, ts_col, sync_since
+                src_schema, src_name, col_names, ts_col, sync_since
             )
             watermark_before = None
             self.log.info(
@@ -415,7 +414,13 @@ class TableCopier:
         return query, tuple(params)
 
     @staticmethod
-    def _full_query(src_schema, src_name, col_names, order_col, ts_col, sync_since):
+    def _full_query(src_schema, src_name, col_names, ts_col, sync_since):
+        # full copy 는 정렬 없이 seq scan 으로 스트리밍한다.
+        # PG 의 ORDER BY 는 server-side cursor 와 만나면 첫 row 를 내보내기 전에
+        # 전체 테이블 정렬(blocking sort)을 강제해, 대용량 첫 실행에서 데이터가
+        # 들어가기 전 긴 선행 대기를 만든다. watermark_after 는 batch running max
+        # 로 추적하므로 정렬이 불필요하고, target 정렬은 MergeTree(order_by)가
+        # 백그라운드 머지로 처리한다.
         col_list = ", ".join(quote_pg_identifier(c) for c in col_names)
         query = (
             f"SELECT {col_list} FROM {quote_pg_identifier(src_schema)}."
@@ -425,8 +430,6 @@ class TableCopier:
         if sync_since and ts_col:
             query += f" WHERE {quote_pg_identifier(ts_col)} >= %s"
             params = (sync_since,)
-        if order_col:
-            query += f" ORDER BY {quote_pg_identifier(order_col)}"
         return query, params
 
     # ── post-sync OPTIMIZE ───────────────────────────────────
