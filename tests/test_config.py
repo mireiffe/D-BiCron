@@ -96,6 +96,62 @@ class TestValidation:
         with pytest.raises(ValueError, match="insert_types_check"):
             TableConfig.from_dict(_base(insert_types_check="false"))
 
+    def test_retention_flat_config_ok(self):
+        cfg = TableConfig.from_dict(
+            _base(
+                sync_mode="append",
+                watermark_column="id",
+                timestamp_column="created_at",
+                retention_enabled=True,
+                source_retention="180d",
+                source_retention_batch_size=5000,
+            )
+        )
+        assert cfg.retention_enabled is True
+        assert cfg.source_retention == "180d"
+        assert cfg.source_retention_batch_size == 5000
+
+    def test_retention_nested_config_ok(self):
+        cfg = TableConfig.from_dict(
+            _base(
+                sync_mode="append",
+                watermark_column="id",
+                timestamp_column="created_at",
+                retention={
+                    "enabled": True,
+                    "retention": "2026-01-01T00:00:00",
+                    "batch_size": 123,
+                    "lock_timeout_ms": 1000,
+                },
+            )
+        )
+        assert cfg.retention_enabled is True
+        assert cfg.source_retention == "2026-01-01T00:00:00"
+        assert cfg.source_retention_batch_size == 123
+        assert cfg.retention_lock_timeout_ms == 1000
+
+    def test_retention_enabled_requires_append(self):
+        with pytest.raises(ValueError, match="retention_enabled requires append"):
+            TableConfig.from_dict(
+                _base(
+                    sync_mode="full_reload",
+                    timestamp_column="created_at",
+                    retention_enabled=True,
+                    source_retention="180d",
+                )
+            )
+
+    def test_retention_enabled_requires_timestamp_column(self):
+        with pytest.raises(ValueError, match="source_retention requires timestamp_column"):
+            TableConfig.from_dict(
+                _base(
+                    sync_mode="append",
+                    watermark_column="id",
+                    retention_enabled=True,
+                    source_retention="180d",
+                )
+            )
+
 
 class TestLoaders:
     def _write(self, p, body):

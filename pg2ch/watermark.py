@@ -36,7 +36,7 @@ def resolve_sync_since(raw: str, *, now: datetime | None = None) -> str:
     - 절대: ISO 8601 timestamp → 그대로 반환
     """
     delta = parse_relative_to_timedelta(raw)
-    if delta:
+    if delta is not None:
         base = now or datetime.now()
         return (base - delta).isoformat()
     return raw

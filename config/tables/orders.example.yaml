@@ -53,3 +53,10 @@ max_failed_rows: 1000            # 누적 실패가 이 수를 넘으면 run 실
 optimize_after_sync: true
 optimize_partitions: ["202606"]
 optimize_mutations_sync: 2
+
+# PG source retention (복제 완료된 오래된 source row 삭제)
+retention:
+  enabled: false                 # true 로 켜야 삭제 실행
+  source_retention: 180d         # 이보다 오래된 row 삭제 후보
+  batch_size: 10000              # DELETE batch 크기
+  lock_timeout_ms: 5000          # lock 대기 제한

@@ -3,7 +3,7 @@
 "어디까지 복사되었나 / 어느 batch 의 어느 row 가 실패했나" 를 영속 기록한다.
 스키마(기본 ``pg2ch_meta``)에 세 테이블:
 
-  copy_run        — 테이블×실행(=Airflow task 1회) 단위. status / watermark_before
+  copy_run        — 테이블×실행 단위. status / watermark_before
                     / watermark_after / rows_read·written·failed / batch_count.
                     다음 실행의 증분 cutoff(=어디까지 복사) 는 이 테이블의 마지막
                     성공 run.watermark_after 에서 읽는다.

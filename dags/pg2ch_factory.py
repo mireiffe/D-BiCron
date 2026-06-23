@@ -3,9 +3,9 @@
 테이블마다 적재 방식(append / full_reload)·주기가 다르므로 테이블당 독립 DAG 로
 만들어 스케줄·재시도·추적을 분리한다. dag_id 는 ``pg2ch_<table_id>``.
 
-각 DAG 은 단일 'copy' task 를 가진다. 실제 batch/row 단위 진행·실패 추적은
-pg2ch 메타 스키마(copy_run / copy_batch / copy_failed_row)에 기록되므로
-Airflow task 1개로도 충분히 정밀한 추적이 가능하다.
+각 DAG 은 precheck → copy → finalize_watermark → retention 순서의 task 를 가진다.
+batch/row 단위 진행·실패 추적은 pg2ch 메타 스키마(copy_run / copy_batch /
+copy_failed_row)에 기록한다.
 
 Airflow 3.x (apache/airflow:3.2.2) 기준 import 사용:
   from airflow.sdk import DAG, get_current_context
@@ -37,37 +37,93 @@ def _parse_start_date(value: str | None) -> datetime:
         return _DEFAULT_START
 
 
-def _make_copy_callable(table_id: str):
-    """table_id 를 바인딩한 task 콜러블. 실행 시점에 설정을 재로드한다."""
+def _runtime_config(table_id: str) -> TableConfig:
+    cfg = next((c for c in load_all_table_configs() if c.table_id == table_id), None)
+    if cfg is None:
+        raise RuntimeError(f"table config '{table_id}' not found at runtime")
+    return cfg
 
-    def _copy(**_):
-        from airflow.sdk import get_current_context
 
-        from pg2ch.config import load_all_table_configs
+def _airflow_context() -> dict:
+    from airflow.sdk import get_current_context
+
+    ctx = get_current_context()
+    dag_run = ctx.get("dag_run")
+    ti = ctx.get("ti") or ctx.get("task_instance")
+    return {
+        "dag_id": getattr(dag_run, "dag_id", None),
+        "run_id": getattr(dag_run, "run_id", None),
+        "task_id": getattr(ti, "task_id", None),
+        "try_number": getattr(ti, "try_number", None),
+    }
+
+
+def _current_ti():
+    from airflow.sdk import get_current_context
+
+    ctx = get_current_context()
+    return ctx.get("ti") or ctx.get("task_instance")
+
+
+def _make_precheck_callable(table_id: str):
+    """table_id 를 바인딩한 precheck task 콜러블."""
+
+    def _precheck(**_):
         from pg2ch.copier import TableCopier
 
-        cfg = next(
-            (c for c in load_all_table_configs() if c.table_id == table_id), None
-        )
-        if cfg is None:
-            raise RuntimeError(f"table config '{table_id}' not found at runtime")
+        cfg = _runtime_config(table_id)
+        plan = TableCopier(cfg).precheck()
+        return plan.as_dict()
 
-        ctx = get_current_context()
-        dag_run = ctx.get("dag_run")
-        ti = ctx.get("ti") or ctx.get("task_instance")
-        airflow_context = {
-            "dag_id": getattr(dag_run, "dag_id", None),
-            "run_id": getattr(dag_run, "run_id", None),
-            "task_id": getattr(ti, "task_id", None),
-            "try_number": getattr(ti, "try_number", None),
-        }
-        result = TableCopier(cfg, airflow_context=airflow_context).run()
+    return _precheck
+
+
+def _make_copy_callable(table_id: str):
+    """데이터를 적재하되 watermark 는 다음 task 에서 finalize 한다."""
+
+    def _copy(**_):
+        from pg2ch.copier import TableCopier
+
+        cfg = _runtime_config(table_id)
+        result = TableCopier(
+            cfg,
+            airflow_context=_airflow_context(),
+        ).run(finalize_run=False)
         summary = result.as_dict()
         if result.status == "failed":
             raise RuntimeError(f"copy failed: {summary}")
         return summary  # XCom 으로 push
 
     return _copy
+
+
+def _make_finalize_callable(table_id: str):
+    """copy task 가 계산한 watermark_after 를 copy_run 에 최종 반영한다."""
+
+    def _finalize(**_):
+        from pg2ch.copier import TableCopier
+
+        result = _current_ti().xcom_pull(task_ids="copy")
+        if not result:
+            raise RuntimeError("copy task result not found in XCom")
+        cfg = _runtime_config(table_id)
+        finalized = TableCopier(cfg).finalize(result)
+        return finalized.as_dict()
+
+    return _finalize
+
+
+def _make_retention_callable(table_id: str):
+    """설정이 켜져 있으면 PG source retention 을 실행한다."""
+
+    def _retention(**_):
+        from pg2ch.retention import PgRetention
+
+        cfg = _runtime_config(table_id)
+        result = PgRetention(cfg).run()
+        return result.as_dict()
+
+    return _retention
 
 
 def build_dag(cfg: TableConfig) -> DAG:
@@ -90,13 +146,27 @@ def build_dag(cfg: TableConfig) -> DAG:
             f"- mode: `{cfg.sync_mode}`\n"
             f"- watermark: `{cfg.effective_watermark_column or '-'}`\n"
             f"- on_row_error: `{cfg.on_row_error}`\n"
+            f"- retention: `{'enabled' if cfg.retention_enabled else 'disabled'}`\n"
         ),
     )
     with dag:
-        PythonOperator(
+        precheck = PythonOperator(
+            task_id="precheck",
+            python_callable=_make_precheck_callable(cfg.table_id),
+        )
+        copy = PythonOperator(
             task_id="copy",
             python_callable=_make_copy_callable(cfg.table_id),
         )
+        finalize = PythonOperator(
+            task_id="finalize_watermark",
+            python_callable=_make_finalize_callable(cfg.table_id),
+        )
+        retention = PythonOperator(
+            task_id="retention",
+            python_callable=_make_retention_callable(cfg.table_id),
+        )
+        precheck >> copy >> finalize >> retention
     return dag
 
 

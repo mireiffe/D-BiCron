@@ -3,6 +3,7 @@
   pg2ch init-meta                 메타 스키마 생성 (copy_run / copy_batch / copy_failed_row)
   pg2ch list                      설정된 테이블 파이프라인 목록
   pg2ch copy <table_id|all>       복사 1회 실행
+  pg2ch retention <table_id|all>  PG source retention 1회 실행
   pg2ch status <table_id>         마지막 run / watermark / 미해결 실패 row 수
 
 경로는 환경변수로 조정:
@@ -19,6 +20,7 @@ import sys
 from .config import load_all_table_configs, load_table_config, tables_dir
 from .connections import get_connection
 from .copier import TableCopier
+from .retention import PgRetention
 from .tracking import MetaStore
 
 
@@ -59,7 +61,7 @@ def cmd_list(args) -> int:
         print(
             f"{c.table_id:24s} {c.sync_mode:11s} "
             f"{c.source_table} -> {c.target_table}  "
-            f"[schedule={c.schedule or '-'}]"
+            f"[schedule={c.schedule or '-'} retention={'on' if c.retention_enabled else 'off'}]"
         )
     return 0
 
@@ -88,6 +90,27 @@ def cmd_copy(args) -> int:
     return 1 if failures else 0
 
 
+def cmd_retention(args) -> int:
+    if args.table_id == "all":
+        configs = load_all_table_configs(args.tables_dir)
+    else:
+        configs = [_find_config(args.table_id, args.tables_dir)]
+
+    failures = 0
+    for cfg in configs:
+        try:
+            result = PgRetention(cfg, connections_path=args.connections).run()
+            print(
+                f"[{result.status}] {cfg.table_id}: deleted={result.rows_deleted} "
+                f"safe_cutoff={result.safe_cutoff or '-'} "
+                f"reason={result.reason or '-'}"
+            )
+        except Exception as e:
+            failures += 1
+            print(f"[failed] {cfg.table_id}: {e}", file=sys.stderr)
+    return 1 if failures else 0
+
+
 def cmd_status(args) -> int:
     cfg = _find_config(args.table_id, args.tables_dir)
     meta_cfg = get_connection(cfg.meta, args.connections)
@@ -99,6 +122,7 @@ def cmd_status(args) -> int:
     print(f"sync_mode       : {cfg.sync_mode}")
     print(f"watermark_column: {wm_col or '-'}")
     print(f"resume watermark: {wm or '(none — next run is a full copy)'}")
+    print(f"retention       : {'enabled' if cfg.retention_enabled else 'disabled'}")
     print(f"unresolved failed rows: {unresolved}")
     return 0
 
@@ -120,6 +144,10 @@ def build_parser() -> argparse.ArgumentParser:
     s = sub.add_parser("copy", help="복사 1회 실행")
     s.add_argument("table_id", help="table_id 또는 'all'")
     s.set_defaults(func=cmd_copy)
+
+    s = sub.add_parser("retention", help="PG source retention 1회 실행")
+    s.add_argument("table_id", help="table_id 또는 'all'")
+    s.set_defaults(func=cmd_retention)
 
     s = sub.add_parser("status", help="마지막 run / watermark / 실패 row 수")
     s.add_argument("table_id")

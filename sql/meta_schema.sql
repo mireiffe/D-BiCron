@@ -20,7 +20,7 @@ CREATE TABLE IF NOT EXISTS pg2ch_meta.copy_run (
     source_table     TEXT NOT NULL,
     target_table     TEXT NOT NULL,
     sync_mode        TEXT NOT NULL,                  -- append | full_reload
-    status           TEXT NOT NULL,                  -- running | success | partial | failed
+    status           TEXT NOT NULL,                  -- running | copied | copied_partial | success | partial | failed
     dag_id           TEXT,
     airflow_run_id   TEXT,
     task_id          TEXT,

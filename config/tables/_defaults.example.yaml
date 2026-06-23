@@ -19,6 +19,12 @@ insert_types_check: true
 use_nullable: false
 on_row_error: dead_letter   # dead_letter | skip | fail
 
+# PG source retention 기본값. 실제 삭제는 테이블별로 enabled: true 를 둔 경우만 실행된다.
+retention:
+  enabled: false
+  batch_size: 10000
+  lock_timeout_ms: 5000
+
 settings:
   index_granularity: 8192
 

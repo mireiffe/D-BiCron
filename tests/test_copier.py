@@ -40,6 +40,7 @@ class FakeMeta:
         self.ensured = False
         self.started: dict | None = None
         self.finished: dict | None = None
+        self.finished_history: list[dict] = []
         self.batches: list[dict] = []
         self.failed: list[dict] = []
         self._bid = 0
@@ -56,6 +57,7 @@ class FakeMeta:
 
     def finish_run(self, run_id, **kw):
         self.finished = {"run_id": run_id, **kw}
+        self.finished_history.append(self.finished)
 
     def record_batch(self, **kw):
         self._bid += 1
@@ -121,6 +123,40 @@ class FakePG:
 
     def close(self):
         pass
+
+
+class FakeCountCursor:
+    def __init__(self, owner, count):
+        self.owner = owner
+        self.count = count
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *a):
+        return False
+
+    def execute(self, sql, params=None):
+        self.owner.query = sql
+        self.owner.params = params
+
+    def fetchone(self):
+        return (self.count,)
+
+
+class FakeCountPG:
+    def __init__(self, count):
+        self.count = count
+        self.query = None
+        self.params = None
+        self.rolled_back = False
+
+    def cursor(self, name=None):
+        assert name is None
+        return FakeCountCursor(self, self.count)
+
+    def rollback(self):
+        self.rolled_back = True
 
 
 # id integer NOT NULL, name text NULL
@@ -203,6 +239,13 @@ class TestQueryBuilders:
         assert '"payload"::text AS "payload"' in q
         assert "encode(\"raw\", 'hex') AS \"raw\"" in q
         assert '"flag"::int AS "flag"' in q
+
+    def test_count_query(self):
+        q, p = TableCopier._count_query(
+            "public", "orders", ['"id" > %s'], ("10",)
+        )
+        assert q == 'SELECT count(*) FROM "public"."orders" WHERE "id" > %s'
+        assert p == ("10",)
 
 
 # ── row isolation (_insert) ──────────────────────────────────────
@@ -310,6 +353,31 @@ class TestCopyFlow:
         assert result.watermark_before == "1"
         assert result.watermark_after == "3"
         assert result.status == "success"
+
+    def test_precheck_counts_incremental_rows(self):
+        cfg = _cfg(sync_mode="append", watermark_column="id")
+        pg = FakeCountPG(42)
+        meta = FakeMeta(resume="10")
+        plan = TableCopier(cfg).inspect_copy_plan(pg, meta)
+        assert plan.planned_mode == "incremental"
+        assert plan.rows_to_copy == 42
+        assert plan.resume_watermark == "10"
+        assert '"id" > %s' in pg.query
+        assert pg.params == ("10",)
+        assert pg.rolled_back is True
+
+    def test_deferred_copy_does_not_publish_watermark(self):
+        cfg = _cfg(sync_mode="append", watermark_column="id")
+        pg = FakePG(COLS, [(1, "a"), (2, "b"), (3, "c")])
+        ch = FakeCH()
+        meta = FakeMeta(resume=None)
+        result = TableCopier(cfg).copy(
+            pg, ch, meta, target_default_db="default", finalize_run=False
+        )
+        assert result.status == "success"
+        assert result.watermark_after == "3"
+        assert meta.finished["status"] == "copied"
+        assert meta.finished["watermark_after"] is None
 
     def test_partial_run_dead_letters_bad_row(self):
         cfg = _cfg(sync_mode="append", watermark_column="id", on_row_error="dead_letter")

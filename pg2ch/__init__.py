@@ -11,6 +11,7 @@ Airflow 3.2.2 위에서 동작하는 테이블 단위 복사 파이프라인.
   - config    : 테이블 파이프라인 설정(YAML) 로드 / 검증
   - tracking  : copy_run / copy_batch / copy_failed_row 메타 추적 저장소
   - copier    : append / full_reload 복사 오케스트레이션 (batch + row 단위 dead-letter)
+  - retention : finalize 된 watermark 기준 PG source row 배치 삭제
   - cli       : CLI one-shot 실행기
 """
 

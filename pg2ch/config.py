@@ -10,8 +10,11 @@ from __future__ import annotations
 
 import os
 from dataclasses import dataclass, field
+from datetime import datetime
 from pathlib import Path
 from typing import Any
+
+from .watermark import parse_relative_to_timedelta
 
 DEFAULT_TABLES_DIR = "config/tables"
 _DEFAULTS_FILE = "_defaults.yaml"
@@ -91,6 +94,12 @@ class TableConfig:
     optimize_partitions: Any = None
     optimize_mutations_sync: int = 2
 
+    # PG source retention
+    retention_enabled: bool = False
+    source_retention: str | None = None
+    source_retention_batch_size: int = 10_000
+    retention_lock_timeout_ms: int = 5_000
+
     # Airflow 스케줄링 메타 (DAG factory 가 사용)
     schedule: str | None = None
     start_date: str | None = None
@@ -123,6 +132,29 @@ class TableConfig:
     @classmethod
     def from_dict(cls, data: dict) -> "TableConfig":
         d = dict(data)
+        retention = d.pop("retention", None)
+        if retention is not None:
+            if not isinstance(retention, dict):
+                raise ValueError("retention must be a mapping")
+            retention_keys = {
+                "enabled": "retention_enabled",
+                "source_retention": "source_retention",
+                "retention": "source_retention",
+                "batch_size": "source_retention_batch_size",
+                "source_retention_batch_size": "source_retention_batch_size",
+                "lock_timeout_ms": "retention_lock_timeout_ms",
+                "retention_lock_timeout_ms": "retention_lock_timeout_ms",
+            }
+            unknown_retention = set(retention) - set(retention_keys)
+            if unknown_retention:
+                raise ValueError(
+                    "unknown retention key(s): "
+                    + ", ".join(sorted(unknown_retention))
+                )
+            for src, dst in retention_keys.items():
+                if src in retention and dst not in d:
+                    d[dst] = retention[src]
+
         known = {f for f in cls.__dataclass_fields__ if f != "raw"}
         unknown = set(d) - known - {"_comment", "_label"}
         # _ 로 시작하는 주석 키는 허용
@@ -163,6 +195,16 @@ class TableConfig:
             raise ValueError(f"{self.table_id}: insert_types_check must be boolean")
         if self.max_failed_rows is not None and int(self.max_failed_rows) < 0:
             raise ValueError(f"{self.table_id}: max_failed_rows must be >= 0")
+        if not isinstance(self.retention_enabled, bool):
+            raise ValueError(f"{self.table_id}: retention_enabled must be boolean")
+        if int(self.source_retention_batch_size) <= 0:
+            raise ValueError(
+                f"{self.table_id}: source_retention_batch_size must be a positive integer"
+            )
+        if int(self.retention_lock_timeout_ms) <= 0:
+            raise ValueError(
+                f"{self.table_id}: retention_lock_timeout_ms must be a positive integer"
+            )
 
         if self.sync_mode == "append" and not self.effective_watermark_column:
             raise ValueError(
@@ -173,6 +215,31 @@ class TableConfig:
             raise ValueError(
                 f"{self.table_id}: sync_since requires timestamp_column to be set"
             )
+        if self.retention_enabled:
+            if self.sync_mode != "append":
+                raise ValueError(
+                    f"{self.table_id}: retention_enabled requires append sync_mode"
+                )
+            if not self.source_retention:
+                raise ValueError(
+                    f"{self.table_id}: retention_enabled requires source_retention"
+                )
+            if not self.timestamp_column:
+                raise ValueError(
+                    f"{self.table_id}: source_retention requires timestamp_column"
+                )
+            self._validate_time_expr("source_retention", self.source_retention)
+
+    def _validate_time_expr(self, name: str, value: str) -> None:
+        raw = str(value).strip()
+        if parse_relative_to_timedelta(raw) is not None:
+            return
+        try:
+            datetime.fromisoformat(raw)
+        except ValueError as e:
+            raise ValueError(
+                f"{self.table_id}: {name} must be relative like '180d' or an ISO timestamp"
+            ) from e
 
 
 def _read_yaml(path: Path) -> dict:

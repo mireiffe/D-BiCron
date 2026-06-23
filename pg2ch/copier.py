@@ -78,6 +78,27 @@ class RunResult:
     def as_dict(self) -> dict:
         return {k: getattr(self, k) for k in self.__dataclass_fields__}
 
+    @classmethod
+    def from_dict(cls, data: dict) -> "RunResult":
+        return cls(**{k: data.get(k) for k in cls.__dataclass_fields__})
+
+
+@dataclass
+class CopyPlan:
+    table_id: str
+    sync_mode: str
+    source_table: str
+    target_table: str
+    planned_mode: str
+    rows_to_copy: int
+    watermark_column: str | None = None
+    resume_watermark: str | None = None
+    copy_cutoff: str | None = None
+    sync_since: str | None = None
+
+    def as_dict(self) -> dict:
+        return {k: getattr(self, k) for k in self.__dataclass_fields__}
+
 
 class TableCopier:
     def __init__(
@@ -94,7 +115,7 @@ class TableCopier:
         self.log = logger or logging.getLogger(f"pg2ch.copier.{cfg.table_id}")
 
     # ── public entry ─────────────────────────────────────────
-    def run(self) -> RunResult:
+    def run(self, *, finalize_run: bool = True) -> RunResult:
         """접속 정보를 열어 복사를 수행. Airflow PythonOperator/CLI 진입점."""
         cfg = self.cfg
         src_cfg = get_connection(cfg.source, self.connections_path)
@@ -110,7 +131,10 @@ class TableCopier:
             meta = MetaStore.connect(meta_cfg)
             pg_conn = pg_connect(src_cfg)
             ch = ch_connect(tgt_cfg)
-            return self.copy(pg_conn, ch, meta, target_default_db=tgt_cfg.get("dbname", "default"))
+            return self.copy(
+                pg_conn, ch, meta, target_default_db=tgt_cfg.get("dbname", "default"),
+                finalize_run=finalize_run,
+            )
         finally:
             if ch is not None:
                 try:
@@ -122,6 +146,46 @@ class TableCopier:
             if meta is not None:
                 meta.close()
 
+    def precheck(self) -> CopyPlan:
+        """현재 watermark 기준 copy 대상 row 수를 계산한다."""
+        cfg = self.cfg
+        src_cfg = get_connection(cfg.source, self.connections_path)
+        meta_cfg = get_connection(cfg.meta, self.connections_path)
+        if src_cfg.get("type") not in (None, "postgresql"):
+            raise ValueError(f"source '{cfg.source}' must be postgresql")
+
+        pg_conn = meta = None
+        try:
+            meta = MetaStore.connect(meta_cfg)
+            pg_conn = pg_connect(src_cfg)
+            return self.inspect_copy_plan(pg_conn, meta)
+        finally:
+            if pg_conn is not None:
+                pg_conn.close()
+            if meta is not None:
+                meta.close()
+
+    def finalize(self, result: RunResult | dict) -> RunResult:
+        """deferred copy run 의 watermark/status 를 최종 확정한다."""
+        result = result if isinstance(result, RunResult) else RunResult.from_dict(result)
+        if result.run_id is None:
+            raise ValueError("cannot finalize copy result without run_id")
+        meta_cfg = get_connection(self.cfg.meta, self.connections_path)
+        with MetaStore.connect(meta_cfg) as meta:
+            meta.ensure_schema()
+            meta.finish_run(
+                result.run_id,
+                status=result.status,
+                watermark_after=result.watermark_after,
+                rows_read=result.rows_read,
+                rows_written=result.rows_written,
+                rows_failed=result.rows_failed,
+                batch_count=result.batch_count,
+                duration_ms=result.duration_ms,
+                error=result.error,
+            )
+        return result
+
     # ── core ─────────────────────────────────────────────────
     def copy(
         self,
@@ -130,6 +194,7 @@ class TableCopier:
         meta: MetaStore,
         *,
         target_default_db: str = "default",
+        finalize_run: bool = True,
     ) -> RunResult:
         cfg = self.cfg
         src_schema, src_name = cfg.source_parts()
@@ -137,7 +202,6 @@ class TableCopier:
         wm_col = cfg.effective_watermark_column
         ts_col = cfg.timestamp_column
         is_append = cfg.sync_mode == "append"
-        sync_since = resolve_sync_since(cfg.sync_since) if cfg.sync_since else None
 
         # 1) PG 컬럼 introspection
         pg_cols = self._introspect_pg_columns(pg_conn, src_schema, src_name)
@@ -165,22 +229,14 @@ class TableCopier:
         ch.execute(ddl)
 
         # 3) 모드 / cutoff 결정
-        resume_wm = (
-            meta.get_resume_watermark(cfg.table_id, wm_col)
-            if (is_append and wm_col)
-            else None
-        )
-
-        if is_append and resume_wm is not None:
-            cutoff = apply_overlap(
-                cfg.source_table, resume_wm,
-                overlap_minutes=cfg.overlap_minutes,
-                watermark_overlap=cfg.watermark_overlap,
-            )
+        window = self._copy_window(meta)
+        sync_since = window["sync_since"]
+        if window["planned_mode"] == "incremental":
+            cutoff = window["copy_cutoff"]
             query, params = self._incremental_query(
                 src_schema, src_name, ch_columns, wm_col, ts_col, cutoff, sync_since
             )
-            watermark_before = str(resume_wm)
+            watermark_before = window["watermark_before"]
             self.log.info(
                 "%s: append incremental from cutoff=%s", cfg.source_table, cutoff
             )
@@ -194,7 +250,7 @@ class TableCopier:
             query, params = self._full_query(
                 src_schema, src_name, ch_columns, ts_col, sync_since
             )
-            watermark_before = None
+            watermark_before = window["watermark_before"]
             self.log.info(
                 "%s: %s full copy", cfg.source_table,
                 "append first-run" if is_append else "full_reload",
@@ -228,8 +284,13 @@ class TableCopier:
                 else None
             )
             duration_ms = int((time.monotonic() - t0) * 1000)
+            stored_status = status
+            stored_watermark_after = wm_after
+            if not finalize_run:
+                stored_status = "copied_partial" if status == "partial" else "copied"
+                stored_watermark_after = None
             meta.finish_run(
-                run_id, status=status, watermark_after=wm_after,
+                run_id, status=stored_status, watermark_after=stored_watermark_after,
                 rows_read=totals.rows_read, rows_written=totals.rows_written,
                 rows_failed=totals.rows_failed, batch_count=totals.batch_count,
                 duration_ms=duration_ms,
@@ -259,6 +320,86 @@ class TableCopier:
                 duration_ms=duration_ms, error=str(e),
             )
             raise
+
+    def inspect_copy_plan(self, pg_conn, meta: MetaStore) -> CopyPlan:
+        """현재 resume watermark / sync_since 로 copy 대상 row 수를 계산한다."""
+        cfg = self.cfg
+        src_schema, src_name = cfg.source_parts()
+        meta.ensure_schema()
+        window = self._copy_window(meta)
+
+        if window["planned_mode"] == "incremental":
+            conditions, params = self._incremental_conditions(
+                cfg.effective_watermark_column,
+                cfg.timestamp_column,
+                window["copy_cutoff"],
+                window["sync_since"],
+            )
+        else:
+            conditions, params = self._full_conditions(
+                cfg.timestamp_column,
+                window["sync_since"],
+            )
+        query, params = self._count_query(src_schema, src_name, conditions, params)
+        rows_to_copy = self._count_source_rows(pg_conn, query, params)
+        return CopyPlan(
+            table_id=cfg.table_id,
+            sync_mode=cfg.sync_mode,
+            source_table=cfg.source_table,
+            target_table=cfg.target_table,
+            planned_mode=window["planned_mode"],
+            rows_to_copy=rows_to_copy,
+            watermark_column=cfg.effective_watermark_column if cfg.sync_mode == "append" else None,
+            resume_watermark=window["resume_watermark"],
+            copy_cutoff=_wm_str(window["copy_cutoff"]),
+            sync_since=window["sync_since"],
+        )
+
+    def _copy_window(self, meta: MetaStore) -> dict:
+        cfg = self.cfg
+        wm_col = cfg.effective_watermark_column
+        is_append = cfg.sync_mode == "append"
+        sync_since = resolve_sync_since(cfg.sync_since) if cfg.sync_since else None
+        resume_wm = (
+            meta.get_resume_watermark(cfg.table_id, wm_col)
+            if (is_append and wm_col)
+            else None
+        )
+        if is_append and resume_wm is not None:
+            cutoff = apply_overlap(
+                cfg.source_table,
+                resume_wm,
+                overlap_minutes=cfg.overlap_minutes,
+                watermark_overlap=cfg.watermark_overlap,
+            )
+            return {
+                "planned_mode": "incremental",
+                "resume_watermark": str(resume_wm),
+                "copy_cutoff": cutoff,
+                "watermark_before": str(resume_wm),
+                "sync_since": sync_since,
+            }
+        return {
+            "planned_mode": "append_first_run" if is_append else "full_reload",
+            "resume_watermark": None,
+            "copy_cutoff": None,
+            "watermark_before": None,
+            "sync_since": sync_since,
+        }
+
+    @staticmethod
+    def _count_source_rows(pg_conn, query: str, params) -> int:
+        with pg_conn.cursor() as cur:
+            if params:
+                cur.execute(query, params)
+            else:
+                cur.execute(query)
+            row = cur.fetchone()
+        try:
+            pg_conn.rollback()
+        except Exception:
+            pass
+        return int(row[0]) if row else 0
 
     # ── streaming ────────────────────────────────────────────
     def _stream(
@@ -458,15 +599,9 @@ class TableCopier:
         cls, src_schema, src_name, select_items, wm_col, ts_col, cutoff, sync_since
     ):
         col_list = cls._pg_select_list(select_items)
-        conditions = [f"{quote_pg_identifier(wm_col)} > %s"]
-        params: list = [cutoff]
-        if sync_since and ts_col:
-            if ts_col == wm_col:
-                if str(sync_since) > str(cutoff):
-                    params[0] = sync_since
-            else:
-                conditions.append(f"{quote_pg_identifier(ts_col)} >= %s")
-                params.append(sync_since)
+        conditions, params = cls._incremental_conditions(
+            wm_col, ts_col, cutoff, sync_since
+        )
         where = " AND ".join(conditions)
         query = (
             f"SELECT {col_list} FROM {quote_pg_identifier(src_schema)}."
@@ -488,10 +623,38 @@ class TableCopier:
             f"SELECT {col_list} FROM {quote_pg_identifier(src_schema)}."
             f"{quote_pg_identifier(src_name)}"
         )
-        params = None
+        conditions, params = cls._full_conditions(ts_col, sync_since)
+        if conditions:
+            query += " WHERE " + " AND ".join(conditions)
+        return query, params
+
+    @staticmethod
+    def _incremental_conditions(wm_col, ts_col, cutoff, sync_since):
+        conditions = [f"{quote_pg_identifier(wm_col)} > %s"]
+        params: list = [cutoff]
         if sync_since and ts_col:
-            query += f" WHERE {quote_pg_identifier(ts_col)} >= %s"
-            params = (sync_since,)
+            if ts_col == wm_col:
+                if str(sync_since) > str(cutoff):
+                    params[0] = sync_since
+            else:
+                conditions.append(f"{quote_pg_identifier(ts_col)} >= %s")
+                params.append(sync_since)
+        return conditions, tuple(params)
+
+    @staticmethod
+    def _full_conditions(ts_col, sync_since):
+        if sync_since and ts_col:
+            return [f"{quote_pg_identifier(ts_col)} >= %s"], (sync_since,)
+        return [], None
+
+    @staticmethod
+    def _count_query(src_schema, src_name, conditions, params):
+        query = (
+            f"SELECT count(*) FROM {quote_pg_identifier(src_schema)}."
+            f"{quote_pg_identifier(src_name)}"
+        )
+        if conditions:
+            query += " WHERE " + " AND ".join(conditions)
         return query, params
 
     # ── post-sync OPTIMIZE ───────────────────────────────────
