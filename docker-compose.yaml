@@ -129,9 +129,12 @@ services:
       airflow-init:
         condition: service_completed_successfully
 
-  # 로컬 테스트용 ClickHouse (실제 운영에서는 connections.json 을 외부 CH 로 향하게 한다)
+  # 로컬 테스트용 ClickHouse (실제 운영에서는 connections.json 을 외부 CH 로 향하게 한다).
+  # 기본 `docker compose up` 에선 뜨지 않는다(외부 CH 사용 가정, 부팅 경량화).
+  # 로컬 테스트 시에만: docker compose --profile local-ch up -d
   clickhouse:
     image: clickhouse/clickhouse-server:24.8
+    profiles: ["local-ch"]
     ports:
       - "8123:8123"
       - "9000:9000"
