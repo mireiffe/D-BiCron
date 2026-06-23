@@ -152,18 +152,22 @@ def build_dag(cfg: TableConfig) -> DAG:
     with dag:
         precheck = PythonOperator(
             task_id="precheck",
+            task_display_name="1. precheck",
             python_callable=_make_precheck_callable(cfg.table_id),
         )
         copy = PythonOperator(
             task_id="copy",
+            task_display_name="2. copy",
             python_callable=_make_copy_callable(cfg.table_id),
         )
         finalize = PythonOperator(
             task_id="finalize_watermark",
+            task_display_name="3. finalize_watermark",
             python_callable=_make_finalize_callable(cfg.table_id),
         )
         retention = PythonOperator(
             task_id="retention",
+            task_display_name="4. retention",
             python_callable=_make_retention_callable(cfg.table_id),
         )
         precheck >> copy >> finalize >> retention
