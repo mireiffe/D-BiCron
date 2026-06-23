@@ -13,7 +13,16 @@
 #   # UI: http://localhost:8080  (admin / admin)
 
 x-airflow-common: &airflow-common
-  build: .
+  build:
+    context: .
+    # 사내 사설 패키지 저장소(미러)를 빌드에 전달 (.env 에서 값을 채운다).
+    # 비어 있으면 Dockerfile 의 ARG 기본값(빈 값)이 적용되어 공용 PyPI 를 탄다.
+    args:
+      PIP_INDEX_URL: ${PIP_INDEX_URL:-}
+      PIP_EXTRA_INDEX_URL: ${PIP_EXTRA_INDEX_URL:-}
+      PIP_TRUSTED_HOST: ${PIP_TRUSTED_HOST:-}
+      UV_INDEX_URL: ${UV_INDEX_URL:-}
+      NPM_CONFIG_REGISTRY: ${NPM_CONFIG_REGISTRY:-}
   image: pg2ch-airflow:3.2.2
   env_file:
     - .env
