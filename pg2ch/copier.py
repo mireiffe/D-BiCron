@@ -278,10 +278,14 @@ class TableCopier:
 
         batch_seq = 0
         while True:
+            batch_t0 = time.monotonic()
+            fetch_t0 = time.monotonic()
             raw_rows = cursor.fetchmany(cfg.batch_size)
+            fetch_ms = int((time.monotonic() - fetch_t0) * 1000)
             if not raw_rows:
                 break
 
+            wm_t0 = time.monotonic()
             lo = hi = None
             if wm_idx is not None:
                 for r in raw_rows:
@@ -294,14 +298,20 @@ class TableCopier:
                         hi = v
                 if hi is not None and (totals.max_wm is None or hi > totals.max_wm):
                     totals.max_wm = hi
+            watermark_ms = int((time.monotonic() - wm_t0) * 1000)
 
+            transform_t0 = time.monotonic()
             xrows = [transformer(r) for r in raw_rows] if transformer else list(raw_rows)
+            transform_ms = int((time.monotonic() - transform_t0) * 1000)
+            insert_t0 = time.monotonic()
             written, failures = self._insert(
                 ch, insert_sql, raw_rows, xrows, col_names, wm_idx
             )
+            insert_ms = int((time.monotonic() - insert_t0) * 1000)
             rows_failed = len(failures)
             batch_status = "success" if rows_failed == 0 else "partial"
 
+            meta_t0 = time.monotonic()
             batch_id = meta.record_batch(
                 run_id=run_id, table_id=cfg.table_id, batch_seq=batch_seq,
                 status=batch_status, rows_in=len(raw_rows), rows_written=written,
@@ -312,14 +322,22 @@ class TableCopier:
                     run_id=run_id, batch_id=batch_id, table_id=cfg.table_id,
                     batch_seq=batch_seq, failures=failures,
                 )
+            meta_ms = int((time.monotonic() - meta_t0) * 1000)
 
             totals.rows_read += len(raw_rows)
             totals.rows_written += written
             totals.rows_failed += rows_failed
             totals.batch_count += 1
+            total_ms = int((time.monotonic() - batch_t0) * 1000)
+            rows_per_sec = int(len(raw_rows) / max(total_ms / 1000, 0.001))
             self.log.info(
-                "%s: batch %d — in=%d written=%d failed=%d (total written=%d)",
+                "%s: batch %d — in=%d written=%d failed=%d "
+                "elapsed=%dms rate=%d rows/s "
+                "(fetch=%dms watermark=%dms transform=%dms insert=%dms meta=%dms; "
+                "total written=%d)",
                 cfg.source_table, batch_seq, len(raw_rows), written, rows_failed,
+                total_ms, rows_per_sec,
+                fetch_ms, watermark_ms, transform_ms, insert_ms, meta_ms,
                 totals.rows_written,
             )
 
