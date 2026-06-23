@@ -241,7 +241,8 @@ uv run pg2ch status orders       # 마지막 run / watermark / 미해결 실패 
    서비스는 *Airflow 자체 메타DB*(dbname `airflow`, user `airflow`)다 — 예시의
    `dbname: shop / user: app` 을 그대로 두면 접속 실패한다. 로컬 테스트만 하려면 compose 에
    포함된 ClickHouse(`host: clickhouse, port: 9000`)를 `target` 으로 쓰고, `source`/`meta`
-   는 접근 가능한 실제 PG 로 맞춘다.
+   는 접근 가능한 실제 PG 로 맞춘다. (로컬 CH 는 `local-ch` 프로필 뒤에 있다 — 기본
+   `up` 에선 안 뜨므로 `docker compose --profile local-ch up -d` 로 켠다.)
 2. **Docker 컨테이너 안에서는 서비스 이름으로 통신**한다(`postgres`, `clickhouse`). 외부 DB
    라면 컨테이너에서 닿는 실제 호스트/IP 를 적는다.
 3. ClickHouse 포트는 **native(9000)** — clickhouse-driver 는 HTTP(8123)가 아니라 native
@@ -251,6 +252,13 @@ uv run pg2ch status orders       # 마지막 run / watermark / 미해결 실패 
    자동 해결하지만, 호스트에서 로그를 직접 열어 보려면 `.env` 의 `AIRFLOW_UID` 를
    `$(id -u)` 로 맞춘다.
 5. **로그인**: 위 [실행](#3-a-실행--airflow-docker-운영-방식) 박스의 로그인 노트 참조.
+6. **`InvalidSignatureError: Signature verification failed` 가 scheduler 로그에 반복**되면,
+   컨테이너마다 JWT 서명 시크릿(`AIRFLOW__API_AUTH__JWT_SECRET`)이 갈린 것이다 — 보통
+   부분 재시작/잔존 컨테이너로 api-server 와 scheduler 가 서로 다른 값을 물고 있을 때 생긴다.
+   전체 재생성으로 한 번에 같은 값을 받게 한다: `docker compose down && docker compose up -d`.
+   시크릿을 직접 고정하려면 `.env` 의 `AIRFLOW_JWT_SECRET` 을 채우고(전 컨테이너 공유),
+   바꾼 뒤에는 항상 `down && up` 으로 재생성한다. 확인: `docker compose exec airflow-apiserver
+   airflow config get-value api_auth jwt_secret` 와 scheduler 의 값이 같아야 한다.
 
 ---
 

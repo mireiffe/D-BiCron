@@ -32,8 +32,14 @@ x-airflow-common: &airflow-common
     AIRFLOW__CORE__EXECUTION_API_SERVER_URL: 'http://airflow-apiserver:8080/execution/'
     AIRFLOW__CORE__LOAD_EXAMPLES: 'false'
     AIRFLOW__CORE__DAGS_FOLDER: /opt/airflow/dags
-    # 모든 컴포넌트가 공유해야 하는 내부 인증 시크릿
+    # api-server ↔ scheduler ↔ task 실행 API 의 JWT 서명에 쓰는 공유 시크릿.
+    # 모든 컨테이너가 같은 값을 써야 한다 — 값이 갈리면 실행 API 호출마다
+    # InvalidSignatureError 가 반복된다. 값을 바꿀 땐 부분 재시작 말고 전체
+    # 재생성: `docker compose down && docker compose up -d`.
     AIRFLOW__API_AUTH__JWT_SECRET: ${AIRFLOW_JWT_SECRET:-pg2ch-dev-secret-change-me}
+    # connection/variable 암호화 키(Fernet). 비워 두면 비암호화로 저장되고,
+    # 키를 바꾸면 기존 암호값을 복호화할 수 없다. .env 의 FERNET_KEY 로 고정한다.
+    AIRFLOW__CORE__FERNET_KEY: ${FERNET_KEY:-}
     # [개발 전용] Airflow 3.x SimpleAuthManager 인증 우회(로그인 없이 전원 admin).
     # 기본 false(보안). 로컬에서만 .env 에 AIRFLOW_ALL_ADMINS=true 로 명시적 opt-in 한다.
     # 공유/운영 환경에서는 절대 true 로 두지 말 것 — 운영은 README 의 로그인 섹션 참조.
