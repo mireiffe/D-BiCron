@@ -199,12 +199,22 @@ cp .env.example .env             # PG_PASSWORD 등 채우기, AIRFLOW_UID=$(id -
 
 docker compose build
 docker compose up -d
-# Airflow UI: http://localhost:8080  (admin / admin)
+# Airflow UI: http://localhost:8080
 ```
 
 테이블당 DAG `pg2ch_<table_id>` 가 자동 생성된다. UI 에서 토글을 켜면 `schedule` 대로 돈다.
 `docker-compose.yaml` 은 Airflow 공식 3.x 템플릿을 LocalExecutor 로 단순화한 것이며,
 로컬 테스트용 ClickHouse 서비스를 포함한다.
+
+> **로그인**: Airflow 3.x 기본 인증은 SimpleAuthManager 이고 `airflow users create` 는
+> FAB 인증매니저 전용이다. 개발 편의를 위해 compose 는 `SIMPLE_AUTH_MANAGER_ALL_ADMINS=true`
+> 로 **인증을 우회**한다(로그인 없이 admin). 운영에서는 이 값을 끄고, 생성된 비밀번호로
+> 로그인하거나 FAB 인증매니저를 쓴다.
+> ```bash
+> # SimpleAuthManager 가 생성한 admin 비밀번호 확인 (우회를 끈 경우)
+> docker compose exec airflow-apiserver \
+>   cat /opt/airflow/simple_auth_manager_passwords.json.generated
+> ```
 
 ### 3-b. 실행 — CLI (Airflow 없이 one-shot / 디버그)
 
@@ -233,6 +243,11 @@ uv run pg2ch status orders       # 마지막 run / watermark / 미해결 실패 
    라면 컨테이너에서 닿는 실제 호스트/IP 를 적는다.
 3. ClickHouse 포트는 **native(9000)** — clickhouse-driver 는 HTTP(8123)가 아니라 native
    TCP 를 쓴다.
+4. **로그 권한**: dag-processor 가 `*.log` 를 못 만든다는 에러는 bind-mount 된 `./logs` 를
+   컨테이너 사용자가 못 쓰는 권한 문제다. compose 의 `airflow-init` 가 root 로 `chown` 해
+   자동 해결하지만, 호스트에서 로그를 직접 열어 보려면 `.env` 의 `AIRFLOW_UID` 를
+   `$(id -u)` 로 맞춘다.
+5. **로그인**: 위 [실행](#3-a-실행--airflow-docker-운영-방식) 박스의 로그인 노트 참조.
 
 ---
 

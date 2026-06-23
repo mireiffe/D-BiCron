@@ -34,6 +34,9 @@ x-airflow-common: &airflow-common
     AIRFLOW__CORE__DAGS_FOLDER: /opt/airflow/dags
     # 모든 컴포넌트가 공유해야 하는 내부 인증 시크릿
     AIRFLOW__API_AUTH__JWT_SECRET: ${AIRFLOW_JWT_SECRET:-pg2ch-dev-secret-change-me}
+    # [개발용] Airflow 3.x 기본 SimpleAuthManager 인증 우회 — 로그인 없이 전원 admin.
+    # 운영에서는 'false' 로 두고 FAB 인증매니저 또는 생성 비밀번호를 사용한다 (README 참조).
+    AIRFLOW__CORE__SIMPLE_AUTH_MANAGER_ALL_ADMINS: 'true'
     # pg2ch 설정 경로 (컨테이너 내부)
     PG2CH_CONNECTIONS: /opt/airflow/config/connections.json
     PG2CH_TABLES_DIR: /opt/airflow/config/tables
@@ -66,20 +69,19 @@ services:
       start_period: 5s
     restart: always
 
-  # DB 마이그레이션 + 관리자 계정 생성 후 종료
+  # 볼륨 권한 정리(root 로 실행) + DB 마이그레이션 후 종료.
+  # bind-mount 된 logs/plugins 를 컨테이너 사용자(AIRFLOW_UID)가 쓸 수 있게 chown 한다
+  # → dag-processor 의 "*.log 파일 없음" 권한 에러를 해결.
   airflow-init:
     <<: *airflow-common
+    user: "0:0"
     entrypoint: /bin/bash
     command:
       - -c
       - |
+        mkdir -p /opt/airflow/logs /opt/airflow/dags /opt/airflow/plugins /opt/airflow/config /opt/airflow/sql
+        chown -R "${AIRFLOW_UID:-50000}:0" /opt/airflow/logs /opt/airflow/plugins
         airflow db migrate
-        airflow users create \
-          --role Admin \
-          --username "${_AIRFLOW_WWW_USER_USERNAME:-admin}" \
-          --password "${_AIRFLOW_WWW_USER_PASSWORD:-admin}" \
-          --firstname Admin --lastname User \
-          --email admin@example.com || true
     restart: on-failure
 
   airflow-apiserver:
