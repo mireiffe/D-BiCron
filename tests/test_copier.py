@@ -17,10 +17,12 @@ class FakeCH:
     def __init__(self, bad=None):
         self.bad = bad
         self.executed: list[str] = []
+        self.kwargs: list[dict] = []
         self.inserted: list = []
 
     def execute(self, sql, params=None, **kw):
         self.executed.append(sql)
+        self.kwargs.append(kw)
         if sql.startswith("INSERT INTO") and isinstance(params, list):
             if self.bad and any(self.bad(r) for r in params):
                 raise ValueError("ch insert failed")
@@ -185,6 +187,23 @@ class TestQueryBuilders:
         assert "ORDER BY" not in q
         assert p == ("2025-01-01T00:00:00",)
 
+    def test_full_query_pushes_pg_casts_for_expensive_types(self):
+        q, _ = TableCopier._full_query(
+            "public",
+            "events",
+            [
+                {"name": "id", "pg_type": "integer", "ch_type": "Int32"},
+                {"name": "payload", "pg_type": "jsonb", "ch_type": "String"},
+                {"name": "raw", "pg_type": "bytea", "ch_type": "String"},
+                {"name": "flag", "pg_type": "boolean", "ch_type": "UInt8"},
+            ],
+            None,
+            None,
+        )
+        assert '"payload"::text AS "payload"' in q
+        assert "encode(\"raw\", 'hex') AS \"raw\"" in q
+        assert '"flag"::int AS "flag"' in q
+
 
 # ── row isolation (_insert) ──────────────────────────────────────
 
@@ -231,6 +250,15 @@ class TestInsertIsolation:
             self._copier(on_row_error="fail")._insert(
                 ch, "INSERT INTO `d`.`t` (`id`, `name`) VALUES", rows, rows, ["id", "name"], 0
             )
+
+    def test_insert_types_check_can_be_disabled(self):
+        ch = FakeCH()
+        rows = [(1, "a"), (2, "b")]
+        written, failures = self._copier(insert_types_check=False)._insert(
+            ch, "INSERT INTO `d`.`t` (`id`, `name`) VALUES", rows, rows, ["id", "name"], 0
+        )
+        assert written == 2 and failures == []
+        assert ch.kwargs[-1]["types_check"] is False
 
 
 # ── full copy() flow ─────────────────────────────────────────────

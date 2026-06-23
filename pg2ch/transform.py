@@ -176,13 +176,24 @@ def build_transformer(columns: list[dict]):
     if not transforms and not null_coerce:
         return None
 
+    transform_items = tuple(transforms.items())
+    null_items = tuple(null_coerce.items())
+
     def transform(row: tuple) -> tuple:
-        lst = list(row)
-        for idx, fn in transforms.items():
-            lst[idx] = fn(lst[idx])
-        for idx, default in null_coerce.items():
-            if lst[idx] is None:
+        lst = None
+        for idx, fn in transform_items:
+            old = row[idx] if lst is None else lst[idx]
+            new = fn(old)
+            if new is not old:
+                if lst is None:
+                    lst = list(row)
+                lst[idx] = new
+        for idx, default in null_items:
+            value = row[idx] if lst is None else lst[idx]
+            if value is None:
+                if lst is None:
+                    lst = list(row)
                 lst[idx] = default
-        return tuple(lst)
+        return row if lst is None else tuple(lst)
 
     return transform

@@ -92,6 +92,10 @@ class TestValidation:
         with pytest.raises(ValueError, match="batch_size"):
             TableConfig.from_dict(_base(batch_size=0))
 
+    def test_bad_insert_types_check(self):
+        with pytest.raises(ValueError, match="insert_types_check"):
+            TableConfig.from_dict(_base(insert_types_check="false"))
+
 
 class TestLoaders:
     def _write(self, p, body):

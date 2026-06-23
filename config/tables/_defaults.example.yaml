@@ -15,6 +15,7 @@ retry_delay_seconds: 300
 
 # 적재 기본값
 batch_size: 100000
+insert_types_check: true
 use_nullable: false
 on_row_error: dead_letter   # dead_letter | skip | fail
 

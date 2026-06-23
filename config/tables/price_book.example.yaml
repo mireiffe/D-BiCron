@@ -29,4 +29,5 @@ column_overrides:
 use_nullable: false
 
 batch_size: 100000
+insert_types_check: true
 on_row_error: dead_letter

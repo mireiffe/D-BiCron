@@ -27,7 +27,12 @@ import time
 from dataclasses import dataclass
 from datetime import datetime
 
-from .chtypes import quote_ch_identifier, quote_ch_string, quote_pg_identifier
+from .chtypes import (
+    quote_ch_identifier,
+    quote_ch_string,
+    quote_pg_identifier,
+    unwrap_ch_type,
+)
 from .config import TableConfig
 from .connections import ch_connect, get_connection, pg_connect
 from .ddl import build_ch_columns, build_create_table_ddl, extract_ch_key_columns
@@ -173,7 +178,7 @@ class TableCopier:
                 watermark_overlap=cfg.watermark_overlap,
             )
             query, params = self._incremental_query(
-                src_schema, src_name, col_names, wm_col, ts_col, cutoff, sync_since
+                src_schema, src_name, ch_columns, wm_col, ts_col, cutoff, sync_since
             )
             watermark_before = str(resume_wm)
             self.log.info(
@@ -187,7 +192,7 @@ class TableCopier:
                     f"{quote_ch_identifier(tgt_db)}.{quote_ch_identifier(tgt_name)}"
                 )
             query, params = self._full_query(
-                src_schema, src_name, col_names, ts_col, sync_since
+                src_schema, src_name, ch_columns, ts_col, sync_since
             )
             watermark_before = None
             self.log.info(
@@ -357,16 +362,17 @@ class TableCopier:
     # ── INSERT with row isolation ────────────────────────────
     def _insert(self, ch, insert_sql, raw_rows, xrows, col_names, wm_idx):
         """(written_count, failures) 반환. failures: [(wm_str, row_json, error)]."""
+        types_check = self.cfg.insert_types_check
         if self.cfg.on_row_error == "fail":
-            ch.execute(insert_sql, xrows, types_check=True)
+            ch.execute(insert_sql, xrows, types_check=types_check)
             return len(xrows), []
 
         try:
-            ch.execute(insert_sql, xrows, types_check=True)
+            ch.execute(insert_sql, xrows, types_check=types_check)
             return len(xrows), []
         except Exception as first_err:
             written, failures = self._isolate(
-                ch, insert_sql, raw_rows, xrows, col_names, wm_idx
+                ch, insert_sql, raw_rows, xrows, col_names, wm_idx, types_check
             )
             if written == 0 and len(xrows) > 1:
                 # 전체 batch 가 row 단위로도 실패 → 인프라/스키마 문제로 판단, fail fast
@@ -376,18 +382,22 @@ class TableCopier:
                 ) from first_err
             return written, failures
 
-    def _isolate(self, ch, insert_sql, raws, xs, col_names, wm_idx):
+    def _isolate(self, ch, insert_sql, raws, xs, col_names, wm_idx, types_check):
         """binary-split 로 나쁜 row 격리."""
         try:
-            ch.execute(insert_sql, xs, types_check=True)
+            ch.execute(insert_sql, xs, types_check=types_check)
             return len(xs), []
         except Exception as e:
             if len(xs) == 1:
                 wm = raws[0][wm_idx] if wm_idx is not None else None
                 return 0, [(_wm_str(wm), row_to_json(col_names, raws[0]), str(e))]
             mid = len(xs) // 2
-            w1, f1 = self._isolate(ch, insert_sql, raws[:mid], xs[:mid], col_names, wm_idx)
-            w2, f2 = self._isolate(ch, insert_sql, raws[mid:], xs[mid:], col_names, wm_idx)
+            w1, f1 = self._isolate(
+                ch, insert_sql, raws[:mid], xs[:mid], col_names, wm_idx, types_check
+            )
+            w2, f2 = self._isolate(
+                ch, insert_sql, raws[mid:], xs[mid:], col_names, wm_idx, types_check
+            )
             return w1 + w2, f1 + f2
 
     # ── PG introspection ─────────────────────────────────────
@@ -412,8 +422,42 @@ class TableCopier:
 
     # ── query builders ───────────────────────────────────────
     @staticmethod
-    def _incremental_query(src_schema, src_name, col_names, wm_col, ts_col, cutoff, sync_since):
-        col_list = ", ".join(quote_pg_identifier(c) for c in col_names)
+    def _pg_select_item(item) -> str:
+        if not isinstance(item, dict):
+            return quote_pg_identifier(item)
+
+        name = item["name"]
+        quoted = quote_pg_identifier(name)
+        alias = f" AS {quoted}"
+        pg_type = item["pg_type"]
+        base = unwrap_ch_type(item["ch_type"])
+        override = item.get("override") or {}
+
+        if override.get("parse_format"):
+            return quoted
+        if pg_type in ("json", "jsonb") and base == "String":
+            return f"{quoted}::text{alias}"
+        if pg_type == "bytea" and base == "String":
+            return f"encode({quoted}, 'hex'){alias}"
+        if pg_type == "boolean" and base == "UInt8":
+            return f"{quoted}::int{alias}"
+        if base == "String" and pg_type not in (
+            "character varying",
+            "character",
+            "text",
+        ):
+            return f"{quoted}::text{alias}"
+        return quoted
+
+    @classmethod
+    def _pg_select_list(cls, items) -> str:
+        return ", ".join(cls._pg_select_item(item) for item in items)
+
+    @classmethod
+    def _incremental_query(
+        cls, src_schema, src_name, select_items, wm_col, ts_col, cutoff, sync_since
+    ):
+        col_list = cls._pg_select_list(select_items)
         conditions = [f"{quote_pg_identifier(wm_col)} > %s"]
         params: list = [cutoff]
         if sync_since and ts_col:
@@ -431,15 +475,15 @@ class TableCopier:
         )
         return query, tuple(params)
 
-    @staticmethod
-    def _full_query(src_schema, src_name, col_names, ts_col, sync_since):
+    @classmethod
+    def _full_query(cls, src_schema, src_name, select_items, ts_col, sync_since):
         # full copy 는 정렬 없이 seq scan 으로 스트리밍한다.
         # PG 의 ORDER BY 는 server-side cursor 와 만나면 첫 row 를 내보내기 전에
         # 전체 테이블 정렬(blocking sort)을 강제해, 대용량 첫 실행에서 데이터가
         # 들어가기 전 긴 선행 대기를 만든다. watermark_after 는 batch running max
         # 로 추적하므로 정렬이 불필요하고, target 정렬은 MergeTree(order_by)가
         # 백그라운드 머지로 처리한다.
-        col_list = ", ".join(quote_pg_identifier(c) for c in col_names)
+        col_list = cls._pg_select_list(select_items)
         query = (
             f"SELECT {col_list} FROM {quote_pg_identifier(src_schema)}."
             f"{quote_pg_identifier(src_name)}"

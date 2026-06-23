@@ -45,6 +45,7 @@ use_nullable: false
 
 # 배치 / 에러 처리
 batch_size: 50000
+insert_types_check: true          # 안정화 후 false 로 두면 INSERT CPU 비용 감소 가능
 on_row_error: dead_letter        # 실패 row 는 copy_failed_row 에 보관
 max_failed_rows: 1000            # 누적 실패가 이 수를 넘으면 run 실패 처리
 

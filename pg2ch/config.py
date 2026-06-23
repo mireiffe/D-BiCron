@@ -82,6 +82,7 @@ class TableConfig:
 
     # 배치 / 에러 처리
     batch_size: int = 100_000
+    insert_types_check: bool = True
     on_row_error: str = "dead_letter"  # dead_letter | fail | skip
     max_failed_rows: int | None = None
 
@@ -158,6 +159,8 @@ class TableConfig:
             raise ValueError(f"{self.table_id}: order_by is required")
         if int(self.batch_size) <= 0:
             raise ValueError(f"{self.table_id}: batch_size must be a positive integer")
+        if not isinstance(self.insert_types_check, bool):
+            raise ValueError(f"{self.table_id}: insert_types_check must be boolean")
         if self.max_failed_rows is not None and int(self.max_failed_rows) < 0:
             raise ValueError(f"{self.table_id}: max_failed_rows must be >= 0")
 

@@ -155,6 +155,7 @@ use_nullable: false
 
 # 배치 / 에러 처리
 batch_size: 50000
+insert_types_check: true          # 안정화 후 false 로 두면 INSERT CPU 비용 감소 가능
 on_row_error: dead_letter        # dead_letter | skip | fail
 max_failed_rows: 1000            # 누적 실패가 넘으면 run 실패 처리
 
@@ -188,6 +189,7 @@ use_nullable: false
 | DDL | `engine`, `order_by`, `primary_key`, `partition_by`, `indexes`, `settings` |
 | 타입/컬럼 | `column_overrides`, `drop_columns`, `use_nullable` |
 | 증분(append) | `watermark_column`, `timestamp_column`, `sync_since`, `overlap_minutes`, `watermark_overlap` |
+| 배치/성능 | `batch_size`, `insert_types_check` |
 | 에러 | `on_row_error`(dead_letter\|skip\|fail), `max_failed_rows` |
 | 스케줄 | `schedule`, `start_date`, `catchup`, `max_active_runs`, `retries`, `retry_delay_seconds`, `tags` |
 | 후처리 | `optimize_after_sync`, `optimize_partitions`, `optimize_mutations_sync` |
