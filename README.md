@@ -6,6 +6,9 @@
 주기가 다를 수 있고(설정으로 지정), 어디까지 복사되었는지 / 어느 batch 의 어느 row 가
 실패했는지를 정밀하게 추적한다.
 
+> 이 저장소는 과거 cron 기반 다중 DB 관리 플랫폼(dbcron)을 완전히 대체한 것이다.
+> 옛 프로젝트는 `backup_cron` 브랜치에 보존되어 있다 → 아래 [기존 프로젝트](#기존-프로젝트-backup_cron) 참조.
+
 ---
 
 ## 핵심 개념
@@ -63,51 +66,52 @@ dead-letter 에 보존됨) 파이프라인이 멈추지 않는다 — 이때 run
 
 ---
 
-## 빠른 시작 (Docker Compose)
+## 설정 & 실행
 
-```bash
-cp .env.example .env                                   # PG_PASSWORD 등 채우기, AIRFLOW_UID=$(id -u)
-cp config/connections.example.json config/connections.json
-cp config/tables/orders.example.yaml config/tables/orders.yaml   # 테이블별로 1개씩
-# (선택) cp config/tables/_defaults.example.yaml config/tables/_defaults.yaml
+큰 흐름은 **① 접속 정보 → ② 테이블 규칙 → ③ 실행** 세 단계다.
+`*.example` 파일이 템플릿이므로 복사해서 `.example` 만 떼고 값을 채운다.
 
-docker compose build
-docker compose up -d
-# Airflow UI: http://localhost:8080  (admin / admin)
+```
+config/connections.json    ← PG/CH/meta 접속 정보 (ID 로 관리)
+config/tables/*.yaml         ← 테이블당 1개, 복사 규칙 + DDL + 스케줄
+        └── dags/pg2ch_factory.py 가 읽어 pg2ch_<table_id> DAG 자동 생성
+            또는  uv run pg2ch copy <table_id> 로 직접 실행
+추적 결과 → Postgres pg2ch_meta 스키마
 ```
 
-DAG `pg2ch_<table_id>` 가 테이블당 1개씩 자동 생성된다.
+### 1. 접속 정보 — `config/connections.json`
 
-`docker-compose.yaml` 은 Airflow 공식 3.x 템플릿을 LocalExecutor 로 단순화한 것이며,
-로컬 테스트용 ClickHouse 서비스를 포함한다. 운영에서는 `connections.json` 을 실제
-PG/CH 로 향하게 한다.
-
----
-
-## 설정
-
-### 접속 정보 — `config/connections.json`
+```bash
+cp config/connections.example.json config/connections.json
+```
 
 ID 로 키잉된 JSON. 테이블 설정은 이 ID(`source`/`target`/`meta`)만 참조한다.
-비밀 값은 `${ENV_VAR}` / `${ENV_VAR:-default}` 로 환경변수 참조 가능.
-`"_enc": "b64"` 인 항목의 password 는 base64 디코딩된다.
 
 ```json
 {
-  "my_postgres":   {"type": "postgresql", "host": "postgres", "port": 5432,
+  "my_postgres":   {"type": "postgresql", "host": "10.0.0.5", "port": 5432,
                     "dbname": "shop", "user": "app", "password": "${PG_PASSWORD}"},
-  "my_clickhouse": {"type": "clickhouse", "host": "clickhouse", "port": 9000,
-                    "dbname": "default", "user": "default", "password": ""},
-  "meta":          {"type": "postgresql", "host": "postgres", "port": 5432,
+  "my_clickhouse": {"type": "clickhouse", "host": "10.0.0.9", "port": 9000,
+                    "dbname": "default", "user": "default", "password": "${CH_PASSWORD:-}"},
+  "meta":          {"type": "postgresql", "host": "10.0.0.5", "port": 5432,
                     "dbname": "shop", "user": "app", "password": "${PG_PASSWORD}",
                     "schema": "pg2ch_meta"}
 }
 ```
 
-### 테이블 파이프라인 — `config/tables/<table_id>.yaml` (테이블당 1개)
+- **`source`** = 실제 PG (복사 대상 테이블이 있는 곳), **`target`** = 실제 CH.
+  ClickHouse `port` 는 **native 9000** (HTTP 8123 아님).
+- **`meta`** = 추적 기록을 저장할 Postgres. 따로 둘 필요 없이 **source PG 를 재사용**해도
+  된다 (`pg2ch_meta` 스키마가 자동 생성됨).
+- 비밀 값은 파일에 직접 적지 말고 `${PG_PASSWORD}` 처럼 환경변수로 빼는 것을 권장(`.env` 에 작성).
+  `${VAR:-기본값}` 문법과 `"_enc": "b64"` (base64 password) 도 지원.
+
+### 2. 테이블 규칙 — `config/tables/<table_id>.yaml` (테이블당 1개)
 
 같은 디렉터리의 `_defaults.yaml`(있으면)이 모든 테이블에 병합된다(테이블별 값 우선,
 `settings` 는 깊은 병합). 전체 예시는 `config/tables/*.example.yaml` 참조.
+
+**A) 새 row 가 쌓이는 테이블 → `append`**
 
 ```yaml
 table_id: orders                 # 고유 ID → DAG id(pg2ch_orders) + 추적 키
@@ -115,7 +119,7 @@ source: my_postgres              # connections.json 의 ID
 target: my_clickhouse
 meta: meta
 
-sync_mode: append                # append | full_reload
+sync_mode: append
 schedule: "*/15 * * * *"         # cron (DAG 스케줄)
 start_date: "2026-01-01"
 
@@ -126,7 +130,7 @@ target_table: default.orders
 watermark_column: updated_at     # 이 컬럼 > 마지막 watermark 인 row 만 전송
 timestamp_column: updated_at     # sync_since 하한 / 정렬 기준
 sync_since: 90d                  # 30d/12h/90m 상대값 또는 ISO 절대값
-overlap_minutes: 30              # timestamp watermark 를 N분 앞당겨 재전송
+overlap_minutes: 30              # timestamp watermark 를 N분 앞당겨 재전송 (dedup 됨)
 # watermark_overlap: 1000        # 숫자형 watermark 일 때 N 만큼 앞당겨 재전송
 
 # DDL (대상 테이블이 없으면 이대로 생성)
@@ -159,6 +163,77 @@ optimize_after_sync: true
 optimize_partitions: ["202606"]  # 생략 시 전체 테이블
 ```
 
+**B) 통째로 갈아엎는 테이블 → `full_reload`** (매 실행 TRUNCATE 후 전체 재적재)
+
+```yaml
+table_id: price_book
+source: my_postgres
+target: my_clickhouse
+sync_mode: full_reload
+schedule: "0 4 * * *"            # 매일 04:00
+source_table: public.price_book
+target_table: default.price_book
+engine: MergeTree
+order_by: [sku]
+column_overrides: {currency: LowCardinality(String), price: "Decimal(18,4)"}
+use_nullable: false
+```
+
+**주요 키 요약**
+
+| 항목 | 키 |
+|------|-----|
+| 필수 | `table_id`, `source`, `target`, `source_table`, `target_table`, `sync_mode`, `order_by` |
+| 위치 | `source_table`, `target_table` (`schema.table`) |
+| DDL | `engine`, `order_by`, `primary_key`, `partition_by`, `indexes`, `settings` |
+| 타입/컬럼 | `column_overrides`, `drop_columns`, `use_nullable` |
+| 증분(append) | `watermark_column`, `timestamp_column`, `sync_since`, `overlap_minutes`, `watermark_overlap` |
+| 에러 | `on_row_error`(dead_letter\|skip\|fail), `max_failed_rows` |
+| 스케줄 | `schedule`, `start_date`, `catchup`, `max_active_runs`, `retries`, `retry_delay_seconds`, `tags` |
+| 후처리 | `optimize_after_sync`, `optimize_partitions`, `optimize_mutations_sync` |
+
+### 3-a. 실행 — Airflow (Docker, 운영 방식)
+
+```bash
+cp .env.example .env             # PG_PASSWORD 등 채우기, AIRFLOW_UID=$(id -u)
+
+docker compose build
+docker compose up -d
+# Airflow UI: http://localhost:8080  (admin / admin)
+```
+
+테이블당 DAG `pg2ch_<table_id>` 가 자동 생성된다. UI 에서 토글을 켜면 `schedule` 대로 돈다.
+`docker-compose.yaml` 은 Airflow 공식 3.x 템플릿을 LocalExecutor 로 단순화한 것이며,
+로컬 테스트용 ClickHouse 서비스를 포함한다.
+
+### 3-b. 실행 — CLI (Airflow 없이 one-shot / 디버그)
+
+```bash
+uv sync                          # 엔진 의존성 설치
+uv run pg2ch init-meta           # 추적 스키마(pg2ch_meta) 생성
+uv run pg2ch list                # 설정된 테이블 목록
+uv run pg2ch copy orders         # 특정 테이블 복사 1회
+uv run pg2ch copy all            # 전체 복사
+uv run pg2ch status orders       # 마지막 run / watermark / 미해결 실패 row 수
+```
+
+경로는 `--connections` / `--tables-dir` 또는 `PG2CH_CONNECTIONS` / `PG2CH_TABLES_DIR`
+환경변수로 지정.
+
+---
+
+## ⚠️ 흔한 함정
+
+1. **`connections.json` 은 당신의 실제 PG/CH 를 가리켜야 한다.** compose 안의 `postgres`
+   서비스는 *Airflow 자체 메타DB*(dbname `airflow`, user `airflow`)다 — 예시의
+   `dbname: shop / user: app` 을 그대로 두면 접속 실패한다. 로컬 테스트만 하려면 compose 에
+   포함된 ClickHouse(`host: clickhouse, port: 9000`)를 `target` 으로 쓰고, `source`/`meta`
+   는 접근 가능한 실제 PG 로 맞춘다.
+2. **Docker 컨테이너 안에서는 서비스 이름으로 통신**한다(`postgres`, `clickhouse`). 외부 DB
+   라면 컨테이너에서 닿는 실제 호스트/IP 를 적는다.
+3. ClickHouse 포트는 **native(9000)** — clickhouse-driver 는 HTTP(8123)가 아니라 native
+   TCP 를 쓴다.
+
 ---
 
 ## 추적 데이터 조회
@@ -180,22 +255,6 @@ FROM pg2ch_meta.copy_failed_row WHERE NOT resolved ORDER BY failed_at DESC;
 
 `row_data` 에 원본 row 가 JSONB 로 보관되므로 수정 후 재적재(replay)가 가능하다.
 스키마 정본은 `sql/meta_schema.sql`(코드의 `ensure_schema()` 가 자동 생성하기도 함).
-
----
-
-## CLI (Airflow 없이 one-shot)
-
-```bash
-uv sync                            # 엔진 의존성 설치
-uv run pg2ch init-meta             # 메타 스키마 생성
-uv run pg2ch list                  # 설정된 테이블 목록
-uv run pg2ch copy orders           # 특정 테이블 복사 1회
-uv run pg2ch copy all              # 전체 복사
-uv run pg2ch status orders         # 마지막 run / watermark / 미해결 실패 row 수
-```
-
-경로는 `--connections` / `--tables-dir` 또는 `PG2CH_CONNECTIONS` / `PG2CH_TABLES_DIR`
-환경변수로 지정.
 
 ---
 
@@ -233,3 +292,21 @@ tests/                     pytest (mocked, DB 불필요)
 ```bash
 uv run pytest -q
 ```
+
+---
+
+## 기존 프로젝트 (backup_cron)
+
+이 저장소는 원래 **다중 DB 주기 관리용 cron job 플랫폼(dbcron)** — APScheduler 기반
+스케줄러 + Express WebUI + 여러 job(enrich / pg2pg / retention / schema_drift 등) — 이었다.
+PG→CH 복사 전용으로 전면 재작성하면서 그 코드 전체를 제거했다.
+
+옛 코드는 **`backup_cron` 브랜치**에 그대로 보존되어 있다 (현재 `main` 의 직전 커밋이기도 함).
+
+```bash
+git checkout backup_cron        # 옛 dbcron 프로젝트 보기
+git checkout main               # 현재 pg2ch 프로젝트로 복귀
+```
+
+> `backup_cron` 은 로컬 브랜치다. 옛 커밋들은 `main` 히스토리의 조상으로도 남아 원격에
+> 보존되어 있으나, 라벨까지 원격에 두려면 `git push origin backup_cron` 로 푸시한다.
