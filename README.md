@@ -207,14 +207,17 @@ docker compose up -d
 로컬 테스트용 ClickHouse 서비스를 포함한다.
 
 > **로그인**: Airflow 3.x 기본 인증은 SimpleAuthManager 이고 `airflow users create` 는
-> FAB 인증매니저 전용이다. 개발 편의를 위해 compose 는 `SIMPLE_AUTH_MANAGER_ALL_ADMINS=true`
-> 로 **인증을 우회**한다(로그인 없이 admin). 운영에서는 이 값을 끄고, 생성된 비밀번호로
-> 로그인하거나 FAB 인증매니저를 쓴다.
+> FAB 인증매니저 전용이다. compose 는 기본적으로 인증을 **켜 둔다**(보안 기본값).
+> 로컬 개발에서 로그인 없이 들어가려면 `.env` 에 `AIRFLOW_ALL_ADMINS=true` 를 명시적으로
+> 설정한다 — ⚠️ **공유/운영 환경에서는 절대 켜지 말 것**(인증 우회).
+> 인증을 켜 둔 채로 로그인하려면 SimpleAuthManager 가 생성한 비밀번호를 쓴다:
 > ```bash
-> # SimpleAuthManager 가 생성한 admin 비밀번호 확인 (우회를 끈 경우)
+> # 사용자 admin 의 생성 비밀번호 확인
 > docker compose exec airflow-apiserver \
 >   cat /opt/airflow/simple_auth_manager_passwords.json.generated
 > ```
+> 운영에서 정식 사용자 관리가 필요하면 FAB 인증매니저로 전환한다
+> (`apache-airflow-providers-fab` 설치 + `AIRFLOW__CORE__AUTH_MANAGER` 설정 후 `airflow users create`).
 
 ### 3-b. 실행 — CLI (Airflow 없이 one-shot / 디버그)
 
