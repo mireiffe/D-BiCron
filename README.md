@@ -1,168 +1,235 @@
-# dbcron
+# pg2ch
 
-다중 DB 주기적 관리용 cron job 플랫폼.
+**PostgreSQL → ClickHouse 복사 전용 파이프라인** — Apache Airflow 3.2.2 위에서 동작.
 
-## 설치
+여러 PG 테이블을 대응되는 CH 테이블로 주기적으로 복사한다. 테이블마다 적재 방식과
+주기가 다를 수 있고(설정으로 지정), 어디까지 복사되었는지 / 어느 batch 의 어느 row 가
+실패했는지를 정밀하게 추적한다.
 
-```bash
-uv sync
+---
+
+## 핵심 개념
+
+### 적재 모드 (테이블별 `sync_mode`)
+
+PG 에 데이터가 들어오는 방식이 테이블마다 달라서, 두 모드를 지원한다.
+
+| 모드 | 동작 | 용도 |
+|------|------|------|
+| `append` | 마지막 watermark 이후의 새 row 만 증분 전송. 첫 실행은 전체를 한 번 복사한 뒤 watermark 를 세운다. | 주기적으로 row 가 쌓이는 테이블 |
+| `full_reload` | 매 실행마다 target 을 `TRUNCATE` 하고 전체를 다시 적재. | 주기적으로 truncate 후 통째로 재적재되는 테이블 |
+
+### 자동 테이블 생성 + 타입 제어
+
+대상 CH 테이블이 없으면 설정대로 생성한다 (`CREATE TABLE IF NOT EXISTS`).
+`engine` / `order_by` / `primary_key` / `partition_by` / `indexes` / `settings` 와
+컬럼 단위 `column_overrides`(LowCardinality, Decimal, text→DateTime 파싱 등) /
+`drop_columns` / `use_nullable` 를 모두 설정으로 제어한다.
+
+### 추적 & 실패 모델 (이 프로젝트의 핵심)
+
+전용 PostgreSQL 메타 스키마(`pg2ch_meta`)에 세 테이블로 기록한다.
+
+```
+copy_run         테이블 × 실행(=Airflow task 1회)
+  ├─ status              running | success | partial | failed
+  ├─ watermark_before    이 실행 시작 시점 cutoff      ← "어디서부터"
+  ├─ watermark_after     이 실행으로 전진한 high-watermark ← "어디까지 복사됨"
+  └─ rows_read / written / failed / batch_count / duration_ms
+
+copy_batch       run 안의 batch 단위
+  ├─ batch_seq, status(success|partial|failed)
+  ├─ rows_in / written / failed
+  └─ watermark_lo / hi   ← "어느 batch 가 어느 구간을 다뤘나"
+
+copy_failed_row  dead-letter (실패 row 원본 보관)
+  ├─ batch_seq, watermark_value
+  ├─ row_data (JSONB, 원본 source row)  ← "어느 row 가, 무슨 값으로 실패했나"
+  └─ error, resolved
 ```
 
-## 실행
+**증분 재개(resume)** 는 `copy_run` 의 마지막 성공 watermark 에서 읽는다 — 별도 상태
+저장소가 없다. 다음 실행 cutoff = `MAX(watermark_after) WHERE status IN ('success','partial')`.
+
+**batch INSERT 실패 처리**: ClickHouse 는 block 단위로 INSERT 가 실패하므로,
+실패한 batch 는 **binary-split** 으로 나쁜 row 를 격리한다. 정상 row 는 적재하고
+끝까지 실패하는 단일 row 만 `copy_failed_row` 에 보관(`on_row_error: dead_letter`)한다.
+멀티 row batch 가 통째로 실패하면 row 단위가 아닌 인프라/스키마 문제로 보고 즉시
+run 을 실패시킨다(fail-fast). 실패가 있어도 watermark 는 전진하므로(실패 row 는
+dead-letter 에 보존됨) 파이프라인이 멈추지 않는다 — 이때 run 상태는 `partial`.
+
+> 직접 `ClickHouse postgresql()` 테이블 함수로 복사하지 않고 항상 Python 스트리밍으로
+> 복사하는 이유가 바로 이 row 단위 추적/격리 때문이다.
+
+---
+
+## 빠른 시작 (Docker Compose)
 
 ```bash
-# CLI one-shot
-uv run dbcron <job_name> --days 1
+cp .env.example .env                                   # PG_PASSWORD 등 채우기, AIRFLOW_UID=$(id -u)
+cp config/connections.example.json config/connections.json
+cp config/tables/orders.example.yaml config/tables/orders.yaml   # 테이블별로 1개씩
+# (선택) cp config/tables/_defaults.example.yaml config/tables/_defaults.yaml
 
-# CLI with cron
-uv run dbcron <job_name> --days 1 --cron "*/10 * * * *"
-
-# Web UI
-cd dbcron/webui && npm install && npm start
+docker compose build
+docker compose up -d
+# Airflow UI: http://localhost:8080  (admin / admin)
 ```
 
-## DB 등록
+DAG `pg2ch_<table_id>` 가 테이블당 1개씩 자동 생성된다.
 
-DB 접속 정보는 `data/databases.json` 파일에서 관리합니다.
-WebUI 에서 추가/삭제하거나 직접 편집할 수 있습니다.
+`docker-compose.yaml` 은 Airflow 공식 3.x 템플릿을 LocalExecutor 로 단순화한 것이며,
+로컬 테스트용 ClickHouse 서비스를 포함한다. 운영에서는 `connections.json` 을 실제
+PG/CH 로 향하게 한다.
 
-```bash
-# 샘플 데이터로 시작하기
-uv run python scripts/seed.py
-```
+---
 
-`databases.json` 형식:
+## 설정
+
+### 접속 정보 — `config/connections.json`
+
+ID 로 키잉된 JSON. 테이블 설정은 이 ID(`source`/`target`/`meta`)만 참조한다.
+비밀 값은 `${ENV_VAR}` / `${ENV_VAR:-default}` 로 환경변수 참조 가능.
+`"_enc": "b64"` 인 항목의 password 는 base64 디코딩된다.
 
 ```json
-[
-  {
-    "id": "my_postgres",
-    "type": "postgresql",
-    "label": "My PostgreSQL",
-    "color": "#00e5ff",
-    "host": "localhost",
-    "port": 5432,
-    "dbname": "mydb",
-    "user": "myuser",
-    "password": "mypassword",
-    "include_tables": ["public.*", "orders"],
-    "exclude_tables": ["archive.*", "tmp_*"]
-  }
-]
+{
+  "my_postgres":   {"type": "postgresql", "host": "postgres", "port": 5432,
+                    "dbname": "shop", "user": "app", "password": "${PG_PASSWORD}"},
+  "my_clickhouse": {"type": "clickhouse", "host": "clickhouse", "port": 9000,
+                    "dbname": "default", "user": "default", "password": ""},
+  "meta":          {"type": "postgresql", "host": "postgres", "port": 5432,
+                    "dbname": "shop", "user": "app", "password": "${PG_PASSWORD}",
+                    "schema": "pg2ch_meta"}
+}
 ```
 
-지원 DB 타입: `postgresql`, `mssql`, `sqlite`, `clickhouse`
-`include_tables` / `exclude_tables` 는 comma/glob 패턴을 지원하며, `schema.*` 형식으로 schema 단위 필터링도 가능합니다.
+### 테이블 파이프라인 — `config/tables/<table_id>.yaml` (테이블당 1개)
 
-## 환경 변수
+같은 디렉터리의 `_defaults.yaml`(있으면)이 모든 테이블에 병합된다(테이블별 값 우선,
+`settings` 는 깊은 병합). 전체 예시는 `config/tables/*.example.yaml` 참조.
 
-`.env.example`을 `.env`로 복사하고 값을 채워 넣으세요.
+```yaml
+table_id: orders                 # 고유 ID → DAG id(pg2ch_orders) + 추적 키
+source: my_postgres              # connections.json 의 ID
+target: my_clickhouse
+meta: meta
+
+sync_mode: append                # append | full_reload
+schedule: "*/15 * * * *"         # cron (DAG 스케줄)
+start_date: "2026-01-01"
+
+source_table: public.orders
+target_table: default.orders
+
+# append 증분 기준
+watermark_column: updated_at     # 이 컬럼 > 마지막 watermark 인 row 만 전송
+timestamp_column: updated_at     # sync_since 하한 / 정렬 기준
+sync_since: 90d                  # 30d/12h/90m 상대값 또는 ISO 절대값
+overlap_minutes: 30              # timestamp watermark 를 N분 앞당겨 재전송
+# watermark_overlap: 1000        # 숫자형 watermark 일 때 N 만큼 앞당겨 재전송
+
+# DDL (대상 테이블이 없으면 이대로 생성)
+engine: ReplacingMergeTree(updated_at)
+order_by: [id]
+primary_key: [id]
+partition_by: toYYYYMM(created_at)
+indexes:
+  - {name: idx_status, column: status, type: set(1000), granularity: 1}
+settings: {index_granularity: 8192}
+
+# 컬럼 처리
+drop_columns: [internal_note]
+column_overrides:
+  status: LowCardinality(String)
+  amount: Decimal(18,4)
+  occurred_at_str:               # text → DateTime 파싱
+    type: "DateTime64(3, 'UTC')"
+    parse_format: "%Y%m%d %H%M%S"
+    timezone: "Asia/Seoul"
+use_nullable: false
+
+# 배치 / 에러 처리
+batch_size: 50000
+on_row_error: dead_letter        # dead_letter | skip | fail
+max_failed_rows: 1000            # 누적 실패가 넘으면 run 실패 처리
+
+# 적재 직후 즉시 dedup
+optimize_after_sync: true
+optimize_partitions: ["202606"]  # 생략 시 전체 테이블
+```
+
+---
+
+## 추적 데이터 조회
+
+```sql
+-- 테이블별 진행 현황 (어디까지 복사됐나)
+SELECT table_id, status, watermark_after, rows_written, rows_failed, finished_at
+FROM pg2ch_meta.copy_run
+WHERE run_id IN (SELECT max(run_id) FROM pg2ch_meta.copy_run GROUP BY table_id);
+
+-- 실패한 batch 와 그 watermark 구간
+SELECT run_id, batch_seq, rows_failed, watermark_lo, watermark_hi, error
+FROM pg2ch_meta.copy_batch WHERE status <> 'success' ORDER BY run_id DESC;
+
+-- 어떤 row 가 무슨 값으로 실패했나 (재처리 대상)
+SELECT table_id, batch_seq, watermark_value, row_data, error
+FROM pg2ch_meta.copy_failed_row WHERE NOT resolved ORDER BY failed_at DESC;
+```
+
+`row_data` 에 원본 row 가 JSONB 로 보관되므로 수정 후 재적재(replay)가 가능하다.
+스키마 정본은 `sql/meta_schema.sql`(코드의 `ensure_schema()` 가 자동 생성하기도 함).
+
+---
+
+## CLI (Airflow 없이 one-shot)
 
 ```bash
-cp .env.example .env
+uv sync                            # 엔진 의존성 설치
+uv run pg2ch init-meta             # 메타 스키마 생성
+uv run pg2ch list                  # 설정된 테이블 목록
+uv run pg2ch copy orders           # 특정 테이블 복사 1회
+uv run pg2ch copy all              # 전체 복사
+uv run pg2ch status orders         # 마지막 run / watermark / 미해결 실패 row 수
 ```
 
-DB 접속 정보는 환경 변수가 아닌 `data/databases.json`에서 관리합니다.
-`.env`에는 S3, webhook, sync config 경로 등 인프라 설정만 포함됩니다.
+경로는 `--connections` / `--tables-dir` 또는 `PG2CH_CONNECTIONS` / `PG2CH_TABLES_DIR`
+환경변수로 지정.
 
-## 새로운 Job 추가하기
+---
 
-3단계로 완료됩니다.
+## 새 테이블 추가하기
 
-### 1단계: Job 클래스 작성
+1. `config/connections.json` 에 source/target 접속이 없으면 추가.
+2. `config/tables/<table_id>.yaml` 작성 (위 예시 또는 `*.example.yaml` 복붙).
+3. 끝. DAG `pg2ch_<table_id>` 가 dag-processor 파싱 시 자동 등록된다.
 
-`dbcron/jobs/` 디렉토리에 새 파일을 만듭니다.
-
-```python
-# dbcron/jobs/my_sync.py
-"""My sync job: some_source → target."""
-
-from __future__ import annotations
-
-import logging
-from datetime import datetime, timedelta
-
-from sqlalchemy import text
-
-from ..db import create_engine_by_id
-from .base import Job, JobResult
-
-logger = logging.getLogger(__name__)
-
-
-class MySyncJob(Job):
-    name = "my_sync"
-    description = "source DB에서 데이터를 가져와 target DB에 적재합니다."
-
-    def run(self, *, days: int = 1, **kwargs) -> JobResult:
-        cutoff = datetime.now() - timedelta(days=days)
-
-        engine = create_engine_by_id("my_target_db")
-        with engine.begin() as conn:
-            result = conn.execute(
-                text("INSERT INTO ... SELECT ... WHERE created_at >= :cutoff"),
-                {"cutoff": cutoff},
-            )
-
-        return JobResult(
-            success=True,
-            message=f"Synced {result.rowcount} rows",
-            rows_affected=result.rowcount,
-        )
-```
-
-**필수 규칙:**
-
-- `Job`을 상속하고 `run(**kwargs) -> JobResult`를 구현합니다.
-- `name` 클래스 변수는 CLI와 API에서 사용하는 고유 식별자입니다.
-- DB 엔진은 `dbcron.db.create_engine_by_id(db_id)` 또는 `create_engine_for(db_cfg)`로 생성합니다.
-- `self.logger`는 `job.<name>` 네임스페이스의 로거입니다.
-- `execute()`를 직접 오버라이드하지 마세요 — 에러 핸들링과 로깅이 자동으로 처리됩니다.
-
-### 2단계: JOB_REGISTRY에 등록
-
-`dbcron/jobs/__init__.py`가 자동으로 `Job` 서브클래스를 탐색합니다.
-별도 등록 없이 파일을 추가하면 바로 사용 가능합니다:
-
-```bash
-uv run dbcron my_sync --days 7
-uv run dbcron my_sync --days 1 --cron "0 */6 * * *"
-```
-
-### 3단계: Web UI에 등록
-
-`dbcron/webui/server.js`의 `AVAILABLE_JOBS` 배열에 항목을 추가합니다.
-
-```javascript
-const AVAILABLE_JOBS = [
-  {
-    name: "my_sync",           // JOB_REGISTRY 키와 동일
-    label: "My Sync 적재",      // UI에 표시되는 이름
-    description: "source → target 적재",  // UI 설명
-    defaultArgs: { days: 1 },  // RUN 버튼 클릭 시 기본 인자
-  },
-];
-```
-
-`defaultArgs`의 키는 Job 클래스의 `run()` 메서드 파라미터와 일치해야 합니다.
+---
 
 ## 프로젝트 구조
 
 ```
-db_manager/
-├── pyproject.toml          # uv 의존성 관리
-├── .env.example            # 환경 변수 템플릿 (S3, webhook 등)
-├── data/
-│   └── databases.json      # DB 접속 정보 레지스트리
-├── dbcron/
-│   ├── main.py             # CLI 엔트리포인트
-│   ├── config.py           # 환경 변수 → AppConfig (S3 등)
-│   ├── db.py               # DB 레지스트리, 엔진 팩토리, URL 빌더
-│   ├── scheduler.py        # APScheduler 래퍼
-│   └── jobs/
-│       ├── __init__.py     # JOB_REGISTRY (자동 탐색)
-│       └── base.py         # Job ABC, JobResult dataclass
-└── dbcron/webui/
-    ├── server.js           # Express API + AVAILABLE_JOBS
-    └── public/             # 정적 프론트엔드
+pg2ch/                     엔진 패키지 (Airflow 비의존, 단위 테스트 가능)
+├── chtypes.py             PG→CH 타입 매핑 / CH 타입 문자열 유틸
+├── ddl.py                 CH 컬럼 매핑 + CREATE TABLE DDL 생성
+├── transform.py           PG row → CH INSERT 호환 변환
+├── watermark.py           sync_since / overlap 계산
+├── connections.py         접속 레지스트리(JSON) + PG/CH/meta 커넥션
+├── config.py              테이블 설정(YAML) 로드/검증 (TableConfig)
+├── tracking.py            메타 저장소 (copy_run/copy_batch/copy_failed_row)
+├── copier.py              복사 오케스트레이션 (모드 + batch/row 추적)
+└── cli.py                 CLI
+dags/pg2ch_factory.py      config → DAG(테이블당 1개) 동적 생성
+sql/meta_schema.sql        메타 스키마 정본
+config/                    connections.json + tables/*.yaml (실제 설정은 gitignore)
+docker-compose.yaml        Airflow 3.2.2 (LocalExecutor) + ClickHouse
+Dockerfile                 apache/airflow:3.2.2 + clickhouse-driver + pg2ch
+tests/                     pytest (mocked, DB 불필요)
+```
+
+## 테스트
+
+```bash
+uv run pytest -q
 ```

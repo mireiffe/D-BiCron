@@ -1,0 +1,25 @@
+# 모든 테이블 설정에 병합되는 공통 기본값 (선택).
+# config/tables/_defaults.yaml 로 복사하면 활성화된다.
+# 테이블별 파일의 값이 항상 우선하며, settings 같은 dict 는 깊은 병합된다.
+
+source: my_postgres
+target: my_clickhouse
+meta: meta
+
+# 스케줄 기본값 (테이블별로 덮어쓸 수 있음)
+start_date: "2026-01-01"
+catchup: false
+max_active_runs: 1
+retries: 1
+retry_delay_seconds: 300
+
+# 적재 기본값
+batch_size: 100000
+use_nullable: false
+on_row_error: dead_letter   # dead_letter | skip | fail
+
+settings:
+  index_granularity: 8192
+
+tags:
+  - pg2ch

@@ -1,0 +1,136 @@
+# pg2ch — Airflow 3.2.2 (LocalExecutor) 로컬/단일노드 구동용 compose.
+#
+# Airflow 공식 3.x docker-compose 템플릿을 LocalExecutor 로 단순화한 것
+# (Celery worker / redis / flower 제거). 패치 버전별 세부는 공식 템플릿과
+# 대조해 조정할 수 있다: https://airflow.apache.org/docs/apache-airflow/3.2.2/howto/docker-compose/
+#
+# 사용:
+#   cp .env.example .env           # PG_PASSWORD 등 채우기, AIRFLOW_UID=$(id -u)
+#   cp config/connections.example.json config/connections.json   # 접속정보 작성
+#   cp config/tables/orders.example.yaml config/tables/orders.yaml
+#   docker compose build
+#   docker compose up -d
+#   # UI: http://localhost:8080  (admin / admin)
+
+x-airflow-common: &airflow-common
+  build: .
+  image: pg2ch-airflow:3.2.2
+  env_file:
+    - .env
+  environment: &airflow-common-env
+    AIRFLOW__CORE__EXECUTOR: LocalExecutor
+    AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: postgresql+psycopg2://airflow:airflow@postgres:5432/airflow
+    AIRFLOW__CORE__EXECUTION_API_SERVER_URL: 'http://airflow-apiserver:8080/execution/'
+    AIRFLOW__CORE__LOAD_EXAMPLES: 'false'
+    AIRFLOW__CORE__DAGS_FOLDER: /opt/airflow/dags
+    # 모든 컴포넌트가 공유해야 하는 내부 인증 시크릿
+    AIRFLOW__API_AUTH__JWT_SECRET: ${AIRFLOW_JWT_SECRET:-pg2ch-dev-secret-change-me}
+    # pg2ch 설정 경로 (컨테이너 내부)
+    PG2CH_CONNECTIONS: /opt/airflow/config/connections.json
+    PG2CH_TABLES_DIR: /opt/airflow/config/tables
+    PG_PASSWORD: ${PG_PASSWORD:-}
+    CH_PASSWORD: ${CH_PASSWORD:-}
+  volumes:
+    - ./dags:/opt/airflow/dags
+    - ./config:/opt/airflow/config
+    - ./sql:/opt/airflow/sql
+    - ./plugins:/opt/airflow/plugins
+    - ./logs:/opt/airflow/logs
+  user: "${AIRFLOW_UID:-50000}:0"
+  depends_on: &airflow-common-depends-on
+    postgres:
+      condition: service_healthy
+
+services:
+  postgres:
+    image: postgres:16
+    environment:
+      POSTGRES_USER: airflow
+      POSTGRES_PASSWORD: airflow
+      POSTGRES_DB: airflow
+    volumes:
+      - postgres-db:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD", "pg_isready", "-U", "airflow"]
+      interval: 10s
+      retries: 5
+      start_period: 5s
+    restart: always
+
+  # DB 마이그레이션 + 관리자 계정 생성 후 종료
+  airflow-init:
+    <<: *airflow-common
+    entrypoint: /bin/bash
+    command:
+      - -c
+      - |
+        airflow db migrate
+        airflow users create \
+          --role Admin \
+          --username "${_AIRFLOW_WWW_USER_USERNAME:-admin}" \
+          --password "${_AIRFLOW_WWW_USER_PASSWORD:-admin}" \
+          --firstname Admin --lastname User \
+          --email admin@example.com || true
+    restart: on-failure
+
+  airflow-apiserver:
+    <<: *airflow-common
+    command: api-server
+    ports:
+      - "8080:8080"
+    healthcheck:
+      test: ["CMD", "curl", "--fail", "http://localhost:8080/api/v2/version"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 30s
+    restart: always
+    depends_on:
+      <<: *airflow-common-depends-on
+      airflow-init:
+        condition: service_completed_successfully
+
+  airflow-scheduler:
+    <<: *airflow-common
+    command: scheduler
+    restart: always
+    depends_on:
+      <<: *airflow-common-depends-on
+      airflow-init:
+        condition: service_completed_successfully
+
+  airflow-dag-processor:
+    <<: *airflow-common
+    command: dag-processor
+    restart: always
+    depends_on:
+      <<: *airflow-common-depends-on
+      airflow-init:
+        condition: service_completed_successfully
+
+  airflow-triggerer:
+    <<: *airflow-common
+    command: triggerer
+    restart: always
+    depends_on:
+      <<: *airflow-common-depends-on
+      airflow-init:
+        condition: service_completed_successfully
+
+  # 로컬 테스트용 ClickHouse (실제 운영에서는 connections.json 을 외부 CH 로 향하게 한다)
+  clickhouse:
+    image: clickhouse/clickhouse-server:24.8
+    ports:
+      - "8123:8123"
+      - "9000:9000"
+    ulimits:
+      nofile:
+        soft: 262144
+        hard: 262144
+    volumes:
+      - clickhouse-data:/var/lib/clickhouse
+    restart: always
+
+volumes:
+  postgres-db:
+  clickhouse-data:

@@ -1,0 +1,5 @@
+# apache/airflow:3.2.2 이미지에 추가 설치하는 런타임 의존성.
+# Airflow constraint 와 충돌하지 않도록 보수적으로 범위 지정.
+clickhouse-driver>=0.2,<1
+psycopg2-binary>=2.9,<3
+PyYAML>=6,<7

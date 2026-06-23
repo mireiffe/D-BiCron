@@ -1,10 +1,20 @@
 .env
 __pycache__/
 *.pyc
-node_modules/
 .venv/
-data/
-.playwright-mcp/
 .claude/
-pipeline_config.json
-*.png
+.pytest_cache/
+*.egg-info/
+dist/
+build/
+
+# Airflow 런타임 산출물 (compose volume)
+logs/
+airflow.db
+airflow.cfg
+standalone_admin_password.txt
+
+# 실제 접속 정보 / 테이블 설정은 커밋하지 않는다 (.example 만 추적)
+config/connections.json
+config/tables/*.yaml
+!config/tables/*.example.yaml

@@ -1,0 +1,31 @@
+{
+  "_comment": "PG/CH/meta 접속 정보 레지스트리. config/connections.json 으로 복사해 사용. 테이블 설정은 여기의 ID(source/target/meta)만 참조한다. 비밀 값은 ${ENV_VAR} 로 환경변수 참조 가능.",
+
+  "my_postgres": {
+    "type": "postgresql",
+    "host": "postgres",
+    "port": 5432,
+    "dbname": "shop",
+    "user": "app",
+    "password": "${PG_PASSWORD}"
+  },
+
+  "my_clickhouse": {
+    "type": "clickhouse",
+    "host": "clickhouse",
+    "port": 9000,
+    "dbname": "default",
+    "user": "default",
+    "password": "${CH_PASSWORD:-}"
+  },
+
+  "meta": {
+    "type": "postgresql",
+    "host": "postgres",
+    "port": 5432,
+    "dbname": "shop",
+    "user": "app",
+    "password": "${PG_PASSWORD}",
+    "schema": "pg2ch_meta"
+  }
+}
