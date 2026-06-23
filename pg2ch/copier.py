@@ -90,7 +90,7 @@ class CopyPlan:
     source_table: str
     target_table: str
     planned_mode: str
-    rows_to_copy: int
+    rows_to_copy: int | None = None
     watermark_column: str | None = None
     resume_watermark: str | None = None
     copy_cutoff: str | None = None
@@ -147,7 +147,10 @@ class TableCopier:
                 meta.close()
 
     def precheck(self) -> CopyPlan:
-        """현재 watermark 기준 copy 대상 row 수를 계산한다."""
+        """copy 계획(mode/cutoff/watermark)을 산출한다 (row 수는 세지 않음).
+
+        source/meta 접속을 열어 copy 전 fail-fast 검증을 겸한다.
+        """
         cfg = self.cfg
         src_cfg = get_connection(cfg.source, self.connections_path)
         meta_cfg = get_connection(cfg.meta, self.connections_path)
@@ -157,8 +160,8 @@ class TableCopier:
         pg_conn = meta = None
         try:
             meta = MetaStore.connect(meta_cfg)
-            pg_conn = pg_connect(src_cfg)
-            return self.inspect_copy_plan(pg_conn, meta)
+            pg_conn = pg_connect(src_cfg)  # source 접속 fail-fast 검증
+            return self.inspect_copy_plan(meta)
         finally:
             if pg_conn is not None:
                 pg_conn.close()
@@ -321,34 +324,24 @@ class TableCopier:
             )
             raise
 
-    def inspect_copy_plan(self, pg_conn, meta: MetaStore) -> CopyPlan:
-        """현재 resume watermark / sync_since 로 copy 대상 row 수를 계산한다."""
+    def inspect_copy_plan(self, meta: MetaStore) -> CopyPlan:
+        """현재 resume watermark / sync_since 로 copy 계획(mode/cutoff)을 산출한다.
+
+        대상 row 수는 세지 않는다 (rows_to_copy=None): COUNT(*) 는 큰 테이블에서
+        전체/범위 스캔으로 비싸고, 결과는 가시성 용도일 뿐 copy 동작에 쓰이지
+        않는다. planned_mode/cutoff/watermark 산출만 수행한다. source 접속 fail-fast
+        는 호출부(precheck)에서 접속을 열어 처리한다.
+        """
         cfg = self.cfg
-        src_schema, src_name = cfg.source_parts()
         meta.ensure_schema()
         window = self._copy_window(meta)
-
-        if window["planned_mode"] == "incremental":
-            conditions, params = self._incremental_conditions(
-                cfg.effective_watermark_column,
-                cfg.timestamp_column,
-                window["copy_cutoff"],
-                window["sync_since"],
-            )
-        else:
-            conditions, params = self._full_conditions(
-                cfg.timestamp_column,
-                window["sync_since"],
-            )
-        query, params = self._count_query(src_schema, src_name, conditions, params)
-        rows_to_copy = self._count_source_rows(pg_conn, query, params)
         return CopyPlan(
             table_id=cfg.table_id,
             sync_mode=cfg.sync_mode,
             source_table=cfg.source_table,
             target_table=cfg.target_table,
             planned_mode=window["planned_mode"],
-            rows_to_copy=rows_to_copy,
+            rows_to_copy=None,
             watermark_column=cfg.effective_watermark_column if cfg.sync_mode == "append" else None,
             resume_watermark=window["resume_watermark"],
             copy_cutoff=_wm_str(window["copy_cutoff"]),
@@ -386,20 +379,6 @@ class TableCopier:
             "watermark_before": None,
             "sync_since": sync_since,
         }
-
-    @staticmethod
-    def _count_source_rows(pg_conn, query: str, params) -> int:
-        with pg_conn.cursor() as cur:
-            if params:
-                cur.execute(query, params)
-            else:
-                cur.execute(query)
-            row = cur.fetchone()
-        try:
-            pg_conn.rollback()
-        except Exception:
-            pass
-        return int(row[0]) if row else 0
 
     # ── streaming ────────────────────────────────────────────
     def _stream(
@@ -646,16 +625,6 @@ class TableCopier:
         if sync_since and ts_col:
             return [f"{quote_pg_identifier(ts_col)} >= %s"], (sync_since,)
         return [], None
-
-    @staticmethod
-    def _count_query(src_schema, src_name, conditions, params):
-        query = (
-            f"SELECT count(*) FROM {quote_pg_identifier(src_schema)}."
-            f"{quote_pg_identifier(src_name)}"
-        )
-        if conditions:
-            query += " WHERE " + " AND ".join(conditions)
-        return query, params
 
     # ── post-sync OPTIMIZE ───────────────────────────────────
     def _optimize(self, ch, db_name: str, table_name: str) -> None:

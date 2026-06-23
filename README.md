@@ -7,8 +7,9 @@
 실패했는지를 정밀하게 추적한다.
 
 Airflow DAG 는 테이블마다 `precheck → copy → finalize_watermark → retention`
-순서로 실행된다. `precheck` 는 현재 watermark 기준 copy 대상 row 수를 계산하고,
-`copy` 는 데이터를 적재하되 watermark 를 아직 공개하지 않는다. `finalize_watermark`
+순서로 실행된다. `precheck` 는 현재 watermark 기준 copy 계획(mode/cutoff)을 산출하고
+source/meta 접속을 fail-fast 검증한다(대상 row 수는 세지 않음 — COUNT 는 큰 테이블에서
+비싸고 적재 동작에 쓰이지 않는다). `copy` 는 데이터를 적재하되 watermark 를 아직 공개하지 않는다. `finalize_watermark`
 가 같은 `run_id` 의 `watermark_after` 를 확정한 뒤, 설정이 켜진 경우에만
 `retention` 이 PostgreSQL source row 를 삭제한다.
 

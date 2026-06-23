@@ -125,40 +125,6 @@ class FakePG:
         pass
 
 
-class FakeCountCursor:
-    def __init__(self, owner, count):
-        self.owner = owner
-        self.count = count
-
-    def __enter__(self):
-        return self
-
-    def __exit__(self, *a):
-        return False
-
-    def execute(self, sql, params=None):
-        self.owner.query = sql
-        self.owner.params = params
-
-    def fetchone(self):
-        return (self.count,)
-
-
-class FakeCountPG:
-    def __init__(self, count):
-        self.count = count
-        self.query = None
-        self.params = None
-        self.rolled_back = False
-
-    def cursor(self, name=None):
-        assert name is None
-        return FakeCountCursor(self, self.count)
-
-    def rollback(self):
-        self.rolled_back = True
-
-
 # id integer NOT NULL, name text NULL
 COLS = [
     ("id", "integer", "NO", None, None),
@@ -239,13 +205,6 @@ class TestQueryBuilders:
         assert '"payload"::text AS "payload"' in q
         assert "encode(\"raw\", 'hex') AS \"raw\"" in q
         assert '"flag"::int AS "flag"' in q
-
-    def test_count_query(self):
-        q, p = TableCopier._count_query(
-            "public", "orders", ['"id" > %s'], ("10",)
-        )
-        assert q == 'SELECT count(*) FROM "public"."orders" WHERE "id" > %s'
-        assert p == ("10",)
 
 
 # ── row isolation (_insert) ──────────────────────────────────────
@@ -354,17 +313,32 @@ class TestCopyFlow:
         assert result.watermark_after == "3"
         assert result.status == "success"
 
-    def test_precheck_counts_incremental_rows(self):
+    def test_precheck_plans_incremental_without_count(self):
         cfg = _cfg(sync_mode="append", watermark_column="id")
-        pg = FakeCountPG(42)
         meta = FakeMeta(resume="10")
-        plan = TableCopier(cfg).inspect_copy_plan(pg, meta)
+        plan = TableCopier(cfg).inspect_copy_plan(meta)
         assert plan.planned_mode == "incremental"
-        assert plan.rows_to_copy == 42
         assert plan.resume_watermark == "10"
-        assert '"id" > %s' in pg.query
-        assert pg.params == ("10",)
-        assert pg.rolled_back is True
+        assert plan.copy_cutoff == "10"
+        assert plan.watermark_column == "id"
+        # COUNT(*) 는 수행하지 않는다 — 가시성 용도이고 비싸다.
+        assert plan.rows_to_copy is None
+
+    def test_precheck_plans_full_reload(self):
+        cfg = _cfg(sync_mode="full_reload")
+        meta = FakeMeta(resume=None)
+        plan = TableCopier(cfg).inspect_copy_plan(meta)
+        assert plan.planned_mode == "full_reload"
+        assert plan.rows_to_copy is None
+        assert plan.watermark_column is None
+
+    def test_precheck_plans_append_first_run(self):
+        cfg = _cfg(sync_mode="append", watermark_column="id")
+        meta = FakeMeta(resume=None)
+        plan = TableCopier(cfg).inspect_copy_plan(meta)
+        assert plan.planned_mode == "append_first_run"
+        assert plan.resume_watermark is None
+        assert plan.rows_to_copy is None
 
     def test_deferred_copy_does_not_publish_watermark(self):
         cfg = _cfg(sync_mode="append", watermark_column="id")
