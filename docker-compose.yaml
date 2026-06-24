@@ -47,6 +47,9 @@ x-airflow-common: &airflow-common
     # pg2ch 설정 경로 (컨테이너 내부)
     PG2CH_CONNECTIONS: /opt/airflow/config/connections.json
     PG2CH_TABLES_DIR: /opt/airflow/config/tables
+    # 동시 실행 copy task 수 상한 = pg2ch_copy pool 슬롯 수.
+    # 0/unlimited 이면 pool 미사용(무제한). 워커 메모리/OOM 제어용.
+    PG2CH_COPY_CONCURRENCY: ${PG2CH_COPY_CONCURRENCY:-8}
     PG_PASSWORD: ${PG_PASSWORD:-}
     CH_PASSWORD: ${CH_PASSWORD:-}
   volumes:
