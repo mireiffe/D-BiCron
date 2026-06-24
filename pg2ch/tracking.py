@@ -5,8 +5,10 @@
 
   copy_run        — 테이블×실행 단위. status / watermark_before
                     / watermark_after / rows_read·written·failed / batch_count.
-                    다음 실행의 증분 cutoff(=어디까지 복사) 는 이 테이블의 마지막
-                    성공 run.watermark_after 에서 읽는다.
+                    다음 실행의 증분 cutoff(=어디까지 복사) 는 finalize 된
+                    run.watermark_after, 그리고 finalize 전에 죽은 run 이 남긴
+                    copy_batch.watermark_hi 중 더 진행된 지점에서 읽는다
+                    (get_resume_watermark 참조).
   copy_batch      — run 안의 batch 단위. watermark_lo/hi, rows_in/written/failed,
                     status(success|partial|failed), attempts.
   copy_failed_row — dead-letter. 실패한 source row 의 watermark + 원본(JSONB) +
@@ -18,9 +20,12 @@
 from __future__ import annotations
 
 import json
+import logging
 import re
 from datetime import datetime, date
 from decimal import Decimal
+
+logger = logging.getLogger("pg2ch.tracking")
 
 _IDENT_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 
@@ -221,7 +226,54 @@ class MetaStore:
             )
 
     def get_resume_watermark(self, table_id: str, watermark_column: str) -> str | None:
-        """마지막 성공/부분성공 run 의 watermark_after = 다음 증분 cutoff."""
+        """다음 증분 cutoff = 마지막으로 durable 하게 커밋된 watermark.
+
+        finalize 된 ``copy_run.watermark_after`` 뿐 아니라, finalize 전에
+        크래시/OOM(SIGKILL) 으로 죽어 watermark 를 확정하지 못한 run 이
+        ``copy_batch`` 에 (autocommit 으로) 남긴 마지막 batch 의 watermark_hi
+        까지 본다. 이렇게 해야 run 이 죽어도 다음 run 이 거기서 이어받아,
+        같은 구간을 처음부터 무한 재복사하는 루프를 끊는다.
+
+        증분 run(``watermark_before IS NOT NULL``)은 ``ORDER BY wm`` 로
+        스트리밍하므로 batch 가 watermark 오름차순이고, (run_id, batch_seq)
+        가 가장 큰 = 마지막으로 커밋된 batch 의 hi 가 안전한 재개점이다.
+        full_reload / append 첫 전체복사 run 은 정렬 없이 스트리밍해
+        watermark_hi 가 단조증가가 아니므로(``watermark_before IS NULL``)
+        제외하고, finalize 된 watermark_after 로 폴백한다.
+
+        ⚠️ batch 경계에서 동일 watermark(tie) 가 쪼개지면 strict
+        ``wm > cutoff`` 가 아직 복사 안 된 동률 row 를 건너뛸 수 있다.
+        mid-run 재개에 의존한다면 overlap_minutes / watermark_overlap 을
+        설정해 경계를 재읽도록 한다.
+        """
+        # 1) finalize 전에 죽은 증분 run 까지 포함해, 마지막으로 커밋된 batch 진행점.
+        with self.conn.cursor() as cur:
+            cur.execute(
+                f"""
+                SELECT b.watermark_hi, r.status
+                FROM {self.schema}.copy_batch b
+                JOIN {self.schema}.copy_run r ON r.run_id = b.run_id
+                WHERE r.table_id=%s AND r.watermark_column=%s
+                  AND r.watermark_before IS NOT NULL
+                  AND b.watermark_hi IS NOT NULL
+                ORDER BY b.run_id DESC, b.batch_seq DESC
+                LIMIT 1
+                """,
+                (table_id, watermark_column),
+            )
+            row = cur.fetchone()
+        if row:
+            wm, status = row[0], row[1]
+            if status not in ("success", "partial"):
+                logger.warning(
+                    "%s: resuming from un-finalized batch progress "
+                    "watermark_hi=%s (last run status=%s); set "
+                    "overlap_minutes/watermark_overlap to avoid skipping "
+                    "boundary rows",
+                    table_id, wm, status,
+                )
+            return wm
+        # 2) 증분 batch 가 없으면(첫 전체복사 직후 등) finalize 된 watermark_after.
         with self.conn.cursor() as cur:
             cur.execute(
                 f"""

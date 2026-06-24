@@ -36,4 +36,6 @@ PostgreSQL → ClickHouse 복사 전용 파이프라인 (Apache Airflow 3.2.2 �
 - 항상 Python 스트리밍으로 복사한다 (batch/row 단위 추적·격리를 위해).
 - batch INSERT 실패 시 binary-split 로 나쁜 row 만 격리 → `copy_failed_row` dead-letter.
 - 멀티 row batch 전체 실패 = 인프라/스키마 문제로 보고 fail-fast.
-- 증분 재개 cutoff 는 `copy_run` 의 마지막 성공 `watermark_after` 에서 읽는다.
+- 증분 재개 cutoff 는 finalize 된 `copy_run.watermark_after` 와, finalize 전에
+  죽은 증분 run 이 남긴 마지막 `copy_batch.watermark_hi` 중 더 진행된 지점에서
+  읽는다 (OOM/SIGKILL 로 죽어도 재복사 루프에 빠지지 않게).

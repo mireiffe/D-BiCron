@@ -114,18 +114,41 @@ class TestMetaStore:
         assert "UPDATE pg2ch_meta.copy_run" in sql
         assert params[0] == "success"
 
-    def test_get_resume_watermark(self):
+    def test_get_resume_watermark_from_batch_progress(self):
+        # finalize 전에 죽은 증분 run 의 마지막 커밋 batch 진행점에서 재개.
         conn = FakeConn()
-        conn.fetch_queue = [("2025-06-01T00:00:00",)]
+        conn.fetch_queue = [("2025-06-01T00:00:00", "running")]
         m = MetaStore(conn)
         assert m.get_resume_watermark("orders", "updated_at") == "2025-06-01T00:00:00"
+        sql, params = conn.executed[-1]
+        assert "copy_batch" in sql
+        assert "watermark_before IS NOT NULL" in sql
+        assert "ORDER BY b.run_id DESC, b.batch_seq DESC" in sql
+        assert params == ("orders", "updated_at")
+
+    def test_get_resume_watermark_batch_blessed_run(self):
+        # 정상 종료(success)된 run 의 마지막 batch 도 동일 경로로 읽힌다.
+        conn = FakeConn()
+        conn.fetch_queue = [("2025-06-01T00:00:00", "success")]
+        assert (
+            MetaStore(conn).get_resume_watermark("orders", "updated_at")
+            == "2025-06-01T00:00:00"
+        )
+
+    def test_get_resume_watermark_falls_back_to_blessed(self):
+        # 증분 batch 가 없으면(첫 전체복사 직후 등) finalize 된 watermark_after.
+        conn = FakeConn()
+        conn.fetch_queue = [None, ("2025-05-01T00:00:00",)]
+        m = MetaStore(conn)
+        assert m.get_resume_watermark("orders", "updated_at") == "2025-05-01T00:00:00"
         sql, params = conn.executed[-1]
         assert "status IN ('success','partial')" in sql
         assert params == ("orders", "updated_at")
 
     def test_get_resume_watermark_none(self):
+        # batch 도 finalize 된 run 도 없으면 None (첫 실행).
         conn = FakeConn()
-        conn.fetch_queue = [None]
+        conn.fetch_queue = [None, None]
         assert MetaStore(conn).get_resume_watermark("orders", "updated_at") is None
 
     def test_record_batch_returns_id(self):
