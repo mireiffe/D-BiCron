@@ -115,6 +115,13 @@ services:
     <<: *airflow-common
     command: scheduler
     restart: always
+    # LocalExecutor 에선 copy task 가 scheduler 의 자식 프로세스로 포크된다.
+    # 동시 copy 들의 배치 버퍼 합산이 이 한도를 넘으면 cgroup OOM-killer 가
+    # (보통) 가장 큰 copy task 를 죽여 호스트 전체 다운을 막는다.
+    # 동시성은 PG2CH_COPY_CONCURRENCY(pg2ch_copy pool)로 함께 제한할 것.
+    mem_limit: 32g
+    memswap_limit: 32g     # = mem_limit → swap 비활성, OOM 을 결정적으로
+    mem_reservation: 8g
     depends_on:
       <<: *airflow-common-depends-on
       airflow-init:
