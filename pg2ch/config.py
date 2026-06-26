@@ -21,6 +21,7 @@ _DEFAULTS_FILE = "_defaults.yaml"
 
 _SYNC_MODES = {"append", "full_reload"}
 _ROW_ERROR_POLICIES = {"dead_letter", "fail", "skip"}
+_INTEGRITY_POLICIES = {"fail", "warn"}
 import re as _re
 
 _TABLE_ID_RE = _re.compile(r"^[A-Za-z0-9_.-]+$")
@@ -100,6 +101,12 @@ class TableConfig:
     source_retention_batch_size: int = 10_000
     retention_lock_timeout_ms: int = 5_000
 
+    # 무결성 검사 (retention 전 누락 row 탐지)
+    integrity_enabled: bool = False
+    integrity_lookback_runs: int = 1
+    integrity_on_mismatch: str = "fail"  # fail | warn
+    integrity_tolerance: int = 0
+
     # Airflow 스케줄링 메타 (DAG factory 가 사용)
     schedule: str | None = None
     start_date: str | None = None
@@ -155,6 +162,30 @@ class TableConfig:
                 if src in retention and dst not in d:
                     d[dst] = retention[src]
 
+        integrity = d.pop("integrity", None)
+        if integrity is not None:
+            if not isinstance(integrity, dict):
+                raise ValueError("integrity must be a mapping")
+            integrity_keys = {
+                "enabled": "integrity_enabled",
+                "integrity_enabled": "integrity_enabled",
+                "lookback_runs": "integrity_lookback_runs",
+                "integrity_lookback_runs": "integrity_lookback_runs",
+                "on_mismatch": "integrity_on_mismatch",
+                "integrity_on_mismatch": "integrity_on_mismatch",
+                "tolerance": "integrity_tolerance",
+                "integrity_tolerance": "integrity_tolerance",
+            }
+            unknown_integrity = set(integrity) - set(integrity_keys)
+            if unknown_integrity:
+                raise ValueError(
+                    "unknown integrity key(s): "
+                    + ", ".join(sorted(unknown_integrity))
+                )
+            for src, dst in integrity_keys.items():
+                if src in integrity and dst not in d:
+                    d[dst] = integrity[src]
+
         known = {f for f in cls.__dataclass_fields__ if f != "raw"}
         unknown = set(d) - known - {"_comment", "_label"}
         # _ 로 시작하는 주석 키는 허용
@@ -204,6 +235,24 @@ class TableConfig:
         if int(self.retention_lock_timeout_ms) <= 0:
             raise ValueError(
                 f"{self.table_id}: retention_lock_timeout_ms must be a positive integer"
+            )
+
+        if self.integrity_on_mismatch not in _INTEGRITY_POLICIES:
+            raise ValueError(
+                f"{self.table_id}: integrity_on_mismatch must be one of "
+                f"{sorted(_INTEGRITY_POLICIES)}, got '{self.integrity_on_mismatch}'"
+            )
+        if int(self.integrity_lookback_runs) < 1:
+            raise ValueError(
+                f"{self.table_id}: integrity_lookback_runs must be >= 1"
+            )
+        if int(self.integrity_tolerance) < 0:
+            raise ValueError(
+                f"{self.table_id}: integrity_tolerance must be >= 0"
+            )
+        if self.integrity_enabled and self.sync_mode != "append":
+            raise ValueError(
+                f"{self.table_id}: integrity_enabled requires append sync_mode"
             )
 
         if self.sync_mode == "append" and not self.effective_watermark_column:

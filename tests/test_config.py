@@ -152,6 +152,75 @@ class TestValidation:
                 )
             )
 
+    def test_integrity_defaults(self):
+        cfg = TableConfig.from_dict(_base(sync_mode="append", watermark_column="id"))
+        assert cfg.integrity_enabled is False
+        assert cfg.integrity_lookback_runs == 1
+        assert cfg.integrity_on_mismatch == "fail"
+        assert cfg.integrity_tolerance == 0
+
+    def test_integrity_nested_config_ok(self):
+        cfg = TableConfig.from_dict(
+            _base(
+                sync_mode="append",
+                watermark_column="id",
+                integrity={
+                    "enabled": True,
+                    "lookback_runs": 3,
+                    "on_mismatch": "warn",
+                    "tolerance": 5,
+                },
+            )
+        )
+        assert cfg.integrity_enabled is True
+        assert cfg.integrity_lookback_runs == 3
+        assert cfg.integrity_on_mismatch == "warn"
+        assert cfg.integrity_tolerance == 5
+
+    def test_integrity_flat_config_ok(self):
+        cfg = TableConfig.from_dict(
+            _base(
+                sync_mode="append",
+                watermark_column="id",
+                integrity_enabled=True,
+                integrity_lookback_runs=2,
+            )
+        )
+        assert cfg.integrity_enabled is True
+        assert cfg.integrity_lookback_runs == 2
+
+    def test_integrity_unknown_key_rejected(self):
+        with pytest.raises(ValueError, match="unknown integrity key"):
+            TableConfig.from_dict(
+                _base(sync_mode="append", watermark_column="id", integrity={"nope": 1})
+            )
+
+    def test_integrity_bad_on_mismatch(self):
+        with pytest.raises(ValueError, match="integrity_on_mismatch must be"):
+            TableConfig.from_dict(
+                _base(
+                    sync_mode="append",
+                    watermark_column="id",
+                    integrity={"on_mismatch": "explode"},
+                )
+            )
+
+    def test_integrity_lookback_must_be_positive(self):
+        with pytest.raises(ValueError, match="integrity_lookback_runs must be >= 1"):
+            TableConfig.from_dict(
+                _base(
+                    sync_mode="append",
+                    watermark_column="id",
+                    integrity={"lookback_runs": 0},
+                )
+            )
+
+    def test_integrity_enabled_requires_append(self):
+        with pytest.raises(ValueError, match="integrity_enabled requires append"):
+            TableConfig.from_dict(
+                _base(sync_mode="full_reload", integrity_enabled=True)
+            )
+
 
 class TestLoaders:
     def _write(self, p, body):

@@ -3,6 +3,7 @@
   pg2ch init-meta                 메타 스키마 생성 (copy_run / copy_batch / copy_failed_row)
   pg2ch list                      설정된 테이블 파이프라인 목록
   pg2ch copy <table_id|all>       복사 1회 실행
+  pg2ch verify <table_id|all>     최근 watermark 구간 무결성 검사 (source vs target)
   pg2ch retention <table_id|all>  PG source retention 1회 실행
   pg2ch status <table_id>         마지막 run / watermark / 미해결 실패 row 수
 
@@ -20,6 +21,7 @@ import sys
 from .config import load_all_table_configs, load_table_config, tables_dir
 from .connections import get_connection
 from .copier import TableCopier
+from .integrity import IntegrityChecker
 from .retention import PgRetention
 from .tracking import MetaStore
 
@@ -90,6 +92,36 @@ def cmd_copy(args) -> int:
     return 1 if failures else 0
 
 
+def cmd_verify(args) -> int:
+    if args.table_id == "all":
+        configs = load_all_table_configs(args.tables_dir)
+    else:
+        configs = [_find_config(args.table_id, args.tables_dir)]
+
+    failures = 0
+    for cfg in configs:
+        try:
+            result = IntegrityChecker(cfg, connections_path=args.connections).run()
+            print(
+                f"[{result.status}] {cfg.table_id}: windows={result.windows_checked} "
+                f"source={result.source_rows} target={result.target_rows} "
+                f"missing={result.missing_rows} reason={result.reason or '-'}"
+            )
+            for w in result.windows:
+                if w.get("missing"):
+                    print(
+                        f"    run_id={w['run_id']} ({w['watermark_lo']} ~ "
+                        f"{w['watermark_hi']}]: source={w['source_rows']} "
+                        f"target={w['target_rows']} missing={w['missing']}"
+                    )
+            if result.status == "mismatch":
+                failures += 1
+        except Exception as e:
+            failures += 1
+            print(f"[failed] {cfg.table_id}: {e}", file=sys.stderr)
+    return 1 if failures else 0
+
+
 def cmd_retention(args) -> int:
     if args.table_id == "all":
         configs = load_all_table_configs(args.tables_dir)
@@ -122,6 +154,7 @@ def cmd_status(args) -> int:
     print(f"sync_mode       : {cfg.sync_mode}")
     print(f"watermark_column: {wm_col or '-'}")
     print(f"resume watermark: {wm or '(none — next run is a full copy)'}")
+    print(f"integrity       : {'enabled' if cfg.integrity_enabled else 'disabled'}")
     print(f"retention       : {'enabled' if cfg.retention_enabled else 'disabled'}")
     print(f"unresolved failed rows: {unresolved}")
     return 0
@@ -144,6 +177,10 @@ def build_parser() -> argparse.ArgumentParser:
     s = sub.add_parser("copy", help="복사 1회 실행")
     s.add_argument("table_id", help="table_id 또는 'all'")
     s.set_defaults(func=cmd_copy)
+
+    s = sub.add_parser("verify", help="최근 watermark 구간 무결성 검사")
+    s.add_argument("table_id", help="table_id 또는 'all'")
+    s.set_defaults(func=cmd_verify)
 
     s = sub.add_parser("retention", help="PG source retention 1회 실행")
     s.add_argument("table_id", help="table_id 또는 'all'")

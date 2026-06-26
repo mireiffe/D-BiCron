@@ -3,7 +3,9 @@
 테이블마다 적재 방식(append / full_reload)·주기가 다르므로 테이블당 독립 DAG 로
 만들어 스케줄·재시도·추적을 분리한다. dag_id 는 ``pg2ch_<table_id>``.
 
-각 DAG 은 precheck → copy → finalize_watermark → retention 순서의 task 를 가진다.
+각 DAG 은 precheck → copy → finalize_watermark → verify → retention 순서의 task 를
+가진다. verify 는 retention(=source 삭제) 직전에 최근 watermark 구간의 source/target
+row 수를 비교해 누락을 잡고, 누락 시 retention 을 막는다(integrity_on_mismatch=fail).
 batch/row 단위 진행·실패 추적은 pg2ch 메타 스키마(copy_run / copy_batch /
 copy_failed_row)에 기록한다.
 
@@ -125,6 +127,25 @@ def _make_finalize_callable(table_id: str):
     return _finalize
 
 
+def _make_verify_callable(table_id: str):
+    """retention 직전 무결성 검사. 설정이 켜져 있고 누락이 잡히면 raise 해 retention 을 막는다."""
+
+    def _verify(**_):
+        from pg2ch.integrity import IntegrityChecker
+
+        cfg = _runtime_config(table_id)
+        result = IntegrityChecker(cfg).run()
+        summary = result.as_dict()
+        if result.status == "mismatch":
+            if cfg.integrity_on_mismatch == "fail":
+                # raise → downstream retention 은 all_success 규칙으로 skip 된다.
+                raise RuntimeError(f"integrity check failed (missing rows): {summary}")
+            log.warning("%s: integrity mismatch (on_mismatch=warn): %s", table_id, summary)
+        return summary  # XCom 으로 push
+
+    return _verify
+
+
 def _make_retention_callable(table_id: str):
     """설정이 켜져 있으면 PG source retention 을 실행한다."""
 
@@ -227,6 +248,7 @@ def build_dag(cfg: TableConfig, copy_pool: str | None = None) -> DAG:
             f"- mode: `{cfg.sync_mode}`\n"
             f"- watermark: `{cfg.effective_watermark_column or '-'}`\n"
             f"- on_row_error: `{cfg.on_row_error}`\n"
+            f"- integrity: `{'enabled' if cfg.integrity_enabled else 'disabled'}`\n"
             f"- retention: `{'enabled' if cfg.retention_enabled else 'disabled'}`\n"
         ),
     )
@@ -248,12 +270,17 @@ def build_dag(cfg: TableConfig, copy_pool: str | None = None) -> DAG:
             task_display_name="3. finalize_watermark",
             python_callable=_make_finalize_callable(cfg.table_id),
         )
+        verify = PythonOperator(
+            task_id="verify",
+            task_display_name="4. verify",
+            python_callable=_make_verify_callable(cfg.table_id),
+        )
         retention = PythonOperator(
             task_id="retention",
-            task_display_name="4. retention",
+            task_display_name="5. retention",
             python_callable=_make_retention_callable(cfg.table_id),
         )
-        precheck >> copy >> finalize >> retention
+        precheck >> copy >> finalize >> verify >> retention
     return dag
 
 

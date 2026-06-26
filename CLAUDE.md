@@ -16,7 +16,7 @@ PostgreSQL → ClickHouse 복사 전용 파이프라인 (Apache Airflow 3.2.2 �
 
 - `uv sync --extra test` — 엔진 의존성 + 테스트 설치
 - `uv run pytest -q` — 테스트 (DB 불필요, 전부 mock)
-- `uv run pg2ch <init-meta|list|copy|status> ...` — CLI one-shot
+- `uv run pg2ch <init-meta|list|copy|verify|retention|status> ...` — CLI one-shot
 - `docker compose build && docker compose up -d` — Airflow 스택 기동 (UI :8080)
 
 ## 새 테이블 추가
@@ -28,8 +28,10 @@ PostgreSQL → ClickHouse 복사 전용 파이프라인 (Apache Airflow 3.2.2 �
 ## 엔진 구조 (pg2ch/)
 
 `chtypes`(타입) → `ddl`(DDL) / `transform`(row 변환) → `copier`(오케스트레이션).
-`tracking`(메타 저장소), `config`(YAML 로드/검증), `connections`(접속), `cli`.
+`tracking`(메타 저장소), `config`(YAML 로드/검증), `connections`(접속),
+`integrity`(retention 전 무결성 검사), `retention`(PG source 삭제), `cli`.
 엔진은 Airflow 에 의존하지 않으며, `dags/pg2ch_factory.py` 만 Airflow API 를 쓴다.
+DAG task 순서: `precheck → copy → finalize_watermark → verify → retention`.
 
 ## 복사/추적 설계 원칙
 
@@ -39,3 +41,7 @@ PostgreSQL → ClickHouse 복사 전용 파이프라인 (Apache Airflow 3.2.2 �
 - 증분 재개 cutoff 는 finalize 된 `copy_run.watermark_after` 와, finalize 전에
   죽은 증분 run 이 남긴 마지막 `copy_batch.watermark_hi` 중 더 진행된 지점에서
   읽는다 (OOM/SIGKILL 로 죽어도 재복사 루프에 빠지지 않게).
+- retention(=source 삭제)은 파괴적이므로 직전에 `verify` 로 최근 watermark 구간의
+  source `count(*)` vs target `uniqExact(key)` 를 비교한다. target 은 distinct key
+  로 세야 overlap 재전송 중복(ReplacingMergeTree 머지 전)이 누락을 가리지 않는다.
+  누락 시(on_mismatch=fail) retention 을 막아 source 유실을 방지한다.

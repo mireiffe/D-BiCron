@@ -6,12 +6,13 @@
 주기가 다를 수 있고(설정으로 지정), 어디까지 복사되었는지 / 어느 batch 의 어느 row 가
 실패했는지를 정밀하게 추적한다.
 
-Airflow DAG 는 테이블마다 `precheck → copy → finalize_watermark → retention`
+Airflow DAG 는 테이블마다 `precheck → copy → finalize_watermark → verify → retention`
 순서로 실행된다. `precheck` 는 현재 watermark 기준 copy 계획(mode/cutoff)을 산출하고
 source/meta 접속을 fail-fast 검증한다(대상 row 수는 세지 않음 — COUNT 는 큰 테이블에서
 비싸고 적재 동작에 쓰이지 않는다). `copy` 는 데이터를 적재하되 watermark 를 아직 공개하지 않는다. `finalize_watermark`
-가 같은 `run_id` 의 `watermark_after` 를 확정한 뒤, 설정이 켜진 경우에만
-`retention` 이 PostgreSQL source row 를 삭제한다.
+가 같은 `run_id` 의 `watermark_after` 를 확정한다. `verify` 는(켜진 경우) 최근 watermark
+구간의 source/target row 수를 비교해 누락을 잡고, 누락 시 `retention` 을 막는다.
+마지막으로 설정이 켜진 경우에만 `retention` 이 PostgreSQL source row 를 삭제한다.
 
 > 이 저장소는 과거 cron 기반 다중 DB 관리 플랫폼(dbcron)을 완전히 대체한 것이다.
 > 옛 프로젝트는 `backup_cron` 브랜치에 보존되어 있다 → 아래 [기존 프로젝트](#기존-프로젝트-backup_cron) 참조.
@@ -70,6 +71,30 @@ dead-letter 에 보존됨) 파이프라인이 멈추지 않는다 — 이때 run
 
 > 직접 `ClickHouse postgresql()` 테이블 함수로 복사하지 않고 항상 Python 스트리밍으로
 > 복사하는 이유가 바로 이 row 단위 추적/격리 때문이다.
+
+### 무결성 검사 (retention 안전장치)
+
+`overlap` 을 걸어도 batch 경계 tie·크래시 등으로 CH 에 안 넘어간 row 가 드물게 생길 수
+있다. 그 상태로 `retention` 이 source 를 지우면 데이터가 영구 유실된다. 이를 막기 위해
+`retention` **직전에** `verify` task 가 최근 watermark 구간을 검사한다.
+
+각 run 이 이미 기록한 구간 `(watermark_before, watermark_after]` 에 대해:
+
+- **PG source (기대값)** = `count(*)` of rows with `watermark > before AND watermark <= after`
+- **CH target (실재값)** = `uniqExact(<order_by/primary_key>)` of the same window
+
+`source > target` 이면 누락이다. target 은 **distinct key** 로 센다 — overlap 재전송으로
+`ReplacingMergeTree` 에 같은 row 가 머지 전까지 중복 존재할 수 있어, 단순 `count(*)` 는
+(다른 row 가 빠졌어도) 중복이 메워 누락을 가릴 수 있기 때문이다. dedup 키로 distinct 를
+세면 중복에 영향받지 않고 논리적 row 수를 본다.
+
+검사 범위는 **최근 run 의 watermark 구간**으로 한정되어(전체 테이블 COUNT 가 아님) 큰
+테이블에서도 가볍다. `integrity_on_mismatch: fail`(기본)이면 누락 시 `verify` 가 실패하고,
+하위 `retention` 은 자동으로 skip 되어 source 가 보존된다. `warn` 이면 로그만 남기고 진행.
+CLI 로 직접 점검하려면 `pg2ch verify <table_id>`.
+
+> append 전용(full_reload 는 watermark 구간이 없어 skip). retention 을 켤 거라면 함께
+> 켜는 것을 권장한다 — 삭제 직전의 마지막 점검이다.
 
 ---
 
@@ -170,6 +195,13 @@ max_failed_rows: 1000            # 누적 실패가 넘으면 run 실패 처리
 optimize_after_sync: true
 optimize_partitions: ["202606"]  # 생략 시 전체 테이블
 
+# 무결성 검사 (retention 직전 누락 row 탐지, append 전용)
+integrity:
+  enabled: false                  # true 로 켜야 검사 실행
+  lookback_runs: 1                # 최근 몇 개 run 구간을 검사할지
+  on_mismatch: fail               # fail = retention 차단 | warn = 로그만
+  tolerance: 0                    # 허용 누락 수
+
 # PG source retention (복제 완료된 오래된 row 삭제)
 retention:
   enabled: false                  # true 로 켜야 삭제 실행
@@ -207,6 +239,7 @@ use_nullable: false
 | 에러 | `on_row_error`(dead_letter\|skip\|fail), `max_failed_rows` |
 | 스케줄 | `schedule`, `start_date`, `catchup`, `max_active_runs`, `retries`, `retry_delay_seconds`, `tags` |
 | 후처리 | `optimize_after_sync`, `optimize_partitions`, `optimize_mutations_sync` |
+| 무결성 검사 | `integrity.enabled`, `integrity.lookback_runs`, `integrity.on_mismatch`(fail\|warn), `integrity.tolerance` |
 | PG retention | `retention.enabled`, `retention.source_retention`, `retention.batch_size`, `retention.lock_timeout_ms` |
 
 ### 3-a. 실행 — Airflow (Docker, 운영 방식)
@@ -220,7 +253,7 @@ docker compose up -d
 ```
 
 테이블당 DAG `pg2ch_<table_id>` 가 자동 생성된다. UI 에서 토글을 켜면 `schedule` 대로 돈다.
-각 DAG 는 `precheck`, `copy`, `finalize_watermark`, `retention` task 로 나뉜다.
+각 DAG 는 `precheck`, `copy`, `finalize_watermark`, `verify`, `retention` task 로 나뉜다.
 `docker-compose.yaml` 은 Airflow 공식 3.x 템플릿을 LocalExecutor 로 단순화한 것이며,
 로컬 테스트용 ClickHouse 서비스를 포함한다.
 
@@ -245,6 +278,7 @@ uv run pg2ch init-meta           # 추적 스키마(pg2ch_meta) 생성
 uv run pg2ch list                # 설정된 테이블 목록
 uv run pg2ch copy orders         # 특정 테이블 복사 1회
 uv run pg2ch copy all            # 전체 복사
+uv run pg2ch verify orders       # 최근 watermark 구간 무결성 검사 (source vs target)
 uv run pg2ch retention orders    # PG source retention 1회 실행
 uv run pg2ch status orders       # 마지막 run / watermark / 미해결 실패 row 수
 ```
@@ -327,6 +361,7 @@ pg2ch/                     엔진 패키지 (Airflow 비의존, 단위 테스트
 ├── config.py              테이블 설정(YAML) 로드/검증 (TableConfig)
 ├── tracking.py            메타 저장소 (copy_run/copy_batch/copy_failed_row)
 ├── copier.py              복사 오케스트레이션 (모드 + batch/row 추적)
+├── integrity.py           retention 전 무결성 검사 (watermark 구간 source vs target)
 ├── retention.py           finalize 된 watermark 기준 PG source retention
 └── cli.py                 CLI
 dags/pg2ch_factory.py      config → DAG(테이블당 1개) 동적 생성

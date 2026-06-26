@@ -65,12 +65,16 @@ class FakeCursor:
     def fetchone(self):
         return self.conn.fetch_queue.pop(0)
 
+    def fetchall(self):
+        return self.conn.fetchall_queue.pop(0)
+
 
 class FakeConn:
     def __init__(self):
         self.autocommit = False
         self.executed = []
         self.fetch_queue = []
+        self.fetchall_queue = []
         self.closed = False
 
     def cursor(self):
@@ -150,6 +154,22 @@ class TestMetaStore:
         conn = FakeConn()
         conn.fetch_queue = [None, None]
         assert MetaStore(conn).get_resume_watermark("orders", "updated_at") is None
+
+    def test_recent_run_windows(self):
+        conn = FakeConn()
+        conn.fetchall_queue = [[(7, "200", "300"), (6, "100", "200")]]
+        m = MetaStore(conn)
+        windows = m.recent_run_windows("orders", "updated_at", limit=2)
+        assert windows == [
+            {"run_id": 7, "watermark_before": "200", "watermark_after": "300"},
+            {"run_id": 6, "watermark_before": "100", "watermark_after": "200"},
+        ]
+        sql, params = conn.executed[-1]
+        assert "FROM pg2ch_meta.copy_run" in sql
+        assert "status IN ('success','partial')" in sql
+        assert "watermark_after IS NOT NULL" in sql
+        assert "ORDER BY run_id DESC" in sql
+        assert params == ("orders", "updated_at", 2)
 
     def test_record_batch_returns_id(self):
         conn = FakeConn()

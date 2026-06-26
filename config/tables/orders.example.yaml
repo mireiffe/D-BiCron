@@ -54,6 +54,17 @@ optimize_after_sync: true
 optimize_partitions: ["202606"]
 optimize_mutations_sync: 2
 
+# 무결성 검사 (retention 직전 누락 row 탐지)
+#   최근 watermark 구간 (watermark_before, watermark_after] 에서
+#   PG source 의 row 수와 CH target 의 distinct key 수를 비교한다.
+#   누락이 잡히면(on_mismatch: fail) retention 을 막아 source 유실을 방지한다.
+#   retention 을 켤 거라면 함께 켜는 것을 권장.
+integrity:
+  enabled: false                 # true 로 켜야 검사 실행 (append 전용)
+  lookback_runs: 1               # 최근 몇 개 run 구간을 검사할지
+  on_mismatch: fail              # fail = retention 차단 | warn = 로그만
+  tolerance: 0                   # 허용 누락 수 (이보다 크면 mismatch)
+
 # PG source retention (복제 완료된 오래된 source row 삭제)
 retention:
   enabled: false                 # true 로 켜야 삭제 실행

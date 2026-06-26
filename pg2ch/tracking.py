@@ -287,6 +287,32 @@ class MetaStore:
             row = cur.fetchone()
             return row[0] if row else None
 
+    def recent_run_windows(
+        self, table_id: str, watermark_column: str, limit: int = 1
+    ) -> list[dict]:
+        """최근 finalize 된 run 의 watermark 구간 목록 (무결성 검사용).
+
+        각 원소: ``{run_id, watermark_before, watermark_after}`` — run_id 내림차순.
+        status IN ('success','partial') 이고 watermark_after 가 확정된 run 만 본다
+        (=copy 가 끝나 retention 대상이 된 구간). 구간은 ``(before, after]``.
+        """
+        with self.conn.cursor() as cur:
+            cur.execute(
+                f"""
+                SELECT run_id, watermark_before, watermark_after
+                FROM {self.schema}.copy_run
+                WHERE table_id=%s AND watermark_column=%s
+                  AND status IN ('success','partial') AND watermark_after IS NOT NULL
+                ORDER BY run_id DESC
+                LIMIT %s
+                """,
+                (table_id, watermark_column, int(limit)),
+            )
+            return [
+                {"run_id": r[0], "watermark_before": r[1], "watermark_after": r[2]}
+                for r in cur.fetchall()
+            ]
+
     # ── batch ────────────────────────────────────────────────
     def record_batch(
         self,
