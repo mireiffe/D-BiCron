@@ -408,3 +408,91 @@ class TestCopyFlow:
         meta = FakeMeta()
         with pytest.raises(ValueError, match="not found or has no columns"):
             TableCopier(cfg).copy(pg, ch, meta, target_default_db="default")
+
+
+# ── copy_missing_keys (integrity self-heal) ──────────────────────
+
+
+class FakeKeyCursor:
+    """introspection + 'WHERE key IN %s' 재조회를 라우팅하는 unnamed 커서."""
+
+    def __init__(self, pg):
+        self.pg = pg
+        self._rows = []
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *a):
+        return False
+
+    def execute(self, sql, params=None):
+        self.pg.queries.append((sql, params))
+        if sql.strip().startswith("SELECT column_name"):
+            self._rows = list(COLS)
+        else:  # SELECT ... WHERE "id" IN %s
+            wanted = params[0]
+            self._rows = [self.pg.rows[i] for i in wanted if i in self.pg.rows]
+
+    def fetchall(self):
+        return self._rows
+
+
+class FakeKeyPG:
+    def __init__(self, rows):
+        self.rows = rows  # {id: (id, name)}
+        self.queries = []
+        self.rolled_back = False
+
+    def cursor(self, name=None):
+        return FakeKeyCursor(self)
+
+    def rollback(self):
+        self.rolled_back = True
+
+    def close(self):
+        pass
+
+
+class TestCopyMissingKeys:
+    def test_recopies_and_does_not_advance_watermark(self):
+        cfg = _cfg(sync_mode="append", watermark_column="id", engine="ReplacingMergeTree")
+        pg = FakeKeyPG({2: (2, "b"), 4: (4, "d")})
+        ch = FakeCH()
+        meta = FakeMeta()
+        written, failed = TableCopier(cfg).copy_missing_keys(
+            pg, ch, meta, key_cols=["id"], keys=[(2,), (4,)], target_default_db="default"
+        )
+        assert written == 2 and failed == 0
+        assert (2, "b") in ch.inserted and (4, "d") in ch.inserted
+        # repair run 은 watermark 를 전진시키지 않는다 (resume/무결성 window 제외)
+        assert meta.started["watermark_before"] is None
+        assert meta.started["watermark_column"] is None
+        assert meta.finished["watermark_after"] is None
+        assert meta.finished["status"] == "success"
+        assert pg.rolled_back is True
+
+    def test_empty_keys_is_noop(self):
+        cfg = _cfg(sync_mode="append", watermark_column="id")
+        pg = FakeKeyPG({})
+        ch = FakeCH()
+        meta = FakeMeta()
+        assert TableCopier(cfg).copy_missing_keys(
+            pg, ch, meta, key_cols=["id"], keys=[], target_default_db="default"
+        ) == (0, 0)
+        assert meta.started is None  # run 조차 열지 않음
+
+    def test_dead_letters_rows_that_still_fail(self):
+        cfg = _cfg(
+            sync_mode="append", watermark_column="id",
+            engine="ReplacingMergeTree", on_row_error="dead_letter",
+        )
+        pg = FakeKeyPG({2: (2, "b"), 3: (3, "BAD")})
+        ch = FakeCH(bad=lambda r: r[1] == "BAD")
+        meta = FakeMeta()
+        written, failed = TableCopier(cfg).copy_missing_keys(
+            pg, ch, meta, key_cols=["id"], keys=[(2,), (3,)], target_default_db="default"
+        )
+        assert written == 1 and failed == 1
+        assert len(meta.failed) == 1
+        assert meta.finished["status"] == "partial"

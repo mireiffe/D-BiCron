@@ -394,6 +394,25 @@ class MetaStore:
             ]
             return dict(zip(cols, r))
 
+    def unresolved_failed_keys(
+        self, table_id: str, key_cols: list[str]
+    ) -> list[tuple]:
+        """미해결 dead-letter row 의 key 값들 (row_data JSONB 에서 추출).
+
+        무결성 검사가 "알려진 실패(재복사해도 또 실패)" 를 누락 대상에서 빼는 데
+        쓴다. 각 원소는 key_cols 순서의 텍스트 튜플 (JSONB ``->>`` 이므로 text).
+        """
+        if not key_cols:
+            return []
+        select = ", ".join("row_data->>%s" for _ in key_cols)
+        with self.conn.cursor() as cur:
+            cur.execute(
+                f"SELECT {select} FROM {self.schema}.copy_failed_row "
+                f"WHERE table_id=%s AND NOT resolved",
+                (*key_cols, table_id),
+            )
+            return [tuple(r) for r in cur.fetchall()]
+
     def unresolved_failed_count(self, table_id: str) -> int:
         with self.conn.cursor() as cur:
             cur.execute(

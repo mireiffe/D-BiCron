@@ -19,11 +19,14 @@ insert_types_check: true
 use_nullable: false
 on_row_error: dead_letter   # dead_letter | skip | fail
 
-# 무결성 검사 기본값. 실제 검사는 테이블별로 enabled: true 를 둔 경우만 실행된다(append 전용).
+# 무결성 검사 + 자가복구 기본값. 실제 검사는 테이블별로 enabled: true 를 둔 경우만(append 전용).
 integrity:
   enabled: false
+  method: count       # count(값싼 게이트+누락 key만 diff) | key_diff(항상 정밀)
   lookback_runs: 1
-  on_mismatch: fail   # fail = retention 차단 | warn = 로그만
+  repair: true        # 누락 key 재복사(self-heal); ReplacingMergeTree 계열만 동작
+  repair_attempts: 1
+  on_mismatch: fail   # (repair 후에도 누락 시) fail = retention 차단 | warn = 로그만
   tolerance: 0
 
 # PG source retention 기본값. 실제 삭제는 테이블별로 enabled: true 를 둔 경우만 실행된다.

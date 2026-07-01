@@ -51,6 +51,12 @@ def _wm_str(v) -> str | None:
     return str(v)
 
 
+def _chunks(seq, size):
+    size = max(1, int(size))
+    for i in range(0, len(seq), size):
+        yield seq[i : i + size]
+
+
 @dataclass
 class _Totals:
     rows_read: int = 0
@@ -200,36 +206,14 @@ class TableCopier:
         finalize_run: bool = True,
     ) -> RunResult:
         cfg = self.cfg
-        src_schema, src_name = cfg.source_parts()
-        tgt_db, tgt_name = cfg.target_parts(target_default_db)
         wm_col = cfg.effective_watermark_column
         ts_col = cfg.timestamp_column
         is_append = cfg.sync_mode == "append"
 
-        # 1) PG 컬럼 introspection
-        pg_cols = self._introspect_pg_columns(pg_conn, src_schema, src_name)
-        if not pg_cols:
-            raise ValueError(
-                f"source table {cfg.source_table} not found or has no columns"
-            )
-
-        # 2) CH 컬럼 매핑 + 테이블 보장
-        key_cols = extract_ch_key_columns(cfg.order_by) | extract_ch_key_columns(
-            cfg.primary_key
-        )
-        ch_columns = build_ch_columns(
-            pg_cols, set(cfg.drop_columns), cfg.column_overrides,
-            list(key_cols), cfg.use_nullable,
-        )
-        col_names = [c["name"] for c in ch_columns]
-
+        # 1~2) PG introspection + CH 컬럼 매핑 + 대상 테이블 보장
         meta.ensure_schema()
-        ddl = build_create_table_ddl(
-            tgt_db, tgt_name, ch_columns, cfg.order_by, cfg.partition_by,
-            cfg.engine, cfg.primary_key, cfg.indexes, cfg.settings,
-        )
-        self.log.info("ensuring target table %s.%s", tgt_db, tgt_name)
-        ch.execute(ddl)
+        (src_schema, src_name, tgt_db, tgt_name, ch_columns,
+         col_names) = self._prepare_target(pg_conn, ch, target_default_db)
 
         # 3) 모드 / cutoff 결정
         window = self._copy_window(meta)
@@ -323,6 +307,150 @@ class TableCopier:
                 duration_ms=duration_ms, error=str(e),
             )
             raise
+
+    def _prepare_target(self, pg_conn, ch, target_default_db: str):
+        """PG introspection + CH 컬럼 매핑 + 대상 테이블 보장. copy / repair 공용.
+
+        반환: (src_schema, src_name, tgt_db, tgt_name, ch_columns, col_names)
+        """
+        cfg = self.cfg
+        src_schema, src_name = cfg.source_parts()
+        tgt_db, tgt_name = cfg.target_parts(target_default_db)
+        pg_cols = self._introspect_pg_columns(pg_conn, src_schema, src_name)
+        if not pg_cols:
+            raise ValueError(
+                f"source table {cfg.source_table} not found or has no columns"
+            )
+        key_cols = extract_ch_key_columns(cfg.order_by) | extract_ch_key_columns(
+            cfg.primary_key
+        )
+        ch_columns = build_ch_columns(
+            pg_cols, set(cfg.drop_columns), cfg.column_overrides,
+            list(key_cols), cfg.use_nullable,
+        )
+        col_names = [c["name"] for c in ch_columns]
+        ddl = build_create_table_ddl(
+            tgt_db, tgt_name, ch_columns, cfg.order_by, cfg.partition_by,
+            cfg.engine, cfg.primary_key, cfg.indexes, cfg.settings,
+        )
+        self.log.info("ensuring target table %s.%s", tgt_db, tgt_name)
+        ch.execute(ddl)
+        return src_schema, src_name, tgt_db, tgt_name, ch_columns, col_names
+
+    def copy_missing_keys(
+        self, pg_conn, ch, meta: MetaStore, *,
+        key_cols, keys, target_default_db: str = "default",
+    ) -> tuple[int, int]:
+        """빠진 key 목록의 row 만 source 에서 다시 읽어 target 에 재적재(self-heal).
+
+        무결성 검사(integrity)가 찾아낸 "target 에 없는 source key" 를 받아 그 row 만
+        정확히 다시 넣는다. watermark 는 전진시키지 않는다 — repair run 은
+        watermark_before/after 를 NULL 로 남겨 resume/무결성 window 계산에서 제외된다.
+        ReplacingMergeTree 계열에서 idempotent(중복 재insert 는 머지로 dedup)하며,
+        재적재 중에도 실패하는 row 는 기존 dead-letter 경로로 보관된다.
+
+        반환: (rows_written, rows_failed).
+        """
+        cfg = self.cfg
+        keys = list(keys)
+        key_cols = list(key_cols)
+        if not keys or not key_cols:
+            return 0, 0
+        meta.ensure_schema()
+        (src_schema, src_name, tgt_db, tgt_name, ch_columns,
+         col_names) = self._prepare_target(pg_conn, ch, target_default_db)
+        transformer = build_transformer(ch_columns)
+        col_insert = ", ".join(quote_ch_identifier(c) for c in col_names)
+        insert_sql = (
+            f"INSERT INTO {quote_ch_identifier(tgt_db)}."
+            f"{quote_ch_identifier(tgt_name)} ({col_insert}) VALUES"
+        )
+        wm_col = cfg.effective_watermark_column
+        wm_idx = col_names.index(wm_col) if wm_col and wm_col in col_names else None
+        select_list = self._pg_select_list(ch_columns)
+
+        run_id = meta.start_run(
+            table_id=cfg.table_id, source_table=cfg.source_table,
+            target_table=cfg.target_table, sync_mode=cfg.sync_mode,
+            watermark_column=None, watermark_before=None,
+            dag_id=self.ctx.get("dag_id"), airflow_run_id=self.ctx.get("run_id"),
+            task_id=self.ctx.get("task_id"), try_number=self.ctx.get("try_number"),
+        )
+        total_written = total_failed = 0
+        batch_seq = 0
+        t0 = time.monotonic()
+        try:
+            for chunk in _chunks(keys, cfg.batch_size):
+                raw_rows = self._fetch_by_keys(
+                    pg_conn, src_schema, src_name, select_list, key_cols, chunk
+                )
+                if not raw_rows:
+                    continue
+                xrows = (
+                    [transformer(r) for r in raw_rows] if transformer
+                    else list(raw_rows)
+                )
+                written, failures = self._insert(
+                    ch, insert_sql, raw_rows, xrows, col_names, wm_idx
+                )
+                rows_failed = len(failures)
+                status = "success" if rows_failed == 0 else "partial"
+                batch_id = meta.record_batch(
+                    run_id=run_id, table_id=cfg.table_id, batch_seq=batch_seq,
+                    status=status, rows_in=len(raw_rows), rows_written=written,
+                    rows_failed=rows_failed, watermark_lo=None, watermark_hi=None,
+                )
+                if failures and cfg.on_row_error == "dead_letter":
+                    meta.record_failed_rows(
+                        run_id=run_id, batch_id=batch_id, table_id=cfg.table_id,
+                        batch_seq=batch_seq, failures=failures,
+                    )
+                total_written += written
+                total_failed += rows_failed
+                batch_seq += 1
+            status = "partial" if total_failed else "success"
+            meta.finish_run(
+                run_id, status=status, watermark_after=None,
+                rows_read=total_written + total_failed, rows_written=total_written,
+                rows_failed=total_failed, batch_count=batch_seq,
+                duration_ms=int((time.monotonic() - t0) * 1000),
+            )
+            try:
+                pg_conn.rollback()  # read 트랜잭션 정리
+            except Exception:
+                pass
+            self.log.info(
+                "%s: repair re-copied %d row(s) (%d failed) for %d missing key(s)",
+                cfg.source_table, total_written, total_failed, len(keys),
+            )
+            return total_written, total_failed
+        except Exception as e:
+            self.log.exception("%s: repair run failed", cfg.source_table)
+            meta.finish_run(
+                run_id, status="failed", watermark_after=None,
+                rows_read=total_written + total_failed, rows_written=total_written,
+                rows_failed=total_failed, batch_count=batch_seq,
+                duration_ms=int((time.monotonic() - t0) * 1000), error=str(e),
+            )
+            raise
+
+    @staticmethod
+    def _fetch_by_keys(pg_conn, src_schema, src_name, select_list, key_cols, chunk):
+        """key 값 chunk 에 해당하는 source row 를 읽는다 (WHERE key IN %s)."""
+        src_fqn = (
+            f"{quote_pg_identifier(src_schema)}.{quote_pg_identifier(src_name)}"
+        )
+        if len(key_cols) == 1:
+            predicate = f"{quote_pg_identifier(key_cols[0])} IN %s"
+            param = (tuple(k[0] if isinstance(k, (tuple, list)) else k for k in chunk),)
+        else:
+            cols = ", ".join(quote_pg_identifier(c) for c in key_cols)
+            predicate = f"({cols}) IN %s"
+            param = (tuple(tuple(k) for k in chunk),)
+        query = f"SELECT {select_list} FROM {src_fqn} WHERE {predicate}"
+        with pg_conn.cursor() as cur:
+            cur.execute(query, param)
+            return cur.fetchall()
 
     def inspect_copy_plan(self, meta: MetaStore) -> CopyPlan:
         """현재 resume watermark / sync_since 로 copy 계획(mode/cutoff)을 산출한다.

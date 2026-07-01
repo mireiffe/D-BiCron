@@ -134,7 +134,8 @@ def _make_verify_callable(table_id: str):
         from pg2ch.integrity import IntegrityChecker
 
         cfg = _runtime_config(table_id)
-        result = IntegrityChecker(cfg).run()
+        # 누락이 있으면 설정에 따라 그 row 만 재복사(self-heal)한 뒤 재검사한다.
+        result = IntegrityChecker(cfg, airflow_context=_airflow_context()).run()
         summary = result.as_dict()
         if result.status == "mismatch":
             if cfg.integrity_on_mismatch == "fail":

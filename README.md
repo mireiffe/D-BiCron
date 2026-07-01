@@ -89,12 +89,34 @@ dead-letter 에 보존됨) 파이프라인이 멈추지 않는다 — 이때 run
 세면 중복에 영향받지 않고 논리적 row 수를 본다.
 
 검사 범위는 **최근 run 의 watermark 구간**으로 한정되어(전체 테이블 COUNT 가 아님) 큰
-테이블에서도 가볍다. `integrity_on_mismatch: fail`(기본)이면 누락 시 `verify` 가 실패하고,
+테이블에서도 가볍다.
+
+#### 누락 row 자가복구 (repair)
+
+누락이 잡히면 그냥 실패시키지 않고, **빠진 그 row 만 골라 다시 복사(self-heal)** 한 뒤
+재검사한다. count 게이트가 모자란 구간에서 양쪽 **key 집합의 차(source − target)** 를
+구해 정확히 어떤 key 가 빠졌는지 찾고(`integrity_method: count`), 그 key 들만
+`WHERE key IN (...)` 로 재적재한다.
+
+- **watermark 를 전진시키지 않는다** — repair 는 watermark_before/after 를 NULL 로 남겨
+  resume·window 계산에서 제외되므로, 이미 지나간 구간의 누락도 다시 채울 수 있다.
+- **ReplacingMergeTree 계열에서만** 수행한다(재insert 가 머지로 dedup 되어 idempotent).
+  그 외 엔진은 중복이 남을 수 있어 repair 를 건너뛰고 실패 처리한다.
+- **이미 dead-letter 로 기록된 row 는 제외**한다(재복사해도 또 실패 → 무한 재시도 방지).
+  이런 row 는 데이터/스키마를 고쳐 replay 해야 한다.
+- `integrity_repair_attempts` 회까지 재복사→재검사를 반복하고, 그래도 남으면 hard fail.
+
+`integrity_method: key_diff` 로 두면 count 게이트 없이 **항상** key 집합을 비교한다 —
+count 가 우연히 같아 가려지는 경우(구간 내 source 삭제 등)까지 잡지만 전송 비용이 크다.
+
+#### 판정 & 차단
+
+`integrity_on_mismatch: fail`(기본)이면 (repair 후에도) 누락이 남을 때 `verify` 가 실패하고,
 하위 `retention` 은 자동으로 skip 되어 source 가 보존된다. `warn` 이면 로그만 남기고 진행.
-CLI 로 직접 점검하려면 `pg2ch verify <table_id>`.
+CLI 로 직접 점검하려면 `pg2ch verify <table_id>` (검사만 하려면 `--no-repair`).
 
 > append 전용(full_reload 는 watermark 구간이 없어 skip). retention 을 켤 거라면 함께
-> 켜는 것을 권장한다 — 삭제 직전의 마지막 점검이다.
+> 켜는 것을 권장한다 — 삭제 직전의 마지막 점검 + 자가복구다.
 
 ---
 
@@ -195,11 +217,14 @@ max_failed_rows: 1000            # 누적 실패가 넘으면 run 실패 처리
 optimize_after_sync: true
 optimize_partitions: ["202606"]  # 생략 시 전체 테이블
 
-# 무결성 검사 (retention 직전 누락 row 탐지, append 전용)
+# 무결성 검사 + 누락 row 자가복구 (retention 직전, append 전용)
 integrity:
   enabled: false                  # true 로 켜야 검사 실행
+  method: count                   # count(값싼 게이트+누락 key만 diff) | key_diff(항상 정밀)
   lookback_runs: 1                # 최근 몇 개 run 구간을 검사할지
-  on_mismatch: fail               # fail = retention 차단 | warn = 로그만
+  repair: true                    # 누락 key 재복사(self-heal); ReplacingMergeTree 계열만
+  repair_attempts: 1              # 재복사→재검사 최대 반복 횟수
+  on_mismatch: fail               # (repair 후에도 누락 시) fail = retention 차단 | warn = 로그만
   tolerance: 0                    # 허용 누락 수
 
 # PG source retention (복제 완료된 오래된 row 삭제)
@@ -239,7 +264,7 @@ use_nullable: false
 | 에러 | `on_row_error`(dead_letter\|skip\|fail), `max_failed_rows` |
 | 스케줄 | `schedule`, `start_date`, `catchup`, `max_active_runs`, `retries`, `retry_delay_seconds`, `tags` |
 | 후처리 | `optimize_after_sync`, `optimize_partitions`, `optimize_mutations_sync` |
-| 무결성 검사 | `integrity.enabled`, `integrity.lookback_runs`, `integrity.on_mismatch`(fail\|warn), `integrity.tolerance` |
+| 무결성 검사 | `integrity.enabled`, `integrity.method`(count\|key_diff), `integrity.lookback_runs`, `integrity.repair`, `integrity.repair_attempts`, `integrity.on_mismatch`(fail\|warn), `integrity.tolerance` |
 | PG retention | `retention.enabled`, `retention.source_retention`, `retention.batch_size`, `retention.lock_timeout_ms` |
 
 ### 3-a. 실행 — Airflow (Docker, 운영 방식)

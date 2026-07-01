@@ -22,6 +22,7 @@ _DEFAULTS_FILE = "_defaults.yaml"
 _SYNC_MODES = {"append", "full_reload"}
 _ROW_ERROR_POLICIES = {"dead_letter", "fail", "skip"}
 _INTEGRITY_POLICIES = {"fail", "warn"}
+_INTEGRITY_METHODS = {"count", "key_diff"}
 import re as _re
 
 _TABLE_ID_RE = _re.compile(r"^[A-Za-z0-9_.-]+$")
@@ -103,9 +104,12 @@ class TableConfig:
 
     # 무결성 검사 (retention 전 누락 row 탐지)
     integrity_enabled: bool = False
+    integrity_method: str = "count"  # count | key_diff
     integrity_lookback_runs: int = 1
     integrity_on_mismatch: str = "fail"  # fail | warn
     integrity_tolerance: int = 0
+    integrity_repair: bool = True
+    integrity_repair_attempts: int = 1
 
     # Airflow 스케줄링 메타 (DAG factory 가 사용)
     schedule: str | None = None
@@ -169,12 +173,18 @@ class TableConfig:
             integrity_keys = {
                 "enabled": "integrity_enabled",
                 "integrity_enabled": "integrity_enabled",
+                "method": "integrity_method",
+                "integrity_method": "integrity_method",
                 "lookback_runs": "integrity_lookback_runs",
                 "integrity_lookback_runs": "integrity_lookback_runs",
                 "on_mismatch": "integrity_on_mismatch",
                 "integrity_on_mismatch": "integrity_on_mismatch",
                 "tolerance": "integrity_tolerance",
                 "integrity_tolerance": "integrity_tolerance",
+                "repair": "integrity_repair",
+                "integrity_repair": "integrity_repair",
+                "repair_attempts": "integrity_repair_attempts",
+                "integrity_repair_attempts": "integrity_repair_attempts",
             }
             unknown_integrity = set(integrity) - set(integrity_keys)
             if unknown_integrity:
@@ -237,6 +247,11 @@ class TableConfig:
                 f"{self.table_id}: retention_lock_timeout_ms must be a positive integer"
             )
 
+        if self.integrity_method not in _INTEGRITY_METHODS:
+            raise ValueError(
+                f"{self.table_id}: integrity_method must be one of "
+                f"{sorted(_INTEGRITY_METHODS)}, got '{self.integrity_method}'"
+            )
         if self.integrity_on_mismatch not in _INTEGRITY_POLICIES:
             raise ValueError(
                 f"{self.table_id}: integrity_on_mismatch must be one of "
@@ -249,6 +264,12 @@ class TableConfig:
         if int(self.integrity_tolerance) < 0:
             raise ValueError(
                 f"{self.table_id}: integrity_tolerance must be >= 0"
+            )
+        if not isinstance(self.integrity_repair, bool):
+            raise ValueError(f"{self.table_id}: integrity_repair must be boolean")
+        if int(self.integrity_repair_attempts) < 1:
+            raise ValueError(
+                f"{self.table_id}: integrity_repair_attempts must be >= 1"
             )
         if self.integrity_enabled and self.sync_mode != "append":
             raise ValueError(

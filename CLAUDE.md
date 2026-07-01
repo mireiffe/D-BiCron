@@ -44,4 +44,7 @@ DAG task 순서: `precheck → copy → finalize_watermark → verify → retent
 - retention(=source 삭제)은 파괴적이므로 직전에 `verify` 로 최근 watermark 구간의
   source `count(*)` vs target `uniqExact(key)` 를 비교한다. target 은 distinct key
   로 세야 overlap 재전송 중복(ReplacingMergeTree 머지 전)이 누락을 가리지 않는다.
-  누락 시(on_mismatch=fail) retention 을 막아 source 유실을 방지한다.
+- 누락이 잡히면 그 key 만 골라 재복사(self-heal)한다: source−target key diff →
+  `copier.copy_missing_keys` (watermark 전진 안 함 → resume 무영향, ReplacingMergeTree
+  계열만, dead-letter key 는 제외해 무한 재시도 방지). repair 후에도 남으면
+  on_mismatch=fail 일 때 retention 을 막아 source 유실을 방지한다.

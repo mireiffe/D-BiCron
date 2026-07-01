@@ -1,4 +1,4 @@
-"""Tests for pg2ch.integrity (retention 전 무결성 검사)."""
+"""Tests for pg2ch.integrity — 검사(count/key_diff) + 누락 row 자가복구."""
 
 from __future__ import annotations
 
@@ -6,30 +6,16 @@ from datetime import datetime
 from decimal import Decimal
 
 from pg2ch.config import TableConfig
-from pg2ch.integrity import IntegrityChecker, _ch_literal, _coerce_watermark
+from pg2ch.integrity import IntegrityChecker, _canon_key, _ch_literal, _coerce_watermark
 
 
-# ── fakes ────────────────────────────────────────────────────────
+# ── 검사(verify) 용 큐 기반 fakes ──────────────────────────────────
 
 
-class FakeMeta:
-    def __init__(self, windows):
-        self.windows = windows
-        self.ensured = False
-        self.last_limit = None
-
-    def ensure_schema(self):
-        self.ensured = True
-
-    def recent_run_windows(self, table_id, wm_col, limit):
-        self.last_limit = limit
-        return self.windows[:limit]
-
-
-class FakePGCursor:
+class VPGCur:
     def __init__(self, pg):
         self.pg = pg
-        self._row = None
+        self._r = None
 
     def __enter__(self):
         return self
@@ -38,37 +24,66 @@ class FakePGCursor:
         return False
 
     def execute(self, sql, params=None):
-        self.pg.executed.append((sql, params))
-        self._row = (self.pg.source_counts.pop(0),)
+        self.pg.sql.append((sql, params))
+        if sql.strip().startswith("SELECT count(*)"):
+            self._r = [(self.pg.counts.pop(0),)]
+        else:  # SELECT <key cols> FROM ... WHERE wm > .. (window keys)
+            self._r = list(self.pg.keys.pop(0))
 
     def fetchone(self):
-        return self._row
+        return self._r[0]
+
+    def fetchall(self):
+        return self._r
 
 
-class FakePG:
-    def __init__(self, source_counts):
-        self.source_counts = list(source_counts)
-        self.executed = []
-        self.rollbacks = 0
+class VPG:
+    def __init__(self, counts=(), keys=()):
+        self.counts = list(counts)
+        self.keys = list(keys)
+        self.sql = []
 
     def cursor(self):
-        return FakePGCursor(self)
+        return VPGCur(self)
 
     def rollback(self):
-        self.rollbacks += 1
+        pass
 
 
-class FakeCH:
-    def __init__(self, target_counts):
-        self.target_counts = list(target_counts)
-        self.executed = []
+class VCH:
+    def __init__(self, counts=(), keys=()):
+        self.counts = list(counts)
+        self.keys = list(keys)
+        self.sql = []
 
     def execute(self, sql, params=None, **kw):
-        self.executed.append(sql)
-        return [(self.target_counts.pop(0),)]
+        self.sql.append(sql)
+        s = sql.strip()
+        if s.startswith("SELECT uniqExact") or s.startswith("SELECT count()"):
+            return [(self.counts.pop(0),)]
+        if s.startswith("SELECT DISTINCT"):
+            return list(self.keys.pop(0))
+        return []
 
     def disconnect(self):
         pass
+
+
+class VMeta:
+    def __init__(self, windows, deadletter=()):
+        self.windows = windows
+        self.deadletter = list(deadletter)
+        self.limit = None
+
+    def ensure_schema(self):
+        pass
+
+    def recent_run_windows(self, table_id, wm_col, limit):
+        self.limit = limit
+        return self.windows[:limit]
+
+    def unresolved_failed_keys(self, table_id, key_cols):
+        return list(self.deadletter)
 
 
 def _cfg(**over) -> TableConfig:
@@ -82,6 +97,7 @@ def _cfg(**over) -> TableConfig:
         "watermark_column": "id",
         "timestamp_column": "created_at",
         "order_by": ["id"],
+        "engine": "ReplacingMergeTree",
         "integrity_enabled": True,
     }
     d.update(over)
@@ -95,140 +111,330 @@ def _win(run_id, before, after):
 # ── helpers ──────────────────────────────────────────────────────
 
 
-class TestCoerce:
-    def test_int(self):
-        assert _coerce_watermark("100") == 100
-        assert isinstance(_coerce_watermark("100"), int)
+class TestCoerceAndLiteral:
+    def test_coerce_int(self):
+        assert _coerce_watermark("100") == 100 and isinstance(_coerce_watermark("100"), int)
 
-    def test_decimal(self):
+    def test_coerce_decimal(self):
         assert _coerce_watermark("100.5") == Decimal("100.5")
 
-    def test_datetime(self):
+    def test_coerce_datetime(self):
         assert _coerce_watermark("2026-06-01T12:00:00") == datetime(2026, 6, 1, 12)
 
-    def test_none(self):
-        assert _coerce_watermark(None) is None
-
-
-class TestChLiteral:
-    def test_numeric_bare(self):
+    def test_ch_literal_numeric(self):
         assert _ch_literal("12345") == "12345"
 
-    def test_naive_datetime_preserves_micros(self):
+    def test_ch_literal_datetime_micros(self):
         assert _ch_literal("2026-06-01T12:00:00.123456") == "'2026-06-01 12:00:00.123456'"
 
-    def test_aware_datetime_converted_to_utc(self):
+    def test_ch_literal_aware_to_utc(self):
         assert _ch_literal("2026-06-01T12:00:00+00:00") == "'2026-06-01 12:00:00.000000'"
 
+    def test_canon_key_unifies_types(self):
+        # source int 100 과 dead-letter text "100" 이 같은 canon 이어야 한다.
+        assert _canon_key((100,)) == _canon_key(("100",)) == ("100",)
 
-# ── verify() ─────────────────────────────────────────────────────
+
+# ── verify(): count mode ─────────────────────────────────────────
 
 
-class TestVerify:
-    def test_disabled_returns_without_query(self):
+class TestVerifyCount:
+    def test_disabled(self):
         cfg = _cfg(integrity_enabled=False)
-        pg, ch = FakePG([]), FakeCH([])
-        result = IntegrityChecker(cfg).verify(pg, ch, FakeMeta([]))
-        assert result.status == "disabled"
-        assert pg.executed == [] and ch.executed == []
+        pg, ch = VPG(), VCH()
+        r = IntegrityChecker(cfg).verify(pg, ch, VMeta([]))
+        assert r.status == "disabled"
+        assert pg.sql == [] and ch.sql == []
 
     def test_non_append_skipped(self):
         cfg = _cfg()
-        cfg.sync_mode = "full_reload"  # 검증 우회: verify 의 방어 분기 확인
-        result = IntegrityChecker(cfg).verify(FakePG([]), FakeCH([]), FakeMeta([]))
-        assert result.status == "skipped"
-        assert "append" in result.reason
+        cfg.sync_mode = "full_reload"  # verify 방어 분기
+        r = IntegrityChecker(cfg).verify(VPG(), VCH(), VMeta([]))
+        assert r.status == "skipped" and "append" in r.reason
 
     def test_no_windows_skipped(self):
-        result = IntegrityChecker(_cfg()).verify(FakePG([]), FakeCH([]), FakeMeta([]))
-        assert result.status == "skipped"
-        assert result.reason == "no finalized run windows to check"
+        r = IntegrityChecker(_cfg()).verify(VPG(), VCH(), VMeta([]))
+        assert r.status == "skipped"
+        assert r.reason == "no finalized run windows to check"
 
-    def test_match_is_ok(self):
-        pg, ch = FakePG([100]), FakeCH([100])
-        meta = FakeMeta([_win(5, "1000", "1100")])
-        result = IntegrityChecker(_cfg()).verify(pg, ch, meta)
-        assert result.status == "ok"
-        assert result.missing_rows == 0
-        assert result.source_rows == 100 and result.target_rows == 100
-        assert result.windows_checked == 1
+    def test_match_is_ok_without_keydiff(self):
+        pg, ch = VPG(counts=[3]), VCH(counts=[3])
+        r = IntegrityChecker(_cfg()).verify(pg, ch, VMeta([_win(5, "0", "10")]))
+        assert r.status == "ok" and r.missing_rows == 0
+        # count 가 맞으면 key 조회는 하지 않는다
+        assert not any("DISTINCT" in s for s in ch.sql)
 
-    def test_target_short_is_mismatch(self):
-        pg, ch = FakePG([100]), FakeCH([97])
-        meta = FakeMeta([_win(5, "1000", "1100")])
-        result = IntegrityChecker(_cfg()).verify(pg, ch, meta)
-        assert result.status == "mismatch"
-        assert result.missing_rows == 3
-        assert result.windows[0]["missing"] == 3
+    def test_shortfall_triggers_keydiff(self):
+        pg = VPG(counts=[5], keys=[[(1,), (2,), (3,), (4,), (5,)]])
+        ch = VCH(counts=[2], keys=[[(1,), (2,)]])
+        r = IntegrityChecker(_cfg()).verify(pg, ch, VMeta([_win(5, "0", "10")]))
+        assert r.status == "mismatch"
+        assert r.missing_rows == 3
+        assert set(r._repair_keys) == {(3,), (4,), (5,)}
+        assert any("uniqExact(`id`)" in s for s in ch.sql)
+        assert any("DISTINCT" in s for s in ch.sql)
 
-    def test_target_excess_not_flagged(self):
-        # overlap 중복으로 target distinct 가 더 많아도(이론상) 누락은 아님.
-        pg, ch = FakePG([100]), FakeCH([100])
-        result = IntegrityChecker(_cfg()).verify(pg, ch, FakeMeta([_win(5, "1", "9")]))
-        assert result.status == "ok"
+    def test_deadletter_keys_excluded(self):
+        pg = VPG(counts=[5], keys=[[(1,), (2,), (3,), (4,), (5,)]])
+        ch = VCH(counts=[2], keys=[[(1,), (2,)]])
+        meta = VMeta([_win(5, "0", "10")], deadletter=[("4",)])
+        r = IntegrityChecker(_cfg()).verify(pg, ch, meta)
+        assert r.status == "mismatch"
+        assert r.missing_rows == 2  # 4 는 dead-letter → 제외
+        assert r.deadletter_rows == 1
+        assert set(r._repair_keys) == {(3,), (5,)}
 
-    def test_tolerance_absorbs_small_shortfall(self):
-        pg, ch = FakePG([100]), FakeCH([98])
-        result = IntegrityChecker(_cfg(integrity_tolerance=2)).verify(
-            pg, ch, FakeMeta([_win(5, "1", "9")])
+    def test_tolerance_absorbs(self):
+        pg = VPG(counts=[5], keys=[[(1,), (2,), (3,), (4,), (5,)]])
+        ch = VCH(counts=[3], keys=[[(1,), (2,), (3,)]])
+        r = IntegrityChecker(_cfg(integrity_tolerance=2)).verify(
+            pg, ch, VMeta([_win(5, "0", "10")])
         )
-        assert result.status == "ok"
-        assert result.missing_rows == 2
-
-    def test_tolerance_exceeded_is_mismatch(self):
-        pg, ch = FakePG([100]), FakeCH([97])
-        result = IntegrityChecker(_cfg(integrity_tolerance=2)).verify(
-            pg, ch, FakeMeta([_win(5, "1", "9")])
-        )
-        assert result.status == "mismatch"
+        assert r.status == "ok" and r.missing_rows == 2
 
     def test_first_full_copy_window_skipped(self):
-        # watermark_before=None (첫 전체복사 구간)은 하한 없음 → 스킵.
-        pg, ch = FakePG([]), FakeCH([])
-        meta = FakeMeta([_win(1, None, "1100")])
-        result = IntegrityChecker(_cfg()).verify(pg, ch, meta)
-        assert result.status == "skipped"
-        assert pg.executed == [] and ch.executed == []
-        assert result.windows[0]["status"] == "skipped"
+        pg, ch = VPG(), VCH()
+        r = IntegrityChecker(_cfg()).verify(pg, ch, VMeta([_win(1, None, "10")]))
+        assert r.status == "skipped"
+        assert pg.sql == [] and ch.sql == []
+        assert r.windows[0]["status"] == "skipped"
 
-    def test_lookback_aggregates_multiple_windows(self):
-        pg = FakePG([50, 40, 30])
-        ch = FakeCH([50, 38, 30])  # 두 번째 window 에서 2 누락
-        meta = FakeMeta([
-            _win(7, "200", "300"),
-            _win(6, "100", "200"),
-            _win(5, "1", "100"),
-        ])
-        result = IntegrityChecker(_cfg(integrity_lookback_runs=3)).verify(pg, ch, meta)
-        assert meta.last_limit == 3
-        assert result.windows_checked == 3
-        assert result.source_rows == 120
-        assert result.target_rows == 118
-        assert result.missing_rows == 2
-        assert result.status == "mismatch"
+    def test_lookback_aggregates(self):
+        # window1 ok(count), window2 shortfall→keydiff
+        pg = VPG(counts=[2, 3], keys=[[(10,), (11,), (12,)]])
+        ch = VCH(counts=[2, 1], keys=[[(10,)]])
+        meta = VMeta([_win(7, "20", "30"), _win(6, "10", "20")])
+        r = IntegrityChecker(_cfg(integrity_lookback_runs=2)).verify(pg, ch, meta)
+        assert meta.limit == 2
+        assert r.windows_checked == 2
+        assert r.missing_rows == 2  # window2 에서 11,12
+        assert set(r._repair_keys) == {(11,), (12,)}
+        assert r.status == "mismatch"
 
-    def test_ch_uses_uniqexact_on_key_and_pg_uses_count(self):
-        pg, ch = FakePG([10]), FakeCH([10])
-        IntegrityChecker(_cfg(order_by=["id"])).verify(
-            pg, ch, FakeMeta([_win(5, "1000", "1100")])
+    def test_composite_key(self):
+        pg = VPG(counts=[2], keys=[[(1, "a"), (2, "b")]])
+        ch = VCH(counts=[1], keys=[[(1, "a")]])
+        r = IntegrityChecker(_cfg(order_by=["a", "b"])).verify(
+            pg, ch, VMeta([_win(5, "0", "10")])
         )
-        ch_sql = ch.executed[0]
-        assert "uniqExact(`id`)" in ch_sql
-        assert "`id` > 1000" in ch_sql and "`id` <= 1100" in ch_sql
-        pg_sql, params = pg.executed[0]
-        assert "count(*)" in pg_sql
-        assert params == (1000, 1100)
+        assert r.missing_rows == 1
+        assert set(r._repair_keys) == {(2, "b")}
+        assert any("uniqExact(`a`, `b`)" in s for s in ch.sql)
 
-    def test_composite_key_distinct(self):
-        pg, ch = FakePG([10]), FakeCH([10])
-        IntegrityChecker(_cfg(order_by=["a", "b"])).verify(
-            pg, ch, FakeMeta([_win(5, "1", "9")])
+
+# ── verify(): key_diff mode ──────────────────────────────────────
+
+
+class TestVerifyKeyDiff:
+    def test_always_diffs_no_count(self):
+        pg = VPG(keys=[[(1,), (2,), (3,)]])
+        ch = VCH(keys=[[(1,), (2,), (3,)]])
+        r = IntegrityChecker(_cfg(integrity_method="key_diff")).verify(
+            pg, ch, VMeta([_win(5, "0", "10")])
         )
-        assert "uniqExact(`a`, `b`)" in ch.executed[0]
+        assert r.status == "ok"
+        # count 게이트를 쓰지 않는다
+        assert not any("count(*)" in s for (s, _) in pg.sql)
+        assert not any("uniqExact" in s for s in ch.sql)
+
+    def test_detects_churn_missing(self):
+        # count 는 같지만(둘 다 3) 집합이 달라 누락(3) 이 있는 경우
+        pg = VPG(keys=[[(1,), (2,), (3,)]])
+        ch = VCH(keys=[[(1,), (2,), (9,)]])  # 9=삭제된 옛 key, 3=누락
+        r = IntegrityChecker(_cfg(integrity_method="key_diff")).verify(
+            pg, ch, VMeta([_win(5, "0", "10")])
+        )
+        assert r.status == "mismatch"
+        assert set(r._repair_keys) == {(3,)}
+
+
+# ── key 컬럼이 없을 때(count-only fallback) ──────────────────────
+
+
+class TestNoKeyColumns:
+    def test_string_order_by_falls_back_to_count(self):
+        cfg = _cfg(order_by="id")  # 문자열 식 → plain 컬럼 추출 불가
+        pg, ch = VPG(counts=[5]), VCH(counts=[3])
+        r = IntegrityChecker(cfg).verify(pg, ch, VMeta([_win(5, "0", "10")]))
+        assert r.status == "mismatch"
+        assert r.missing_rows == 2
+        assert r._repair_keys == []  # 재복사 불가 (key 목록 없음)
+        assert any("count()" in s for s in ch.sql)
+
+
+# ── 자가복구 (_run_with_repair) 통합 ─────────────────────────────
+
+
+class HealPGCur:
+    def __init__(self, pg):
+        self.pg = pg
+        self._rows = None
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *a):
+        return False
+
+    def execute(self, sql, params=None):
+        s = sql.strip()
+        if s.startswith("SELECT column_name"):
+            self._rows = [
+                ("id", "integer", "NO", None, None),
+                ("name", "text", "YES", None, None),
+            ]
+        elif s.startswith("SELECT count(*)"):
+            self._rows = [(len(self.pg.keys),)]
+        elif " IN %s" in s:  # _fetch_by_keys
+            wanted = params[0]
+            self._rows = [self.pg.rows[i] for i in wanted if i in self.pg.rows]
+        else:  # window keys
+            self._rows = [(k,) for k in self.pg.keys]
+
+    def fetchone(self):
+        return self._rows[0]
+
+    def fetchall(self):
+        return self._rows
+
+
+class HealPG:
+    def __init__(self, keys, rows):
+        self.keys = keys
+        self.rows = rows
+
+    def cursor(self, name=None):
+        return HealPGCur(self)
+
+    def rollback(self):
+        pass
+
+    def close(self):
+        pass
+
+
+class HealCH:
+    def __init__(self, present):
+        self.present = set(present)
+
+    def execute(self, sql, params=None, **kw):
+        s = sql.strip()
+        if s.startswith("SELECT uniqExact") or s.startswith("SELECT count()"):
+            return [(len(self.present),)]
+        if s.startswith("SELECT DISTINCT"):
+            return [(k,) for k in sorted(self.present)]
+        if s.startswith("INSERT INTO") and isinstance(params, list):
+            for r in params:
+                self.present.add(r[0])
+            return len(params)
+        return []
+
+    def disconnect(self):
+        pass
+
+
+class HealMeta:
+    def __init__(self, windows, deadletter=()):
+        self.windows = windows
+        self.deadletter = list(deadletter)
+        self._id = 0
+        self.runs = []
+        self.finished = []
+
+    def ensure_schema(self):
+        pass
+
+    def recent_run_windows(self, table_id, wm_col, limit):
+        return self.windows[:limit]
+
+    def unresolved_failed_keys(self, table_id, key_cols):
+        return list(self.deadletter)
+
+    def start_run(self, **kw):
+        self._id += 1
+        self.runs.append(kw)
+        return self._id
+
+    def record_batch(self, **kw):
+        return 1
+
+    def finish_run(self, run_id, **kw):
+        self.finished.append(kw)
+
+    def record_failed_rows(self, **kw):
+        pass
+
+
+class TestRunWithRepair:
+    def _rows(self, keys):
+        return {k: (k, f"n{k}") for k in keys}
+
+    def test_heals_missing_then_ok(self):
+        cfg = _cfg()  # engine=ReplacingMergeTree, repair on
+        pg = HealPG([1, 2, 3, 4, 5], self._rows([1, 2, 3, 4, 5]))
+        ch = HealCH(present=[1, 2, 3])  # 4,5 missing
+        meta = HealMeta([_win(5, "0", "10")])
+        r = IntegrityChecker(cfg)._run_with_repair(
+            pg, ch, meta, target_default_db="default", repair=None
+        )
+        assert r.status == "ok"
+        assert r.repaired_rows == 2
+        assert r.repair_attempts_used == 1
+        assert ch.present == {1, 2, 3, 4, 5}
+        # repair run 은 watermark 를 전진시키지 않는다
+        assert meta.runs[-1]["watermark_before"] is None
+        assert meta.runs[-1]["watermark_column"] is None
+
+    def test_no_repair_when_disabled(self):
+        cfg = _cfg(integrity_repair=False)
+        pg = HealPG([1, 2, 3], self._rows([1, 2, 3]))
+        ch = HealCH(present=[1])
+        r = IntegrityChecker(cfg)._run_with_repair(
+            pg, ch, HealMeta([_win(5, "0", "10")]), target_default_db="default",
+            repair=None,
+        )
+        assert r.status == "mismatch"
+        assert r.repaired_rows == 0
+        assert ch.present == {1}
+
+    def test_repair_skipped_for_non_replacing_engine(self):
+        cfg = _cfg(engine="MergeTree")  # 재insert 가 중복을 남길 수 있어 skip
+        pg = HealPG([1, 2, 3], self._rows([1, 2, 3]))
+        ch = HealCH(present=[1])
+        r = IntegrityChecker(cfg)._run_with_repair(
+            pg, ch, HealMeta([_win(5, "0", "10")]), target_default_db="default",
+            repair=None,
+        )
+        assert r.status == "mismatch"
+        assert r.repaired_rows == 0
+        assert ch.present == {1}
+
+    def test_stops_early_when_repair_makes_no_progress(self):
+        # source 에도 없는 row (rows 비어 fetch=0) → 재복사 0 → attempts 소진 전 중단.
+        cfg = _cfg(integrity_repair_attempts=3)
+        pg = HealPG([1, 2, 3], {})  # window 키는 1,2,3 이나 fetch 는 아무것도 못 줌
+        ch = HealCH(present=[1])
+        r = IntegrityChecker(cfg)._run_with_repair(
+            pg, ch, HealMeta([_win(5, "0", "10")]), target_default_db="default",
+            repair=None,
+        )
+        assert r.status == "mismatch"
+        assert r.repaired_rows == 0
+        assert r.repair_attempts_used == 1  # 3 회 허용이지만 진전 없어 1 회에 중단
+
+    def test_repair_arg_overrides_config(self):
+        cfg = _cfg(integrity_repair=True)
+        pg = HealPG([1, 2, 3], self._rows([1, 2, 3]))
+        ch = HealCH(present=[1])
+        r = IntegrityChecker(cfg)._run_with_repair(
+            pg, ch, HealMeta([_win(5, "0", "10")]), target_default_db="default",
+            repair=False,  # CLI --no-repair
+        )
+        assert r.status == "mismatch"
+        assert ch.present == {1}
 
 
 class TestRun:
     def test_disabled_short_circuits_before_connections(self):
-        # integrity_enabled=False 면 connections.json 없이도 즉시 반환해야 한다.
-        result = IntegrityChecker(_cfg(integrity_enabled=False)).run()
-        assert result.status == "disabled"
+        r = IntegrityChecker(_cfg(integrity_enabled=False)).run()
+        assert r.status == "disabled"

@@ -207,3 +207,18 @@ class TestMetaStore:
         conn = FakeConn()
         conn.fetch_queue = [(3,)]
         assert MetaStore(conn).unresolved_failed_count("orders") == 3
+
+    def test_unresolved_failed_keys(self):
+        conn = FakeConn()
+        conn.fetchall_queue = [[("100",), ("101",)]]
+        keys = MetaStore(conn).unresolved_failed_keys("orders", ["id"])
+        assert keys == [("100",), ("101",)]
+        sql, params = conn.executed[-1]
+        assert "row_data->>%s" in sql
+        assert "NOT resolved" in sql
+        assert params == ("id", "orders")
+
+    def test_unresolved_failed_keys_empty_key_cols_noop(self):
+        conn = FakeConn()
+        assert MetaStore(conn).unresolved_failed_keys("orders", []) == []
+        assert conn.executed == []

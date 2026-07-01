@@ -155,9 +155,12 @@ class TestValidation:
     def test_integrity_defaults(self):
         cfg = TableConfig.from_dict(_base(sync_mode="append", watermark_column="id"))
         assert cfg.integrity_enabled is False
+        assert cfg.integrity_method == "count"
         assert cfg.integrity_lookback_runs == 1
         assert cfg.integrity_on_mismatch == "fail"
         assert cfg.integrity_tolerance == 0
+        assert cfg.integrity_repair is True
+        assert cfg.integrity_repair_attempts == 1
 
     def test_integrity_nested_config_ok(self):
         cfg = TableConfig.from_dict(
@@ -166,16 +169,40 @@ class TestValidation:
                 watermark_column="id",
                 integrity={
                     "enabled": True,
+                    "method": "key_diff",
                     "lookback_runs": 3,
                     "on_mismatch": "warn",
                     "tolerance": 5,
+                    "repair": False,
+                    "repair_attempts": 2,
                 },
             )
         )
         assert cfg.integrity_enabled is True
+        assert cfg.integrity_method == "key_diff"
         assert cfg.integrity_lookback_runs == 3
         assert cfg.integrity_on_mismatch == "warn"
         assert cfg.integrity_tolerance == 5
+        assert cfg.integrity_repair is False
+        assert cfg.integrity_repair_attempts == 2
+
+    def test_integrity_bad_method(self):
+        with pytest.raises(ValueError, match="integrity_method must be"):
+            TableConfig.from_dict(
+                _base(
+                    sync_mode="append", watermark_column="id",
+                    integrity={"method": "bogus"},
+                )
+            )
+
+    def test_integrity_repair_attempts_must_be_positive(self):
+        with pytest.raises(ValueError, match="integrity_repair_attempts must be >= 1"):
+            TableConfig.from_dict(
+                _base(
+                    sync_mode="append", watermark_column="id",
+                    integrity={"repair_attempts": 0},
+                )
+            )
 
     def test_integrity_flat_config_ok(self):
         cfg = TableConfig.from_dict(

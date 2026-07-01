@@ -98,21 +98,26 @@ def cmd_verify(args) -> int:
     else:
         configs = [_find_config(args.table_id, args.tables_dir)]
 
+    repair = False if args.no_repair else None
     failures = 0
     for cfg in configs:
         try:
-            result = IntegrityChecker(cfg, connections_path=args.connections).run()
+            result = IntegrityChecker(
+                cfg, connections_path=args.connections
+            ).run(repair=repair)
             print(
                 f"[{result.status}] {cfg.table_id}: windows={result.windows_checked} "
                 f"source={result.source_rows} target={result.target_rows} "
-                f"missing={result.missing_rows} reason={result.reason or '-'}"
+                f"missing={result.missing_rows} deadletter={result.deadletter_rows} "
+                f"repaired={result.repaired_rows} reason={result.reason or '-'}"
             )
             for w in result.windows:
                 if w.get("missing"):
                     print(
                         f"    run_id={w['run_id']} ({w['watermark_lo']} ~ "
                         f"{w['watermark_hi']}]: source={w['source_rows']} "
-                        f"target={w['target_rows']} missing={w['missing']}"
+                        f"target={w['target_rows']} missing={w['missing']} "
+                        f"keys(sample)={w.get('missing_keys_sample')}"
                     )
             if result.status == "mismatch":
                 failures += 1
@@ -154,7 +159,12 @@ def cmd_status(args) -> int:
     print(f"sync_mode       : {cfg.sync_mode}")
     print(f"watermark_column: {wm_col or '-'}")
     print(f"resume watermark: {wm or '(none — next run is a full copy)'}")
-    print(f"integrity       : {'enabled' if cfg.integrity_enabled else 'disabled'}")
+    integrity_desc = (
+        f"enabled (method={cfg.integrity_method}, "
+        f"repair={'on' if cfg.integrity_repair else 'off'})"
+        if cfg.integrity_enabled else "disabled"
+    )
+    print(f"integrity       : {integrity_desc}")
     print(f"retention       : {'enabled' if cfg.retention_enabled else 'disabled'}")
     print(f"unresolved failed rows: {unresolved}")
     return 0
@@ -180,6 +190,10 @@ def build_parser() -> argparse.ArgumentParser:
 
     s = sub.add_parser("verify", help="최근 watermark 구간 무결성 검사")
     s.add_argument("table_id", help="table_id 또는 'all'")
+    s.add_argument(
+        "--no-repair", action="store_true",
+        help="검사만 하고 누락 row 재복사(self-heal)는 하지 않음",
+    )
     s.set_defaults(func=cmd_verify)
 
     s = sub.add_parser("retention", help="PG source retention 1회 실행")

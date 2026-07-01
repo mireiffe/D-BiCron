@@ -1,24 +1,26 @@
-"""copy 무결성 검사 (retention 전 누락 row 탐지).
+"""copy 무결성 검사 + 누락 row 자가복구 (retention 안전장치).
 
-최근 N개 copy_run 의 watermark 구간 ``(watermark_before, watermark_after]`` 에 대해
-  - PG source 의 row 수 (기대값) 와
-  - CH target 의 distinct key 수 (실재값) 를
-비교해, target 에 빠진 row 가 있는지 확인한다.
+최근 N개 copy_run 의 watermark 구간 ``(watermark_before, watermark_after]`` 에서
+PG source 와 CH target 을 비교해 target 에 빠진 row 를 찾고, 켜져 있으면 그 row 만
+다시 복사(self-heal)한 뒤 retention 을 진행한다. retention(=source 삭제) 직전의
+마지막 방어선이다.
 
-retention(=source 삭제) 직전에 실행하는 안전장치다. overlap 을 걸어도 batch 경계
-tie/크래시 등으로 CH 에 안 넘어간 row 가 생길 수 있는데, 그 상태로 retention 이
-source 를 지우면 데이터가 영구 유실된다. 이 검사가 누락을 먼저 잡아 retention 을 막는다.
+두 가지 검사 방식 (integrity_method):
+  - count   : 값싼 게이트. source ``count(*)`` vs target ``uniqExact(key)`` 를 비교하고,
+              모자란 구간만 key-diff 로 정확히 어떤 key 가 빠졌는지 찾는다.
+  - key_diff: 항상 양쪽 key 집합을 끌어와 차집합을 구한다. count 가 우연히 같아
+              가려지는 경우(구간 내 source 삭제 등)까지 잡지만 전송 비용이 크다.
 
-왜 target 은 distinct key 인가:
-  overlap 재전송으로 ReplacingMergeTree 에는 같은 row 가 머지 전까지 중복 존재할 수
-  있다. 그래서 target 의 ``count(*)`` 는 (다른 row 가 빠졌더라도) 중복이 메워
-  누락을 가릴 수 있다. order_by / primary_key(= dedup 키)로 distinct 를 세면 중복에
-  영향받지 않고 "논리적 row 수" 를 본다 → CH 가 모자라면 진짜 누락이다.
+왜 target 을 distinct key 로 보나:
+  overlap 재전송으로 ReplacingMergeTree 에 같은 row 가 머지 전까지 중복 존재할 수
+  있어, target 의 ``count(*)`` 는 누락을 가릴 수 있다. dedup 키(order_by/primary_key)
+  기준으로 봐야 물리 중복에 영향받지 않고 논리적 row 를 본다.
 
-비용:
-  검사 범위를 "최근 run 의 watermark 구간" 으로 한정해, 큰 테이블에서도 전체 스캔
-  없이 최근 slice 만 센다(프로젝트가 precheck 에서 COUNT(*) 를 뺀 이유와 같은 맥락).
-  하한이 없는 구간(append 첫 전체복사 run)은 전체 스캔이 되므로 건너뛴다.
+자가복구(repair):
+  빠진 key 를 ``TableCopier.copy_missing_keys`` 로 재적재한다. watermark 를
+  전진시키지 않으므로 resume 로직과 충돌하지 않는다. ReplacingMergeTree 계열에서만
+  수행한다(그 외 엔진은 재insert 가 중복을 남길 수 있어 skip). 이미 dead-letter 로
+  기록된 row(재복사해도 또 실패)는 누락 대상에서 제외해 무한 재시도를 막는다.
 """
 
 from __future__ import annotations
@@ -31,10 +33,14 @@ from decimal import Decimal, InvalidOperation
 from .chtypes import quote_ch_identifier, quote_ch_string, quote_pg_identifier
 from .config import TableConfig
 from .connections import ch_connect, get_connection, pg_connect
+from .copier import TableCopier
 from .ddl import extract_ch_key_columns
 from .tracking import MetaStore
 
 log = logging.getLogger("pg2ch.integrity")
+
+# 로그/리포트에 남기는 구간별 누락 key 샘플 최대 개수.
+_KEY_SAMPLE = 50
 
 
 @dataclass
@@ -42,24 +48,33 @@ class IntegrityResult:
     table_id: str
     status: str  # ok | mismatch | skipped | disabled
     enabled: bool
+    method: str = "count"
     lookback_runs: int = 0
     windows_checked: int = 0
     source_rows: int = 0
     target_rows: int = 0
-    missing_rows: int = 0
+    missing_rows: int = 0  # target 에 없는 source key 수 (dead-letter 제외) = 판정 기준
+    deadletter_rows: int = 0  # 누락이지만 이미 dead-letter 로 알려진 수 (판정 제외)
+    repaired_rows: int = 0
+    repair_attempts_used: int = 0
     tolerance: int = 0
     windows: list = field(default_factory=list)
     reason: str | None = None
 
+    # 재복사 계획 (내부용 — as_dict/XCom 에는 싣지 않음: 목록이 커질 수 있음).
+    _repair_keys: list = field(default_factory=list, repr=False)
+    _repair_key_cols: list = field(default_factory=list, repr=False)
+
     def as_dict(self) -> dict:
-        return {k: getattr(self, k) for k in self.__dataclass_fields__}
+        return {
+            k: getattr(self, k)
+            for k in self.__dataclass_fields__
+            if not k.startswith("_")
+        }
 
 
 def _coerce_watermark(value):
-    """메타에 TEXT 로 저장된 watermark 를 비교용 파이썬 타입으로 복원.
-
-    숫자형은 int/Decimal 로, ISO timestamp 는 datetime 으로, 그 외는 문자열 그대로.
-    """
+    """메타에 TEXT 로 저장된 watermark 를 비교용 파이썬 타입으로 복원."""
     if value is None:
         return None
     if isinstance(value, (datetime, int, Decimal)):
@@ -94,28 +109,59 @@ def _ch_literal(value) -> str:
     return quote_ch_string(str(v))
 
 
+def _canon_scalar(v) -> str | None:
+    """key 값 하나를 PG/CH/JSON 어디서 왔든 비교 가능한 문자열로 정규화.
+
+    set 비교(source vs target vs dead-letter)를 위해 타입을 문자열로 통일한다.
+    dead-letter 는 JSONB ``->>`` 로 text, source/target 은 드라이버 타입이라
+    문자열 기준으로 맞춰야 교차 비교가 성립한다.
+    """
+    if v is None:
+        return None
+    if isinstance(v, bool):
+        return "1" if v else "0"
+    if isinstance(v, datetime):
+        dt = v.astimezone(timezone.utc).replace(tzinfo=None) if v.tzinfo else v
+        return dt.strftime("%Y-%m-%d %H:%M:%S.%f")
+    if isinstance(v, (bytes, memoryview)):
+        return bytes(v).hex()
+    return str(v)
+
+
+def _canon_key(values) -> tuple:
+    return tuple(_canon_scalar(v) for v in values)
+
+
 class IntegrityChecker:
     def __init__(
         self,
         cfg: TableConfig,
         *,
         connections_path: str | None = None,
+        airflow_context: dict | None = None,
         logger: logging.Logger | None = None,
     ):
         self.cfg = cfg
         self.connections_path = connections_path
+        self.ctx = airflow_context or {}
         self.log = logger or logging.getLogger(f"pg2ch.integrity.{cfg.table_id}")
 
-    def run(self) -> IntegrityResult:
+    # ── public entry ─────────────────────────────────────────
+    def run(self, *, repair: bool | None = None) -> IntegrityResult:
+        """접속을 열어 검사(+자가복구)를 수행. Airflow verify task / CLI 진입점.
+
+        repair=None 이면 설정(integrity_repair)을 따르고, False 면 검사만 한다.
+        """
         cfg = self.cfg
         if not cfg.integrity_enabled:
             return IntegrityResult(
                 table_id=cfg.table_id, status="disabled", enabled=False,
-                reason="integrity_enabled is false",
+                method=cfg.integrity_method, reason="integrity_enabled is false",
             )
         if cfg.sync_mode != "append":
             return IntegrityResult(
                 table_id=cfg.table_id, status="skipped", enabled=True,
+                method=cfg.integrity_method,
                 reason="integrity check requires append sync_mode",
             )
 
@@ -133,9 +179,10 @@ class IntegrityChecker:
             meta.ensure_schema()
             pg_conn = pg_connect(src_cfg)
             ch = ch_connect(tgt_cfg)
-            return self.verify(
+            return self._run_with_repair(
                 pg_conn, ch, meta,
                 target_default_db=tgt_cfg.get("dbname", "default"),
+                repair=repair,
             )
         finally:
             if ch is not None:
@@ -148,26 +195,89 @@ class IntegrityChecker:
             if meta is not None:
                 meta.close()
 
+    def _run_with_repair(
+        self, pg_conn, ch, meta: MetaStore, *,
+        target_default_db: str, repair: bool | None,
+    ) -> IntegrityResult:
+        cfg = self.cfg
+        do_repair = cfg.integrity_repair if repair is None else repair
+        attempts_allowed = 0
+        if do_repair:
+            if self._repair_supported():
+                attempts_allowed = int(cfg.integrity_repair_attempts)
+            else:
+                self.log.warning(
+                    "%s: repair requested but engine %r is not ReplacingMergeTree "
+                    "(re-insert could duplicate); skipping repair",
+                    cfg.table_id, cfg.engine,
+                )
+
+        result = self.verify(pg_conn, ch, meta, target_default_db=target_default_db)
+        repaired_total = 0
+        attempts_used = 0
+        while (
+            result.status == "mismatch"
+            and attempts_used < attempts_allowed
+            and getattr(result, "_repair_keys", None)
+        ):
+            keys = result._repair_keys
+            key_cols = result._repair_key_cols
+            self.log.warning(
+                "%s: integrity mismatch — repairing %d missing key(s) "
+                "(attempt %d/%d)",
+                cfg.table_id, len(keys), attempts_used + 1, attempts_allowed,
+            )
+            copier = TableCopier(
+                cfg, connections_path=self.connections_path,
+                airflow_context=self.ctx,
+            )
+            written, _failed = copier.copy_missing_keys(
+                pg_conn, ch, meta,
+                key_cols=key_cols, keys=keys, target_default_db=target_default_db,
+            )
+            repaired_total += written
+            attempts_used += 1
+            if written == 0:
+                # 재복사로 아무것도 못 채움(=source 에도 없음) → 더 시도해도 무의미.
+                self.log.warning(
+                    "%s: repair re-copied 0 rows; missing rows are not recoverable "
+                    "from source (deleted?) — giving up", cfg.table_id,
+                )
+                break
+            result = self.verify(
+                pg_conn, ch, meta, target_default_db=target_default_db
+            )
+
+        result.repaired_rows = repaired_total
+        result.repair_attempts_used = attempts_used
+        return result
+
+    def _repair_supported(self) -> bool:
+        return "replacingmergetree" in (self.cfg.engine or "").lower()
+
+    # ── detection ────────────────────────────────────────────
     def verify(
         self, pg_conn, ch, meta: MetaStore, *, target_default_db: str = "default",
     ) -> IntegrityResult:
+        """검사만 수행 (재복사 없음). 누락이 있으면 재복사할 key 를 결과에 실어 둔다."""
         cfg = self.cfg
+        method = cfg.integrity_method
         if not cfg.integrity_enabled:
             return IntegrityResult(
                 table_id=cfg.table_id, status="disabled", enabled=False,
-                reason="integrity_enabled is false",
+                method=method, reason="integrity_enabled is false",
             )
         if cfg.sync_mode != "append":
             return IntegrityResult(
                 table_id=cfg.table_id, status="skipped", enabled=True,
-                reason="integrity check requires append sync_mode",
+                method=method, reason="integrity check requires append sync_mode",
             )
 
         wm_col = cfg.effective_watermark_column
         if not wm_col:
             return IntegrityResult(
                 table_id=cfg.table_id, status="skipped", enabled=True,
-                reason="no watermark column to check",
+                method=method, reason="no watermark column to check",
             )
         lookback = int(cfg.integrity_lookback_runs)
         tolerance = int(cfg.integrity_tolerance)
@@ -175,7 +285,7 @@ class IntegrityChecker:
         if not windows:
             return IntegrityResult(
                 table_id=cfg.table_id, status="skipped", enabled=True,
-                lookback_runs=lookback, tolerance=tolerance,
+                method=method, lookback_runs=lookback, tolerance=tolerance,
                 reason="no finalized run windows to check",
             )
 
@@ -185,17 +295,22 @@ class IntegrityChecker:
         )
         if not key_cols:
             self.log.warning(
-                "%s: order_by/primary_key has no plain columns; target uses "
-                "count() and may not detect rows hidden behind duplicates",
+                "%s: order_by/primary_key has no plain columns; falling back to "
+                "count-only check (cannot pinpoint or repair missing rows)",
                 cfg.table_id,
             )
+        deadletter = (
+            {_canon_key(r) for r in meta.unresolved_failed_keys(cfg.table_id, key_cols)}
+            if key_cols else set()
+        )
 
         src_schema, src_name = cfg.source_parts()
         tgt_db, tgt_name = cfg.target_parts(target_default_db)
 
         details: list[dict] = []
+        repair_keys: list[tuple] = []
         checked = 0
-        total_src = total_tgt = total_missing = 0
+        total_src = total_tgt = total_missing = total_deadletter = 0
         for w in windows:
             lo, hi = w["watermark_before"], w["watermark_after"]
             if hi is None:
@@ -207,38 +322,50 @@ class IntegrityChecker:
                 })
                 continue
 
-            src = self._pg_count(pg_conn, src_schema, src_name, wm_col, lo, hi)
-            tgt = self._ch_count(ch, tgt_db, tgt_name, wm_col, key_cols, lo, hi)
-            missing = max(0, src - tgt)
+            src_n, tgt_n, missing_keys, dl_hit = self._check_window(
+                pg_conn, ch, src_schema, src_name, tgt_db, tgt_name,
+                wm_col, key_cols, deadletter, lo, hi, method,
+            )
+            missing = len(missing_keys) if key_cols else max(0, src_n - tgt_n)
             checked += 1
-            total_src += src
-            total_tgt += tgt
+            total_src += src_n
+            total_tgt += tgt_n
             total_missing += missing
+            total_deadletter += dl_hit
+            repair_keys.extend(missing_keys)
             details.append({
-                "run_id": w["run_id"], "watermark_lo": str(lo), "watermark_hi": str(hi),
-                "source_rows": src, "target_rows": tgt, "missing": missing,
+                "run_id": w["run_id"], "watermark_lo": str(lo),
+                "watermark_hi": str(hi), "source_rows": src_n, "target_rows": tgt_n,
+                "missing": missing, "deadletter": dl_hit,
+                "missing_keys_sample": [
+                    list(k) for k in missing_keys[:_KEY_SAMPLE]
+                ],
             })
 
         if checked == 0:
             return IntegrityResult(
                 table_id=cfg.table_id, status="skipped", enabled=True,
-                lookback_runs=lookback, tolerance=tolerance, windows=details,
+                method=method, lookback_runs=lookback, tolerance=tolerance,
+                windows=details,
                 reason="no checkable windows (all without a lower bound)",
             )
 
         status = "mismatch" if total_missing > tolerance else "ok"
         result = IntegrityResult(
-            table_id=cfg.table_id, status=status, enabled=True,
-            lookback_runs=lookback, windows_checked=checked,
-            source_rows=total_src, target_rows=total_tgt,
-            missing_rows=total_missing, tolerance=tolerance, windows=details,
+            table_id=cfg.table_id, status=status, enabled=True, method=method,
+            lookback_runs=lookback, windows_checked=checked, source_rows=total_src,
+            target_rows=total_tgt, missing_rows=total_missing,
+            deadletter_rows=total_deadletter, tolerance=tolerance, windows=details,
         )
+        # 재복사용 key 는 as_dict()/XCom 에 싣지 않도록 언더스코어 속성으로 부착.
+        result._repair_keys = repair_keys
+        result._repair_key_cols = key_cols
         if status == "mismatch":
             self.log.warning(
-                "%s: integrity MISMATCH — source=%d target=%d missing=%d "
-                "across %d window(s) (tolerance=%d): %s",
-                cfg.table_id, total_src, total_tgt, total_missing, checked,
-                tolerance, details,
+                "%s: integrity MISMATCH — missing=%d (deadletter=%d, excluded) "
+                "across %d window(s), tolerance=%d; sample=%s",
+                cfg.table_id, total_missing, total_deadletter, checked, tolerance,
+                [list(k) for k in repair_keys[:_KEY_SAMPLE]],
             )
         else:
             self.log.info(
@@ -247,7 +374,44 @@ class IntegrityChecker:
             )
         return result
 
-    # ── counts ───────────────────────────────────────────────
+    def _check_window(
+        self, pg_conn, ch, src_schema, src_name, tgt_db, tgt_name,
+        wm_col, key_cols, deadletter, lo, hi, method,
+    ):
+        """한 구간 검사 → (source_count, target_count, missing_keys, deadletter_hit).
+
+        count 방식은 값싼 count 게이트를 먼저 보고 모자랄 때만 key-diff 로 정확한
+        누락 key 를 찾는다. key_diff 방식은 항상 key 집합을 비교한다. key_cols 가
+        없으면 count 만 반환한다(누락 key 목록 불가).
+        """
+        if not key_cols:
+            src_n = self._pg_count(pg_conn, src_schema, src_name, wm_col, lo, hi)
+            tgt_n = self._ch_count(ch, tgt_db, tgt_name, wm_col, None, lo, hi)
+            return src_n, tgt_n, [], 0
+
+        if method == "count":
+            src_n = self._pg_count(pg_conn, src_schema, src_name, wm_col, lo, hi)
+            tgt_n = self._ch_count(ch, tgt_db, tgt_name, wm_col, key_cols, lo, hi)
+            if src_n <= tgt_n:
+                return src_n, tgt_n, [], 0
+            # count 가 모자란 구간만 정확히 어떤 key 가 빠졌는지 확인.
+
+        src_map = {}
+        for row in self._pg_keys(
+            pg_conn, src_schema, src_name, wm_col, key_cols, lo, hi
+        ):
+            src_map.setdefault(_canon_key(row), tuple(row))
+        tgt_set = {
+            _canon_key(row)
+            for row in self._ch_keys(ch, tgt_db, tgt_name, wm_col, key_cols, lo, hi)
+        }
+        absent = set(src_map) - tgt_set
+        dl_hit = absent & deadletter
+        missing_canon = absent - deadletter
+        missing_keys = [src_map[c] for c in missing_canon]
+        return len(src_map), len(tgt_set), missing_keys, len(dl_hit)
+
+    # ── counts / key sets ────────────────────────────────────
     @staticmethod
     def _pg_count(pg_conn, src_schema, src_name, wm_col, lo, hi) -> int:
         src_fqn = f"{quote_pg_identifier(src_schema)}.{quote_pg_identifier(src_name)}"
@@ -259,10 +423,7 @@ class IntegrityChecker:
         with pg_conn.cursor() as cur:
             cur.execute(sql, (_coerce_watermark(lo), _coerce_watermark(hi)))
             row = cur.fetchone()
-        try:
-            pg_conn.rollback()  # read 트랜잭션 정리
-        except Exception:
-            pass
+        _rollback(pg_conn)
         return int(row[0]) if row and row[0] is not None else 0
 
     @staticmethod
@@ -279,6 +440,37 @@ class IntegrityChecker:
             f"AND {quote_ch_identifier(wm_col)} <= {_ch_literal(hi)}"
         )
         res = ch.execute(sql)
-        if not res:
-            return 0
-        return int(res[0][0])
+        return int(res[0][0]) if res else 0
+
+    @staticmethod
+    def _pg_keys(pg_conn, src_schema, src_name, wm_col, key_cols, lo, hi):
+        src_fqn = f"{quote_pg_identifier(src_schema)}.{quote_pg_identifier(src_name)}"
+        cols = ", ".join(quote_pg_identifier(c) for c in key_cols)
+        sql = (
+            f"SELECT {cols} FROM {src_fqn} "
+            f"WHERE {quote_pg_identifier(wm_col)} > %s "
+            f"AND {quote_pg_identifier(wm_col)} <= %s"
+        )
+        with pg_conn.cursor() as cur:
+            cur.execute(sql, (_coerce_watermark(lo), _coerce_watermark(hi)))
+            rows = cur.fetchall()
+        _rollback(pg_conn)
+        return rows
+
+    @staticmethod
+    def _ch_keys(ch, tgt_db, tgt_name, wm_col, key_cols, lo, hi):
+        tgt_fqn = f"{quote_ch_identifier(tgt_db)}.{quote_ch_identifier(tgt_name)}"
+        cols = ", ".join(quote_ch_identifier(c) for c in key_cols)
+        sql = (
+            f"SELECT DISTINCT {cols} FROM {tgt_fqn} "
+            f"WHERE {quote_ch_identifier(wm_col)} > {_ch_literal(lo)} "
+            f"AND {quote_ch_identifier(wm_col)} <= {_ch_literal(hi)}"
+        )
+        return ch.execute(sql) or []
+
+
+def _rollback(pg_conn) -> None:
+    try:
+        pg_conn.rollback()  # read 트랜잭션 정리
+    except Exception:
+        pass
