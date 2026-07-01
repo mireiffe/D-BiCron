@@ -117,7 +117,7 @@ def cmd_verify(args) -> int:
                         f"    run_id={w['run_id']} ({w['watermark_lo']} ~ "
                         f"{w['watermark_hi']}]: source={w['source_rows']} "
                         f"target={w['target_rows']} missing={w['missing']} "
-                        f"keys(sample)={w.get('missing_keys_sample')}"
+                        f"sample={w.get('missing_sample')}"
                     )
             if result.status == "mismatch":
                 failures += 1

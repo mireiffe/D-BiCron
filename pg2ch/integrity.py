@@ -39,8 +39,10 @@ from .tracking import MetaStore
 
 log = logging.getLogger("pg2ch.integrity")
 
-# 로그/리포트에 남기는 구간별 누락 key 샘플 최대 개수.
-_KEY_SAMPLE = 50
+# 구조화 결과(windows)에 싣는 구간별 누락 key 샘플 최대 개수. 로그에는 key 자체를
+# 남기지 않고(전량 덤프 방지) 개수·분포만 남긴다. 재복사에는 전체 목록(_repair_keys)을
+# 쓰되 그건 로그/XCom 에 싣지 않는다.
+_MISSING_SAMPLE = 5
 
 
 @dataclass
@@ -337,9 +339,8 @@ class IntegrityChecker:
                 "run_id": w["run_id"], "watermark_lo": str(lo),
                 "watermark_hi": str(hi), "source_rows": src_n, "target_rows": tgt_n,
                 "missing": missing, "deadletter": dl_hit,
-                "missing_keys_sample": [
-                    list(k) for k in missing_keys[:_KEY_SAMPLE]
-                ],
+                # 전량이 아니라 소수 샘플만 (진단용). 로그에는 이것도 남기지 않는다.
+                "missing_sample": [list(k) for k in missing_keys[:_MISSING_SAMPLE]],
             })
 
         if checked == 0:
@@ -361,11 +362,20 @@ class IntegrityChecker:
         result._repair_keys = repair_keys
         result._repair_key_cols = key_cols
         if status == "mismatch":
+            # key 를 통째로 남기지 않는다(대량이면 로그 폭발). 개수 + 구간별 분포만.
+            distribution = [
+                {
+                    "run_id": d["run_id"],
+                    "window": f'({d["watermark_lo"]}, {d["watermark_hi"]}]',
+                    "missing": d["missing"],
+                }
+                for d in details if d.get("missing")
+            ]
             self.log.warning(
                 "%s: integrity MISMATCH — missing=%d (deadletter=%d, excluded) "
-                "across %d window(s), tolerance=%d; sample=%s",
+                "across %d window(s), tolerance=%d; per-window=%s",
                 cfg.table_id, total_missing, total_deadletter, checked, tolerance,
-                [list(k) for k in repair_keys[:_KEY_SAMPLE]],
+                distribution,
             )
         else:
             self.log.info(

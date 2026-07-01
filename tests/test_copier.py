@@ -465,6 +465,12 @@ class TestCopyMissingKeys:
         )
         assert written == 2 and failed == 0
         assert (2, "b") in ch.inserted and (4, "d") in ch.inserted
+        # 단일 컬럼 key 는 = ANY(array) 로 나가야 한다 (큰 IN 리스트 → max_stack_depth 방지)
+        fetch = [q for q, _ in pg.queries if "= ANY(" in q]
+        assert fetch, "repair fetch must use = ANY(array), not a large IN list"
+        # ANY 파라미터는 반드시 list (tuple 이면 IN 구문이 됨)
+        any_params = [p for q, p in pg.queries if "= ANY(" in q][0]
+        assert isinstance(any_params[0], list)
         # repair run 은 watermark 를 전진시키지 않는다 (resume/무결성 window 제외)
         assert meta.started["watermark_before"] is None
         assert meta.started["watermark_column"] is None

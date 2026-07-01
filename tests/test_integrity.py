@@ -211,6 +211,16 @@ class TestVerifyCount:
         assert set(r._repair_keys) == {(11,), (12,)}
         assert r.status == "mismatch"
 
+    def test_missing_sample_is_capped_not_full_dump(self):
+        # 누락이 대량이어도 구조화 결과엔 소수 샘플만(로그 폭발 방지), 개수는 전량.
+        src = [(i,) for i in range(1, 21)]  # 20 개 전부 누락
+        pg = VPG(counts=[20], keys=[src])
+        ch = VCH(counts=[0], keys=[[]])
+        r = IntegrityChecker(_cfg()).verify(pg, ch, VMeta([_win(5, "0", "100")]))
+        assert r.missing_rows == 20
+        assert len(r.windows[0]["missing_sample"]) == 5  # 샘플만
+        assert len(r._repair_keys) == 20  # 재복사는 전량 대상
+
     def test_composite_key(self):
         pg = VPG(counts=[2], keys=[[(1, "a"), (2, "b")]])
         ch = VCH(counts=[1], keys=[[(1, "a")]])
@@ -285,7 +295,7 @@ class HealPGCur:
             ]
         elif s.startswith("SELECT count(*)"):
             self._rows = [(len(self.pg.keys),)]
-        elif " IN %s" in s:  # _fetch_by_keys
+        elif "= ANY(" in s or ") IN %s" in s:  # _fetch_by_keys
             wanted = params[0]
             self._rows = [self.pg.rows[i] for i in wanted if i in self.pg.rows]
         else:  # window keys

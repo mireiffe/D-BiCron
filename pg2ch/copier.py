@@ -57,6 +57,13 @@ def _chunks(seq, size):
         yield seq[i : i + size]
 
 
+# repair 재조회 시 한 번에 거는 key 수. 큰 ``IN (...)`` 리스트는 PostgreSQL 파서가
+# 재귀 처리하다 max_stack_depth 를 넘겨 에러가 나므로 작게 끊는다 (단일 컬럼 key 는
+# ``= ANY(array)`` 로 나가 이 문제가 없지만, 복합 key 의 ``(a,b) IN (...)`` 를 위해
+# 보수적으로 제한한다). insert batch 크기(batch_size)와는 별개다.
+_REPAIR_KEY_CHUNK = 1000
+
+
 @dataclass
 class _Totals:
     rows_read: int = 0
@@ -380,7 +387,7 @@ class TableCopier:
         batch_seq = 0
         t0 = time.monotonic()
         try:
-            for chunk in _chunks(keys, cfg.batch_size):
+            for chunk in _chunks(keys, _REPAIR_KEY_CHUNK):
                 raw_rows = self._fetch_by_keys(
                     pg_conn, src_schema, src_name, select_list, key_cols, chunk
                 )
@@ -436,13 +443,19 @@ class TableCopier:
 
     @staticmethod
     def _fetch_by_keys(pg_conn, src_schema, src_name, select_list, key_cols, chunk):
-        """key 값 chunk 에 해당하는 source row 를 읽는다 (WHERE key IN %s)."""
+        """key 값 chunk 에 해당하는 source row 를 읽는다.
+
+        단일 컬럼 key 는 ``= ANY(%s)`` (배열 파라미터 = 파서 노드 1개)로 나가 큰
+        목록에서도 max_stack_depth 를 넘기지 않는다. 복합 key 는 ``(a,b) IN %s`` 를
+        쓰되 호출부에서 chunk 크기를 작게 제한한다(_REPAIR_KEY_CHUNK).
+        """
         src_fqn = (
             f"{quote_pg_identifier(src_schema)}.{quote_pg_identifier(src_name)}"
         )
         if len(key_cols) == 1:
-            predicate = f"{quote_pg_identifier(key_cols[0])} IN %s"
-            param = (tuple(k[0] if isinstance(k, (tuple, list)) else k for k in chunk),)
+            predicate = f"{quote_pg_identifier(key_cols[0])} = ANY(%s)"
+            # list → PostgreSQL ARRAY (tuple 이면 IN 구문이 되므로 반드시 list).
+            param = ([k[0] if isinstance(k, (tuple, list)) else k for k in chunk],)
         else:
             cols = ", ".join(quote_pg_identifier(c) for c in key_cols)
             predicate = f"({cols}) IN %s"
