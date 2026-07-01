@@ -465,6 +465,8 @@ class TestCopyMissingKeys:
         )
         assert written == 2 and failed == 0
         assert (2, "b") in ch.inserted and (4, "d") in ch.inserted
+        # repair 는 CREATE TABLE 을 재실행하지 않는다 (테이블 존재 보장 + DDL 락 회피)
+        assert not any("CREATE TABLE" in s for s in ch.executed)
         # 단일 컬럼 key 는 = ANY(array) 로 나가야 한다 (큰 IN 리스트 → max_stack_depth 방지)
         fetch = [q for q, _ in pg.queries if "= ANY(" in q]
         assert fetch, "repair fetch must use = ANY(array), not a large IN list"

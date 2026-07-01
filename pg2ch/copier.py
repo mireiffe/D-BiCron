@@ -315,8 +315,12 @@ class TableCopier:
             )
             raise
 
-    def _prepare_target(self, pg_conn, ch, target_default_db: str):
-        """PG introspection + CH 컬럼 매핑 + 대상 테이블 보장. copy / repair 공용.
+    def _prepare_target(self, pg_conn, ch, target_default_db: str, *, ensure_table: bool = True):
+        """PG introspection + CH 컬럼 매핑 (+ ensure_table 시 대상 테이블 보장).
+
+        ensure_table=False 면 CREATE TABLE IF NOT EXISTS 를 건너뛴다. 이미 존재가
+        보장된 상황(repair — 직전 verify 가 이 테이블을 읽었다)에서 재실행이 불필요할
+        뿐 아니라, ClickHouse 쪽 DDL 락/분산 DDL 큐에 걸려 오래 멈출 수 있어 피한다.
 
         반환: (src_schema, src_name, tgt_db, tgt_name, ch_columns, col_names)
         """
@@ -336,12 +340,13 @@ class TableCopier:
             list(key_cols), cfg.use_nullable,
         )
         col_names = [c["name"] for c in ch_columns]
-        ddl = build_create_table_ddl(
-            tgt_db, tgt_name, ch_columns, cfg.order_by, cfg.partition_by,
-            cfg.engine, cfg.primary_key, cfg.indexes, cfg.settings,
-        )
-        self.log.info("ensuring target table %s.%s", tgt_db, tgt_name)
-        ch.execute(ddl)
+        if ensure_table:
+            ddl = build_create_table_ddl(
+                tgt_db, tgt_name, ch_columns, cfg.order_by, cfg.partition_by,
+                cfg.engine, cfg.primary_key, cfg.indexes, cfg.settings,
+            )
+            self.log.info("ensuring target table %s.%s", tgt_db, tgt_name)
+            ch.execute(ddl)
         return src_schema, src_name, tgt_db, tgt_name, ch_columns, col_names
 
     def copy_missing_keys(
@@ -364,8 +369,16 @@ class TableCopier:
         if not keys or not key_cols:
             return 0, 0
         meta.ensure_schema()
+        # 대상 테이블은 직전 verify 가 이미 읽었으므로 존재가 보장된다 → CREATE 재실행
+        # 생략(불필요 + ClickHouse DDL 락에 걸려 멈추는 것을 피함).
         (src_schema, src_name, tgt_db, tgt_name, ch_columns,
-         col_names) = self._prepare_target(pg_conn, ch, target_default_db)
+         col_names) = self._prepare_target(
+            pg_conn, ch, target_default_db, ensure_table=False
+        )
+        self.log.info(
+            "%s: repair fetching %d missing row(s) into %s.%s",
+            cfg.source_table, len(keys), tgt_db, tgt_name,
+        )
         transformer = build_transformer(ch_columns)
         col_insert = ", ".join(quote_ch_identifier(c) for c in col_names)
         insert_sql = (
