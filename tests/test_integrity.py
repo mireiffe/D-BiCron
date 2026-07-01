@@ -295,10 +295,7 @@ class HealPGCur:
             ]
         elif s.startswith("SELECT count(*)"):
             self._rows = [(len(self.pg.keys),)]
-        elif "= ANY(" in s or ") IN %s" in s:  # _fetch_by_keys
-            wanted = params[0]
-            self._rows = [self.pg.rows[i] for i in wanted if i in self.pg.rows]
-        else:  # window keys
+        else:  # window keys (verify 의 _pg_keys)
             self._rows = [(k,) for k in self.pg.keys]
 
     def fetchone(self):
@@ -308,13 +305,33 @@ class HealPGCur:
         return self._rows
 
 
+class HealStreamCur:
+    """repair 의 named server-side cursor — window 전체 row 를 스트리밍."""
+
+    def __init__(self, pg):
+        self._rows = [pg.rows[k] for k in pg.keys if k in pg.rows]
+        self.itersize = None
+
+    def execute(self, q, p=None):
+        pass
+
+    def fetchmany(self, n):
+        chunk = self._rows[:n]
+        self._rows = self._rows[n:]
+        return chunk
+
+    def close(self):
+        pass
+
+
 class HealPG:
     def __init__(self, keys, rows):
         self.keys = keys
         self.rows = rows
 
     def cursor(self, name=None):
-        return HealPGCur(self)
+        # repair 는 named cursor 로 window 를 스트리밍, verify 는 unnamed 로 조회.
+        return HealStreamCur(self) if name is not None else HealPGCur(self)
 
     def rollback(self):
         pass

@@ -51,17 +51,6 @@ def _wm_str(v) -> str | None:
     return str(v)
 
 
-def _chunks(seq, size):
-    size = max(1, int(size))
-    for i in range(0, len(seq), size):
-        yield seq[i : i + size]
-
-
-# repair 재조회 시 한 번에 거는 key 수. 큰 ``IN (...)`` 리스트는 PostgreSQL 파서가
-# 재귀 처리하다 max_stack_depth 를 넘겨 에러가 나므로 작게 끊는다 (단일 컬럼 key 는
-# ``= ANY(array)`` 로 나가 이 문제가 없지만, 복합 key 의 ``(a,b) IN (...)`` 를 위해
-# 보수적으로 제한한다). insert batch 크기(batch_size)와는 별개다.
-_REPAIR_KEY_CHUNK = 1000
 
 
 @dataclass
@@ -362,16 +351,18 @@ class TableCopier:
         ReplacingMergeTree 계열에서 idempotent(중복 재insert 는 머지로 dedup)하며,
         재적재 중에도 실패하는 row 는 기존 dead-letter 경로로 보관된다.
 
-        wm_lo/wm_hi (누락 key 가 속한 watermark 구간의 하한/상한)가 주어지면 fetch 를
-        그 구간으로 제한한다. 이렇게 하면 key 컬럼에 인덱스가 없어도 source 의 watermark
-        인덱스로 스캔이 최근 slice 로 좁혀져, chunk 마다 전체 seq scan 을 도는 것을 막는다.
+        구현: 누락 key 들이 걸친 watermark 구간 (wm_lo, wm_hi] 을 **한 번만** 스트리밍
+        스캔하고(=source 의 watermark 인덱스로 최근 slice 만), 배치마다 빠진 key 에
+        해당하는 row 만 골라 넣는다. key 로 여러 번 조회(chunk 마다 재스캔)하지 않으므로
+        source 에 wm 인덱스만 있어도 스캔이 1회로 끝난다. 모든 누락 key 를 찾으면
+        구간 끝까지 가지 않고 조기 종료한다. 단일/복합 key 모두 동일 경로.
 
         반환: (rows_written, rows_failed).
         """
         cfg = self.cfg
-        keys = list(keys)
         key_cols = list(key_cols)
-        if not keys or not key_cols:
+        missing = {tuple(k) for k in keys}
+        if not missing or not key_cols:
             return 0, 0
         meta.ensure_schema()
         # 대상 테이블은 직전 verify 가 이미 읽었으므로 존재가 보장된다 → CREATE 재실행
@@ -381,8 +372,8 @@ class TableCopier:
             pg_conn, ch, target_default_db, ensure_table=False
         )
         self.log.info(
-            "%s: repair fetching %d missing row(s) into %s.%s",
-            cfg.source_table, len(keys), tgt_db, tgt_name,
+            "%s: repair scanning window for %d missing row(s) into %s.%s",
+            cfg.source_table, len(missing), tgt_db, tgt_name,
         )
         transformer = build_transformer(ch_columns)
         col_insert = ", ".join(quote_ch_identifier(c) for c in col_names)
@@ -392,7 +383,11 @@ class TableCopier:
         )
         wm_col = cfg.effective_watermark_column
         wm_idx = col_names.index(wm_col) if wm_col and wm_col in col_names else None
+        key_idx = [col_names.index(c) for c in key_cols]
         select_list = self._pg_select_list(ch_columns)
+        query, params = self._repair_window_query(
+            src_schema, src_name, select_list, wm_col, wm_lo, wm_hi
+        )
 
         run_id = meta.start_run(
             table_id=cfg.table_id, source_table=cfg.source_table,
@@ -401,17 +396,28 @@ class TableCopier:
             dag_id=self.ctx.get("dag_id"), airflow_run_id=self.ctx.get("run_id"),
             task_id=self.ctx.get("task_id"), try_number=self.ctx.get("try_number"),
         )
+        remaining = set(missing)
         total_written = total_failed = 0
         batch_seq = 0
         t0 = time.monotonic()
+        cursor = pg_conn.cursor(name=f"pg2ch_repair_{cfg.table_id}")
+        cursor.itersize = cfg.batch_size
         try:
-            for chunk in _chunks(keys, _REPAIR_KEY_CHUNK):
-                raw_rows = self._fetch_by_keys(
-                    pg_conn, src_schema, src_name, select_list, key_cols, chunk,
-                    wm_col=wm_col, wm_lo=wm_lo, wm_hi=wm_hi,
-                )
+            if params:
+                cursor.execute(query, params)
+            else:
+                cursor.execute(query)
+            while remaining:
+                raw_all = cursor.fetchmany(cfg.batch_size)
+                if not raw_all:
+                    break
+                raw_rows = []
+                for r in raw_all:
+                    k = tuple(r[i] for i in key_idx)
+                    if k in remaining:
+                        remaining.discard(k)
+                        raw_rows.append(r)
                 if not raw_rows:
-                    batch_seq += 1
                     continue
                 xrows = (
                     [transformer(r) for r in raw_rows] if transformer
@@ -436,10 +442,11 @@ class TableCopier:
                 total_failed += rows_failed
                 batch_seq += 1
                 self.log.info(
-                    "%s: repair batch %d — fetched=%d written=%d (total %d/%d keys)",
+                    "%s: repair batch %d — matched=%d written=%d (found %d/%d keys)",
                     cfg.source_table, batch_seq, len(raw_rows), written,
-                    total_written + total_failed, len(keys),
+                    len(missing) - len(remaining), len(missing),
                 )
+            cursor.close()
             status = "partial" if total_failed else "success"
             meta.finish_run(
                 run_id, status=status, watermark_after=None,
@@ -451,9 +458,14 @@ class TableCopier:
                 pg_conn.rollback()  # read 트랜잭션 정리
             except Exception:
                 pass
+            if remaining:
+                self.log.warning(
+                    "%s: repair could not find %d/%d missing key(s) in source "
+                    "window (deleted?)", cfg.source_table, len(remaining), len(missing),
+                )
             self.log.info(
-                "%s: repair re-copied %d row(s) (%d failed) for %d missing key(s)",
-                cfg.source_table, total_written, total_failed, len(keys),
+                "%s: repair re-copied %d row(s) (%d failed) of %d missing key(s)",
+                cfg.source_table, total_written, total_failed, len(missing),
             )
             return total_written, total_failed
         except Exception as e:
@@ -467,39 +479,20 @@ class TableCopier:
             raise
 
     @staticmethod
-    def _fetch_by_keys(
-        pg_conn, src_schema, src_name, select_list, key_cols, chunk,
-        *, wm_col=None, wm_lo=None, wm_hi=None,
-    ):
-        """key 값 chunk 에 해당하는 source row 를 읽는다.
-
-        단일 컬럼 key 는 ``= ANY(%s)`` (배열 파라미터 = 파서 노드 1개)로 나가 큰
-        목록에서도 max_stack_depth 를 넘기지 않는다. 복합 key 는 ``(a,b) IN %s`` 를
-        쓰되 호출부에서 chunk 크기를 작게 제한한다(_REPAIR_KEY_CHUNK).
-
-        wm_col/wm_lo/wm_hi 가 주어지면 watermark 구간 조건을 함께 걸어, key 컬럼에
-        인덱스가 없어도 source 의 watermark 인덱스로 스캔을 최근 slice 로 좁힌다.
-        """
+    def _repair_window_query(src_schema, src_name, select_list, wm_col, wm_lo, wm_hi):
+        """repair 스캔 쿼리. watermark 구간이 주어지면 그 범위로 제한(wm 인덱스 사용)."""
         src_fqn = (
             f"{quote_pg_identifier(src_schema)}.{quote_pg_identifier(src_name)}"
         )
-        if len(key_cols) == 1:
-            conds = [f"{quote_pg_identifier(key_cols[0])} = ANY(%s)"]
-            # list → PostgreSQL ARRAY (tuple 이면 IN 구문이 되므로 반드시 list).
-            params = [[k[0] if isinstance(k, (tuple, list)) else k for k in chunk]]
-        else:
-            cols = ", ".join(quote_pg_identifier(c) for c in key_cols)
-            conds = [f"({cols}) IN %s"]
-            params = [tuple(tuple(k) for k in chunk)]
         if wm_col and wm_lo is not None and wm_hi is not None:
-            conds.append(f"{quote_pg_identifier(wm_col)} > %s")
-            conds.append(f"{quote_pg_identifier(wm_col)} <= %s")
-            params.append(wm_lo)
-            params.append(wm_hi)
-        query = f"SELECT {select_list} FROM {src_fqn} WHERE {' AND '.join(conds)}"
-        with pg_conn.cursor() as cur:
-            cur.execute(query, tuple(params))
-            return cur.fetchall()
+            query = (
+                f"SELECT {select_list} FROM {src_fqn} "
+                f"WHERE {quote_pg_identifier(wm_col)} > %s "
+                f"AND {quote_pg_identifier(wm_col)} <= %s"
+            )
+            return query, (wm_lo, wm_hi)
+        # wm 구간을 모르면 전체 스캔 (defensive; integrity 는 항상 구간을 준다).
+        return f"SELECT {select_list} FROM {src_fqn}", None
 
     def inspect_copy_plan(self, meta: MetaStore) -> CopyPlan:
         """현재 resume watermark / sync_since 로 copy 계획(mode/cutoff)을 산출한다.

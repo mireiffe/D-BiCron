@@ -411,68 +411,27 @@ class TestCopyFlow:
 
 
 # ── copy_missing_keys (integrity self-heal) ──────────────────────
-
-
-class FakeKeyCursor:
-    """introspection + 'WHERE key IN %s' 재조회를 라우팅하는 unnamed 커서."""
-
-    def __init__(self, pg):
-        self.pg = pg
-        self._rows = []
-
-    def __enter__(self):
-        return self
-
-    def __exit__(self, *a):
-        return False
-
-    def execute(self, sql, params=None):
-        self.pg.queries.append((sql, params))
-        if sql.strip().startswith("SELECT column_name"):
-            self._rows = list(COLS)
-        else:  # SELECT ... WHERE "id" IN %s
-            wanted = params[0]
-            self._rows = [self.pg.rows[i] for i in wanted if i in self.pg.rows]
-
-    def fetchall(self):
-        return self._rows
-
-
-class FakeKeyPG:
-    def __init__(self, rows):
-        self.rows = rows  # {id: (id, name)}
-        self.queries = []
-        self.rolled_back = False
-
-    def cursor(self, name=None):
-        return FakeKeyCursor(self)
-
-    def rollback(self):
-        self.rolled_back = True
-
-    def close(self):
-        pass
+#
+# repair 는 watermark 구간을 named server-side cursor 로 한 번 스트리밍 스캔하고
+# (introspection 은 unnamed cursor), 배치마다 빠진 key 에 해당하는 row 만 골라 넣는다.
+# 그래서 위의 FakePG(COLS, rows) 를 그대로 재사용한다.
 
 
 class TestCopyMissingKeys:
-    def test_recopies_and_does_not_advance_watermark(self):
+    def test_recopies_only_missing_keys_and_keeps_watermark(self):
         cfg = _cfg(sync_mode="append", watermark_column="id", engine="ReplacingMergeTree")
-        pg = FakeKeyPG({2: (2, "b"), 4: (4, "d")})
+        pg = FakePG(COLS, [(1, "a"), (2, "b"), (3, "c"), (4, "d")])
         ch = FakeCH()
         meta = FakeMeta()
         written, failed = TableCopier(cfg).copy_missing_keys(
             pg, ch, meta, key_cols=["id"], keys=[(2,), (4,)], target_default_db="default"
         )
         assert written == 2 and failed == 0
+        # window 를 훑되 빠진 key 만 넣는다
         assert (2, "b") in ch.inserted and (4, "d") in ch.inserted
+        assert (1, "a") not in ch.inserted and (3, "c") not in ch.inserted
         # repair 는 CREATE TABLE 을 재실행하지 않는다 (테이블 존재 보장 + DDL 락 회피)
         assert not any("CREATE TABLE" in s for s in ch.executed)
-        # 단일 컬럼 key 는 = ANY(array) 로 나가야 한다 (큰 IN 리스트 → max_stack_depth 방지)
-        fetch = [q for q, _ in pg.queries if "= ANY(" in q]
-        assert fetch, "repair fetch must use = ANY(array), not a large IN list"
-        # ANY 파라미터는 반드시 list (tuple 이면 IN 구문이 됨)
-        any_params = [p for q, p in pg.queries if "= ANY(" in q][0]
-        assert isinstance(any_params[0], list)
         # repair run 은 watermark 를 전진시키지 않는다 (resume/무결성 window 제외)
         assert meta.started["watermark_before"] is None
         assert meta.started["watermark_column"] is None
@@ -480,25 +439,39 @@ class TestCopyMissingKeys:
         assert meta.finished["status"] == "success"
         assert pg.rolled_back is True
 
-    def test_fetch_is_bounded_by_watermark_range(self):
-        # wm_lo/wm_hi 를 주면 fetch 가 watermark 구간으로 제한된다 (source seq scan 방지).
+    def test_scan_is_bounded_by_watermark_range(self):
+        # wm_lo/wm_hi 를 주면 스캔이 watermark 구간으로 제한된다 (source seq scan 방지).
         cfg = _cfg(
             sync_mode="append", watermark_column="updated_at",
             engine="ReplacingMergeTree",
         )
-        pg = FakeKeyPG({2: (2, "b"), 4: (4, "d")})
+        pg = FakePG(COLS, [(2, "b"), (4, "d")])
         ch = FakeCH()
         meta = FakeMeta()
         TableCopier(cfg).copy_missing_keys(
             pg, ch, meta, key_cols=["id"], keys=[(2,), (4,)],
             target_default_db="default", wm_lo=0, wm_hi=100,
         )
-        fetch = [q for q, _ in pg.queries if "= ANY(" in q][0]
-        assert '"updated_at" > %s' in fetch and '"updated_at" <= %s' in fetch
+        assert '"updated_at" > %s' in pg.stream.query
+        assert '"updated_at" <= %s' in pg.stream.query
+        assert pg.stream.params == (0, 100)
+
+    def test_early_stops_once_all_missing_found(self):
+        # 모든 누락 key 를 찾으면 window 끝까지 스캔하지 않는다.
+        cfg = _cfg(sync_mode="append", watermark_column="id", batch_size=1)
+        pg = FakePG(COLS, [(1, "a"), (2, "b"), (3, "c"), (4, "d"), (5, "e")])
+        ch = FakeCH()
+        meta = FakeMeta()
+        TableCopier(cfg).copy_missing_keys(
+            pg, ch, meta, key_cols=["id"], keys=[(2,)], target_default_db="default"
+        )
+        assert (2, "b") in ch.inserted
+        # 1,2 만 읽고 멈춤 → 3,4,5 는 아직 스캔 전
+        assert pg.stream.rows == [(3, "c"), (4, "d"), (5, "e")]
 
     def test_empty_keys_is_noop(self):
         cfg = _cfg(sync_mode="append", watermark_column="id")
-        pg = FakeKeyPG({})
+        pg = FakePG(COLS, [])
         ch = FakeCH()
         meta = FakeMeta()
         assert TableCopier(cfg).copy_missing_keys(
@@ -511,7 +484,7 @@ class TestCopyMissingKeys:
             sync_mode="append", watermark_column="id",
             engine="ReplacingMergeTree", on_row_error="dead_letter",
         )
-        pg = FakeKeyPG({2: (2, "b"), 3: (3, "BAD")})
+        pg = FakePG(COLS, [(2, "b"), (3, "BAD")])
         ch = FakeCH(bad=lambda r: r[1] == "BAD")
         meta = FakeMeta()
         written, failed = TableCopier(cfg).copy_missing_keys(

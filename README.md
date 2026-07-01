@@ -95,14 +95,13 @@ dead-letter 에 보존됨) 파이프라인이 멈추지 않는다 — 이때 run
 
 누락이 잡히면 그냥 실패시키지 않고, **빠진 그 row 만 골라 다시 복사(self-heal)** 한 뒤
 재검사한다. count 게이트가 모자란 구간에서 양쪽 **key 집합의 차(source − target)** 를
-구해 정확히 어떤 key 가 빠졌는지 찾고(`integrity_method: count`), 그 key 들만
-source 에서 다시 읽어(단일 key 는 `key = ANY(array)`, 복합 key 는 작게 끊은 `IN`)
-재적재한다.
+구해 정확히 어떤 key 가 빠졌는지 찾고(`integrity_method: count`), 그 row 들을 재적재한다.
 
-- **fetch 는 누락 key 가 속한 watermark 구간으로 제한**된다. 그래서 key 컬럼에 인덱스가
-  없어도 source 의 watermark 인덱스로 스캔이 최근 slice 로 좁혀진다(구간 제한이 없으면
-  chunk 마다 source 전체 seq scan 을 돌아 아주 느려진다 — watermark 컬럼은 증분 copy 가
-  이미 의존하므로 인덱스가 있는 것이 정상이다).
+- **재적재는 누락 key 가 걸친 watermark 구간을 한 번만 스트리밍 스캔**하고, 배치마다 빠진
+  key 에 해당하는 row 만 골라 넣는다(모두 찾으면 조기 종료). key 로 여러 번 조회하지
+  않으므로 **source 에 watermark 인덱스만 있어도 스캔이 1회**로 끝난다 — key 컬럼 인덱스가
+  없어도 된다. (증분 copy 가 이미 `WHERE wm > cutoff` 로 그 인덱스에 의존하므로 있는 것이
+  정상이다. watermark 인덱스조차 없으면 이 스캔이 전체 테이블 seq scan 이 되어 느리다.)
 - **watermark 를 전진시키지 않는다** — repair 는 watermark_before/after 를 NULL 로 남겨
   resume·window 계산에서 제외되므로, 이미 지나간 구간의 누락도 다시 채울 수 있다.
 - **ReplacingMergeTree 계열에서만** 수행한다(재insert 가 머지로 dedup 되어 idempotent).
