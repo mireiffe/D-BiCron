@@ -352,6 +352,7 @@ class TableCopier:
     def copy_missing_keys(
         self, pg_conn, ch, meta: MetaStore, *,
         key_cols, keys, target_default_db: str = "default",
+        wm_lo=None, wm_hi=None,
     ) -> tuple[int, int]:
         """빠진 key 목록의 row 만 source 에서 다시 읽어 target 에 재적재(self-heal).
 
@@ -360,6 +361,10 @@ class TableCopier:
         watermark_before/after 를 NULL 로 남겨 resume/무결성 window 계산에서 제외된다.
         ReplacingMergeTree 계열에서 idempotent(중복 재insert 는 머지로 dedup)하며,
         재적재 중에도 실패하는 row 는 기존 dead-letter 경로로 보관된다.
+
+        wm_lo/wm_hi (누락 key 가 속한 watermark 구간의 하한/상한)가 주어지면 fetch 를
+        그 구간으로 제한한다. 이렇게 하면 key 컬럼에 인덱스가 없어도 source 의 watermark
+        인덱스로 스캔이 최근 slice 로 좁혀져, chunk 마다 전체 seq scan 을 도는 것을 막는다.
 
         반환: (rows_written, rows_failed).
         """
@@ -402,9 +407,11 @@ class TableCopier:
         try:
             for chunk in _chunks(keys, _REPAIR_KEY_CHUNK):
                 raw_rows = self._fetch_by_keys(
-                    pg_conn, src_schema, src_name, select_list, key_cols, chunk
+                    pg_conn, src_schema, src_name, select_list, key_cols, chunk,
+                    wm_col=wm_col, wm_lo=wm_lo, wm_hi=wm_hi,
                 )
                 if not raw_rows:
+                    batch_seq += 1
                     continue
                 xrows = (
                     [transformer(r) for r in raw_rows] if transformer
@@ -428,6 +435,11 @@ class TableCopier:
                 total_written += written
                 total_failed += rows_failed
                 batch_seq += 1
+                self.log.info(
+                    "%s: repair batch %d — fetched=%d written=%d (total %d/%d keys)",
+                    cfg.source_table, batch_seq, len(raw_rows), written,
+                    total_written + total_failed, len(keys),
+                )
             status = "partial" if total_failed else "success"
             meta.finish_run(
                 run_id, status=status, watermark_after=None,
@@ -455,27 +467,38 @@ class TableCopier:
             raise
 
     @staticmethod
-    def _fetch_by_keys(pg_conn, src_schema, src_name, select_list, key_cols, chunk):
+    def _fetch_by_keys(
+        pg_conn, src_schema, src_name, select_list, key_cols, chunk,
+        *, wm_col=None, wm_lo=None, wm_hi=None,
+    ):
         """key 값 chunk 에 해당하는 source row 를 읽는다.
 
         단일 컬럼 key 는 ``= ANY(%s)`` (배열 파라미터 = 파서 노드 1개)로 나가 큰
         목록에서도 max_stack_depth 를 넘기지 않는다. 복합 key 는 ``(a,b) IN %s`` 를
         쓰되 호출부에서 chunk 크기를 작게 제한한다(_REPAIR_KEY_CHUNK).
+
+        wm_col/wm_lo/wm_hi 가 주어지면 watermark 구간 조건을 함께 걸어, key 컬럼에
+        인덱스가 없어도 source 의 watermark 인덱스로 스캔을 최근 slice 로 좁힌다.
         """
         src_fqn = (
             f"{quote_pg_identifier(src_schema)}.{quote_pg_identifier(src_name)}"
         )
         if len(key_cols) == 1:
-            predicate = f"{quote_pg_identifier(key_cols[0])} = ANY(%s)"
+            conds = [f"{quote_pg_identifier(key_cols[0])} = ANY(%s)"]
             # list → PostgreSQL ARRAY (tuple 이면 IN 구문이 되므로 반드시 list).
-            param = ([k[0] if isinstance(k, (tuple, list)) else k for k in chunk],)
+            params = [[k[0] if isinstance(k, (tuple, list)) else k for k in chunk]]
         else:
             cols = ", ".join(quote_pg_identifier(c) for c in key_cols)
-            predicate = f"({cols}) IN %s"
-            param = (tuple(tuple(k) for k in chunk),)
-        query = f"SELECT {select_list} FROM {src_fqn} WHERE {predicate}"
+            conds = [f"({cols}) IN %s"]
+            params = [tuple(tuple(k) for k in chunk)]
+        if wm_col and wm_lo is not None and wm_hi is not None:
+            conds.append(f"{quote_pg_identifier(wm_col)} > %s")
+            conds.append(f"{quote_pg_identifier(wm_col)} <= %s")
+            params.append(wm_lo)
+            params.append(wm_hi)
+        query = f"SELECT {select_list} FROM {src_fqn} WHERE {' AND '.join(conds)}"
         with pg_conn.cursor() as cur:
-            cur.execute(query, param)
+            cur.execute(query, tuple(params))
             return cur.fetchall()
 
     def inspect_copy_plan(self, meta: MetaStore) -> CopyPlan:

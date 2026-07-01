@@ -66,6 +66,9 @@ class IntegrityResult:
     # 재복사 계획 (내부용 — as_dict/XCom 에는 싣지 않음: 목록이 커질 수 있음).
     _repair_keys: list = field(default_factory=list, repr=False)
     _repair_key_cols: list = field(default_factory=list, repr=False)
+    # 누락 key 들이 걸친 watermark 구간(union). repair fetch 를 이 구간으로 좁힌다.
+    _repair_wm_lo: object = field(default=None, repr=False)
+    _repair_wm_hi: object = field(default=None, repr=False)
 
     def as_dict(self) -> dict:
         return {
@@ -236,6 +239,7 @@ class IntegrityChecker:
             written, _failed = copier.copy_missing_keys(
                 pg_conn, ch, meta,
                 key_cols=key_cols, keys=keys, target_default_db=target_default_db,
+                wm_lo=result._repair_wm_lo, wm_hi=result._repair_wm_hi,
             )
             repaired_total += written
             attempts_used += 1
@@ -311,6 +315,8 @@ class IntegrityChecker:
 
         details: list[dict] = []
         repair_keys: list[tuple] = []
+        contrib_los: list = []  # 누락이 있는 window 들의 (coerce 된) watermark 하한/상한
+        contrib_his: list = []
         checked = 0
         total_src = total_tgt = total_missing = total_deadletter = 0
         for w in windows:
@@ -335,6 +341,9 @@ class IntegrityChecker:
             total_missing += missing
             total_deadletter += dl_hit
             repair_keys.extend(missing_keys)
+            if missing_keys:
+                contrib_los.append(_coerce_watermark(lo))
+                contrib_his.append(_coerce_watermark(hi))
             details.append({
                 "run_id": w["run_id"], "watermark_lo": str(lo),
                 "watermark_hi": str(hi), "source_rows": src_n, "target_rows": tgt_n,
@@ -361,6 +370,9 @@ class IntegrityChecker:
         # 재복사용 key 는 as_dict()/XCom 에 싣지 않도록 언더스코어 속성으로 부착.
         result._repair_keys = repair_keys
         result._repair_key_cols = key_cols
+        # 누락 key 들이 걸친 watermark union 구간 → repair fetch 를 이 범위로 제한.
+        result._repair_wm_lo = min(contrib_los) if contrib_los else None
+        result._repair_wm_hi = max(contrib_his) if contrib_his else None
         if status == "mismatch":
             # key 를 통째로 남기지 않는다(대량이면 로그 폭발). 개수 + 구간별 분포만.
             distribution = [

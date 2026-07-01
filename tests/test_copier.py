@@ -480,6 +480,22 @@ class TestCopyMissingKeys:
         assert meta.finished["status"] == "success"
         assert pg.rolled_back is True
 
+    def test_fetch_is_bounded_by_watermark_range(self):
+        # wm_lo/wm_hi 를 주면 fetch 가 watermark 구간으로 제한된다 (source seq scan 방지).
+        cfg = _cfg(
+            sync_mode="append", watermark_column="updated_at",
+            engine="ReplacingMergeTree",
+        )
+        pg = FakeKeyPG({2: (2, "b"), 4: (4, "d")})
+        ch = FakeCH()
+        meta = FakeMeta()
+        TableCopier(cfg).copy_missing_keys(
+            pg, ch, meta, key_cols=["id"], keys=[(2,), (4,)],
+            target_default_db="default", wm_lo=0, wm_hi=100,
+        )
+        fetch = [q for q, _ in pg.queries if "= ANY(" in q][0]
+        assert '"updated_at" > %s' in fetch and '"updated_at" <= %s' in fetch
+
     def test_empty_keys_is_noop(self):
         cfg = _cfg(sync_mode="append", watermark_column="id")
         pg = FakeKeyPG({})
