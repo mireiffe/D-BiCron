@@ -5,22 +5,31 @@ PG source 와 CH target 을 비교해 target 에 빠진 row 를 찾고, 켜져 �
 다시 복사(self-heal)한 뒤 retention 을 진행한다. retention(=source 삭제) 직전의
 마지막 방어선이다.
 
-두 가지 검사 방식 (integrity_method):
-  - count   : 값싼 게이트. source ``count(*)`` vs target ``uniqExact(key)`` 를 비교하고,
-              모자란 구간만 key-diff 로 정확히 어떤 key 가 빠졌는지 찾는다.
-  - key_diff: 항상 양쪽 key 집합을 끌어와 차집합을 구한다. count 가 우연히 같아
-              가려지는 경우(구간 내 source 삭제 등)까지 잡지만 전송 비용이 크다.
+비교 식별자는 **watermark 컬럼 하나**다 (order_by/primary_key 는 쓰지 않는다).
+dedup 키는 PG/CH 드라이버가 돌려주는 파이썬 타입 표현이 어긋날 수 있어
+(Decimal scale, timestamp 정밀도/tz 등) 같은 값이 영원히 "누락" 으로 잡히는
+false mismatch 를 만들 수 있다. watermark 는 증분 축이라 양쪽에서 항상 같은
+스칼라로 비교된다. 대신 해상도가 watermark 값 단위라, watermark 가 row 를 유일하게
+식별하지 않으면(같은 timestamp 를 공유하는 row 다수) 그 값의 row 가 하나라도 남아
+있는 한 나머지 누락은 못 본다 — serial/증가 id 처럼 unique 한 watermark 에서 정밀하다.
 
-왜 target 을 distinct key 로 보나:
+두 가지 검사 방식 (integrity_method):
+  - count   : 값싼 게이트. source ``count(*)`` vs target ``uniqExact(watermark)`` 를
+              비교하고, 모자란 구간만 watermark 값 diff 로 무엇이 빠졌는지 찾는다.
+  - key_diff: 항상 양쪽 watermark 값 집합을 끌어와 차집합을 구한다. count 가 우연히
+              같아 가려지는 경우까지 잡지만 전송 비용이 크다.
+
+왜 target 을 distinct watermark 로 보나:
   overlap 재전송으로 ReplacingMergeTree 에 같은 row 가 머지 전까지 중복 존재할 수
-  있어, target 의 ``count(*)`` 는 누락을 가릴 수 있다. dedup 키(order_by/primary_key)
-  기준으로 봐야 물리 중복에 영향받지 않고 논리적 row 를 본다.
+  있어, target 의 ``count(*)`` 는 누락을 가릴 수 있다. 중복은 같은 row(=같은
+  watermark 값)의 재전송이므로 distinct 로 세면 물리 중복에 영향받지 않는다.
 
 자가복구(repair):
-  빠진 key 를 ``TableCopier.copy_missing_keys`` 로 재적재한다. watermark 를
-  전진시키지 않으므로 resume 로직과 충돌하지 않는다. ReplacingMergeTree 계열에서만
-  수행한다(그 외 엔진은 재insert 가 중복을 남길 수 있어 skip). 이미 dead-letter 로
-  기록된 row(재복사해도 또 실패)는 누락 대상에서 제외해 무한 재시도를 막는다.
+  빠진 watermark 값의 row 를 ``TableCopier.copy_missing_keys`` 로 재적재한다.
+  watermark 를 전진시키지 않으므로 resume 로직과 충돌하지 않는다. ReplacingMergeTree
+  계열에서만 수행한다(그 외 엔진은 재insert 가 중복을 남길 수 있어 skip). 이미
+  dead-letter 로 기록된 row(재복사해도 또 실패)는 누락 대상에서 제외해 무한 재시도를
+  막는다.
 """
 
 from __future__ import annotations
@@ -34,14 +43,13 @@ from .chtypes import quote_ch_identifier, quote_ch_string, quote_pg_identifier
 from .config import TableConfig
 from .connections import ch_connect, get_connection, pg_connect
 from .copier import TableCopier
-from .ddl import extract_ch_key_columns
 from .tracking import MetaStore
 
 log = logging.getLogger("pg2ch.integrity")
 
-# 구조화 결과(windows)에 싣는 구간별 누락 key 샘플 최대 개수. 로그에는 key 자체를
-# 남기지 않고(전량 덤프 방지) 개수·분포만 남긴다. 재복사에는 전체 목록(_repair_keys)을
-# 쓰되 그건 로그/XCom 에 싣지 않는다.
+# 구조화 결과(windows)에 싣는 구간별 누락 watermark 값 샘플 최대 개수. 로그에는 값
+# 자체를 남기지 않고(전량 덤프 방지) 개수·분포만 남긴다. 재복사에는 전체 목록
+# (_repair_keys)을 쓰되 그건 로그/XCom 에 싣지 않는다.
 _MISSING_SAMPLE = 5
 
 
@@ -66,7 +74,7 @@ class IntegrityResult:
     # 재복사 계획 (내부용 — as_dict/XCom 에는 싣지 않음: 목록이 커질 수 있음).
     _repair_keys: list = field(default_factory=list, repr=False)
     _repair_key_cols: list = field(default_factory=list, repr=False)
-    # 누락 key 들이 걸친 watermark 구간(union). repair fetch 를 이 구간으로 좁힌다.
+    # 누락 값들이 걸친 watermark 구간(union). repair fetch 를 이 구간으로 좁힌다.
     _repair_wm_lo: object = field(default=None, repr=False)
     _repair_wm_hi: object = field(default=None, repr=False)
 
@@ -295,20 +303,11 @@ class IntegrityChecker:
                 reason="no finalized run windows to check",
             )
 
-        key_cols = sorted(
-            extract_ch_key_columns(cfg.order_by)
-            | extract_ch_key_columns(cfg.primary_key)
-        )
-        if not key_cols:
-            self.log.warning(
-                "%s: order_by/primary_key has no plain columns; falling back to "
-                "count-only check (cannot pinpoint or repair missing rows)",
-                cfg.table_id,
-            )
-        deadletter = (
-            {_canon_key(r) for r in meta.unresolved_failed_keys(cfg.table_id, key_cols)}
-            if key_cols else set()
-        )
+        # 검사/repair 식별자는 watermark 컬럼 하나로 고정한다 (모듈 docstring 참조).
+        key_cols = [wm_col]
+        deadletter = {
+            _canon_key(r) for r in meta.unresolved_failed_keys(cfg.table_id, key_cols)
+        }
 
         src_schema, src_name = cfg.source_parts()
         tgt_db, tgt_name = cfg.target_parts(target_default_db)
@@ -334,7 +333,7 @@ class IntegrityChecker:
                 pg_conn, ch, src_schema, src_name, tgt_db, tgt_name,
                 wm_col, key_cols, deadletter, lo, hi, method,
             )
-            missing = len(missing_keys) if key_cols else max(0, src_n - tgt_n)
+            missing = len(missing_keys)
             checked += 1
             total_src += src_n
             total_tgt += tgt_n
@@ -402,15 +401,10 @@ class IntegrityChecker:
     ):
         """한 구간 검사 → (source_count, target_count, missing_keys, deadletter_hit).
 
-        count 방식은 값싼 count 게이트를 먼저 보고 모자랄 때만 key-diff 로 정확한
-        누락 key 를 찾는다. key_diff 방식은 항상 key 집합을 비교한다. key_cols 가
-        없으면 count 만 반환한다(누락 key 목록 불가).
+        key_cols 는 항상 ``[watermark]`` 다. count 방식은 값싼 count 게이트를 먼저
+        보고 모자랄 때만 watermark 값 diff 로 무엇이 빠졌는지 찾는다. key_diff
+        방식은 항상 값 집합을 비교한다.
         """
-        if not key_cols:
-            src_n = self._pg_count(pg_conn, src_schema, src_name, wm_col, lo, hi)
-            tgt_n = self._ch_count(ch, tgt_db, tgt_name, wm_col, None, lo, hi)
-            return src_n, tgt_n, [], 0
-
         if method == "count":
             src_n = self._pg_count(pg_conn, src_schema, src_name, wm_col, lo, hi)
             tgt_n = self._ch_count(ch, tgt_db, tgt_name, wm_col, key_cols, lo, hi)
@@ -451,13 +445,9 @@ class IntegrityChecker:
     @staticmethod
     def _ch_count(ch, tgt_db, tgt_name, wm_col, key_cols, lo, hi) -> int:
         tgt_fqn = f"{quote_ch_identifier(tgt_db)}.{quote_ch_identifier(tgt_name)}"
-        if key_cols:
-            key_expr = ", ".join(quote_ch_identifier(c) for c in key_cols)
-            agg = f"uniqExact({key_expr})"
-        else:
-            agg = "count()"
+        key_expr = ", ".join(quote_ch_identifier(c) for c in key_cols)
         sql = (
-            f"SELECT {agg} FROM {tgt_fqn} "
+            f"SELECT uniqExact({key_expr}) FROM {tgt_fqn} "
             f"WHERE {quote_ch_identifier(wm_col)} > {_ch_literal(lo)} "
             f"AND {quote_ch_identifier(wm_col)} <= {_ch_literal(hi)}"
         )

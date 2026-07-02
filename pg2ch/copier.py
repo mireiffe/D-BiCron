@@ -354,8 +354,10 @@ class TableCopier:
         구현: 누락 key 들이 걸친 watermark 구간 (wm_lo, wm_hi] 을 **한 번만** 스트리밍
         스캔하고(=source 의 watermark 인덱스로 최근 slice 만), 배치마다 빠진 key 에
         해당하는 row 만 골라 넣는다. key 로 여러 번 조회(chunk 마다 재스캔)하지 않으므로
-        source 에 wm 인덱스만 있어도 스캔이 1회로 끝난다. 모든 누락 key 를 찾으면
-        구간 끝까지 가지 않고 조기 종료한다. 단일/복합 key 모두 동일 경로.
+        source 에 wm 인덱스만 있어도 스캔이 1회로 끝난다. 모든 누락 key 를 한 번 이상
+        보면 구간 끝까지 가지 않고 조기 종료한다 — key(=integrity 의 watermark 값)가
+        row 를 유일 식별하지 않으면 그 시점 이후의 같은 key row 는 재적재되지 않을 수
+        있다(검사 해상도 자체가 key 값 단위라 일관된 한계).
 
         반환: (rows_written, rows_failed).
         """
@@ -414,7 +416,7 @@ class TableCopier:
                 raw_rows = []
                 for r in raw_all:
                     k = tuple(r[i] for i in key_idx)
-                    if k in remaining:
+                    if k in missing:
                         remaining.discard(k)
                         raw_rows.append(r)
                 if not raw_rows:

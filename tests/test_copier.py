@@ -469,6 +469,20 @@ class TestCopyMissingKeys:
         # 1,2 만 읽고 멈춤 → 3,4,5 는 아직 스캔 전
         assert pg.stream.rows == [(3, "c"), (4, "d"), (5, "e")]
 
+    def test_recopies_all_rows_sharing_a_key_in_batch(self):
+        # key(=integrity 의 watermark 값)가 row 를 유일 식별하지 않아도,
+        # 스캔 중 만난 같은 key 의 row 는 첫 매칭 후에도 전부 재적재된다.
+        cfg = _cfg(sync_mode="append", watermark_column="id", engine="ReplacingMergeTree")
+        pg = FakePG(COLS, [(1, "a"), (2, "b1"), (2, "b2")])
+        ch = FakeCH()
+        meta = FakeMeta()
+        written, failed = TableCopier(cfg).copy_missing_keys(
+            pg, ch, meta, key_cols=["id"], keys=[(2,)], target_default_db="default"
+        )
+        assert written == 2 and failed == 0
+        assert (2, "b1") in ch.inserted and (2, "b2") in ch.inserted
+        assert (1, "a") not in ch.inserted
+
     def test_empty_keys_is_noop(self):
         cfg = _cfg(sync_mode="append", watermark_column="id")
         pg = FakePG(COLS, [])

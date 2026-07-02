@@ -81,12 +81,20 @@ dead-letter 에 보존됨) 파이프라인이 멈추지 않는다 — 이때 run
 각 run 이 이미 기록한 구간 `(watermark_before, watermark_after]` 에 대해:
 
 - **PG source (기대값)** = `count(*)` of rows with `watermark > before AND watermark <= after`
-- **CH target (실재값)** = `uniqExact(<order_by/primary_key>)` of the same window
+- **CH target (실재값)** = `uniqExact(<watermark>)` of the same window
 
-`source > target` 이면 누락이다. target 은 **distinct key** 로 센다 — overlap 재전송으로
-`ReplacingMergeTree` 에 같은 row 가 머지 전까지 중복 존재할 수 있어, 단순 `count(*)` 는
-(다른 row 가 빠졌어도) 중복이 메워 누락을 가릴 수 있기 때문이다. dedup 키로 distinct 를
-세면 중복에 영향받지 않고 논리적 row 수를 본다.
+`source > target` 이면 누락이다. target 은 **distinct watermark** 로 센다 — overlap
+재전송으로 `ReplacingMergeTree` 에 같은 row 가 머지 전까지 중복 존재할 수 있어, 단순
+`count(*)` 는 (다른 row 가 빠졌어도) 중복이 메워 누락을 가릴 수 있기 때문이다. 중복은
+같은 row(=같은 watermark 값)의 재전송이므로 distinct 로 세면 영향받지 않는다.
+
+비교 식별자로 `order_by`/`primary_key` 가 아니라 **watermark 컬럼만** 쓴다. dedup 키는
+PG/CH 드라이버의 파이썬 타입 표현이 어긋날 수 있어(Decimal scale, timestamp 정밀도/tz 등)
+같은 값이 영원히 "누락" 으로 잡히는 false mismatch → 무한 repair 루프를 만들 수 있다.
+watermark 는 증분 축이라 양쪽에서 항상 같은 스칼라로 비교된다. 대신 검사 해상도가
+watermark **값** 단위다: 같은 값을 공유하는 row 가 여럿이면(예: 동일 timestamp) 그 값의
+row 가 하나라도 남아 있는 한 나머지 누락은 못 본다 — serial/증가 id 처럼 row 당 유일한
+watermark 에서 정밀하다.
 
 검사 범위는 **최근 run 의 watermark 구간**으로 한정되어(전체 테이블 COUNT 가 아님) 큰
 테이블에서도 가볍다.
@@ -94,14 +102,14 @@ dead-letter 에 보존됨) 파이프라인이 멈추지 않는다 — 이때 run
 #### 누락 row 자가복구 (repair)
 
 누락이 잡히면 그냥 실패시키지 않고, **빠진 그 row 만 골라 다시 복사(self-heal)** 한 뒤
-재검사한다. count 게이트가 모자란 구간에서 양쪽 **key 집합의 차(source − target)** 를
-구해 정확히 어떤 key 가 빠졌는지 찾고(`integrity_method: count`), 그 row 들을 재적재한다.
+재검사한다. count 게이트가 모자란 구간에서 양쪽 **watermark 값 집합의 차(source − target)**
+를 구해 무엇이 빠졌는지 찾고(`integrity_method: count`), 그 row 들을 재적재한다.
 
-- **재적재는 누락 key 가 걸친 watermark 구간을 한 번만 스트리밍 스캔**하고, 배치마다 빠진
-  key 에 해당하는 row 만 골라 넣는다(모두 찾으면 조기 종료). key 로 여러 번 조회하지
-  않으므로 **source 에 watermark 인덱스만 있어도 스캔이 1회**로 끝난다 — key 컬럼 인덱스가
-  없어도 된다. (증분 copy 가 이미 `WHERE wm > cutoff` 로 그 인덱스에 의존하므로 있는 것이
-  정상이다. watermark 인덱스조차 없으면 이 스캔이 전체 테이블 seq scan 이 되어 느리다.)
+- **재적재는 누락 값이 걸친 watermark 구간을 한 번만 스트리밍 스캔**하고, 배치마다 빠진
+  watermark 값에 해당하는 row 만 골라 넣는다(모두 찾으면 조기 종료). 값으로 여러 번
+  조회하지 않으므로 **source 에 watermark 인덱스만 있어도 스캔이 1회**로 끝난다.
+  (증분 copy 가 이미 `WHERE wm > cutoff` 로 그 인덱스에 의존하므로 있는 것이 정상이다.
+  watermark 인덱스조차 없으면 이 스캔이 전체 테이블 seq scan 이 되어 느리다.)
 - **watermark 를 전진시키지 않는다** — repair 는 watermark_before/after 를 NULL 로 남겨
   resume·window 계산에서 제외되므로, 이미 지나간 구간의 누락도 다시 채울 수 있다.
 - **ReplacingMergeTree 계열에서만** 수행한다(재insert 가 머지로 dedup 되어 idempotent).
@@ -110,8 +118,9 @@ dead-letter 에 보존됨) 파이프라인이 멈추지 않는다 — 이때 run
   이런 row 는 데이터/스키마를 고쳐 replay 해야 한다.
 - `integrity_repair_attempts` 회까지 재복사→재검사를 반복하고, 그래도 남으면 hard fail.
 
-`integrity_method: key_diff` 로 두면 count 게이트 없이 **항상** key 집합을 비교한다 —
-count 가 우연히 같아 가려지는 경우(구간 내 source 삭제 등)까지 잡지만 전송 비용이 크다.
+`integrity_method: key_diff` 로 두면 count 게이트 없이 **항상** watermark 값 집합을
+비교한다 — count 가 우연히 같아 가려지는 경우(구간 내 source 삭제 등)까지 잡지만 전송
+비용이 크다.
 
 #### 판정 & 차단
 
@@ -224,9 +233,9 @@ optimize_partitions: ["202606"]  # 생략 시 전체 테이블
 # 무결성 검사 + 누락 row 자가복구 (retention 직전, append 전용)
 integrity:
   enabled: false                  # true 로 켜야 검사 실행
-  method: count                   # count(값싼 게이트+누락 key만 diff) | key_diff(항상 정밀)
+  method: count                   # count(값싼 게이트+누락분만 diff) | key_diff(항상 정밀)
   lookback_runs: 1                # 최근 몇 개 run 구간을 검사할지
-  repair: true                    # 누락 key 재복사(self-heal); ReplacingMergeTree 계열만
+  repair: true                    # 누락 row 재복사(self-heal); ReplacingMergeTree 계열만
   repair_attempts: 1              # 재복사→재검사 최대 반복 횟수
   on_mismatch: fail               # (repair 후에도 누락 시) fail = retention 차단 | warn = 로그만
   tolerance: 0                    # 허용 누락 수

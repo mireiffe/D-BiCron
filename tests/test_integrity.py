@@ -221,15 +221,19 @@ class TestVerifyCount:
         assert len(r.windows[0]["missing_sample"]) == 5  # 샘플만
         assert len(r._repair_keys) == 20  # 재복사는 전량 대상
 
-    def test_composite_key(self):
-        pg = VPG(counts=[2], keys=[[(1, "a"), (2, "b")]])
-        ch = VCH(counts=[1], keys=[[(1, "a")]])
-        r = IntegrityChecker(_cfg(order_by=["a", "b"])).verify(
+    def test_order_by_ignored_checks_watermark_only(self):
+        # 검사 식별자는 order_by/primary_key 가 아니라 watermark 컬럼이다.
+        # (dedup 키는 드라이버 타입 표현 차이로 false mismatch 를 만들 수 있음)
+        pg = VPG(counts=[2], keys=[[(1,), (2,)]])
+        ch = VCH(counts=[1], keys=[[(1,)]])
+        r = IntegrityChecker(_cfg(order_by=["a", "b"], primary_key=["a"])).verify(
             pg, ch, VMeta([_win(5, "0", "10")])
         )
         assert r.missing_rows == 1
-        assert set(r._repair_keys) == {(2, "b")}
-        assert any("uniqExact(`a`, `b`)" in s for s in ch.sql)
+        assert set(r._repair_keys) == {(2,)}
+        assert r._repair_key_cols == ["id"]
+        assert any("uniqExact(`id`)" in s for s in ch.sql)
+        assert not any("`a`" in s for s in ch.sql)
 
 
 # ── verify(): key_diff mode ──────────────────────────────────────
@@ -258,18 +262,33 @@ class TestVerifyKeyDiff:
         assert set(r._repair_keys) == {(3,)}
 
 
-# ── key 컬럼이 없을 때(count-only fallback) ──────────────────────
+# ── order_by 형태와 무관하게 watermark 로 검사 ───────────────────
 
 
-class TestNoKeyColumns:
-    def test_string_order_by_falls_back_to_count(self):
-        cfg = _cfg(order_by="id")  # 문자열 식 → plain 컬럼 추출 불가
-        pg, ch = VPG(counts=[5]), VCH(counts=[3])
+class TestWatermarkKey:
+    def test_string_order_by_still_pinpoints_by_watermark(self):
+        # 문자열 order_by 식이어도 검사/repair 는 watermark 값으로 가능하다.
+        cfg = _cfg(order_by="cityHash64(id)")
+        pg = VPG(counts=[5], keys=[[(1,), (2,), (3,), (4,), (5,)]])
+        ch = VCH(counts=[3], keys=[[(1,), (2,), (3,)]])
         r = IntegrityChecker(cfg).verify(pg, ch, VMeta([_win(5, "0", "10")]))
         assert r.status == "mismatch"
         assert r.missing_rows == 2
-        assert r._repair_keys == []  # 재복사 불가 (key 목록 없음)
-        assert any("count()" in s for s in ch.sql)
+        assert set(r._repair_keys) == {(4,), (5,)}
+        assert any("uniqExact(`id`)" in s for s in ch.sql)
+
+    def test_deadletter_lookup_uses_watermark_column(self):
+        meta = VMeta([_win(5, "0", "10")])
+        seen = {}
+
+        def capture(table_id, key_cols):
+            seen["cols"] = key_cols
+            return []
+
+        meta.unresolved_failed_keys = capture
+        pg, ch = VPG(counts=[1]), VCH(counts=[1])
+        IntegrityChecker(_cfg(order_by=["a", "b"])).verify(pg, ch, meta)
+        assert seen["cols"] == ["id"]
 
 
 # ── 자가복구 (_run_with_repair) 통합 ─────────────────────────────
