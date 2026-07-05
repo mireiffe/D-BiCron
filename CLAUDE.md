@@ -5,6 +5,8 @@ PostgreSQL → ClickHouse 복사 전용 파이프라인 (Apache Airflow 3.2.2 �
 
 - 접속 정보: `config/connections.json` (ID 로 키잉, `${ENV}` 치환 지원)
 - 테이블 파이프라인: `config/tables/<table_id>.yaml` (테이블당 1개, `_defaults.yaml` 병합)
+- PG source retention: `config/retention.yaml` (단일 파일 — 전용 DAG `pg2ch_retention`,
+  copy 와 별개 스케줄이라 삭제가 오래 걸려도 copy 가 안 밀린다)
 - 추적: PostgreSQL `pg2ch_meta` 스키마 (`copy_run` / `copy_batch` / `copy_failed_row`)
 
 ## 적재 모드 (테이블별 `sync_mode`)
@@ -29,9 +31,10 @@ PostgreSQL → ClickHouse 복사 전용 파이프라인 (Apache Airflow 3.2.2 �
 
 `chtypes`(타입) → `ddl`(DDL) / `transform`(row 변환) → `copier`(오케스트레이션).
 `tracking`(메타 저장소), `config`(YAML 로드/검증), `connections`(접속),
-`integrity`(retention 전 무결성 검사), `retention`(PG source 삭제), `cli`.
+`integrity`(무결성 검사 + 자가복구), `retention`(PG source 삭제), `cli`.
 엔진은 Airflow 에 의존하지 않으며, `dags/pg2ch_factory.py` 만 Airflow API 를 쓴다.
-DAG task 순서: `precheck → copy → finalize_watermark → verify → retention`.
+테이블 DAG task 순서: `precheck → copy → finalize_watermark → verify`.
+retention 전용 DAG(`pg2ch_retention`)는 테이블마다 `verify_<id> → retention_<id>` 체인.
 
 ## 복사/추적 설계 원칙
 
@@ -41,7 +44,10 @@ DAG task 순서: `precheck → copy → finalize_watermark → verify → retent
 - 증분 재개 cutoff 는 finalize 된 `copy_run.watermark_after` 와, finalize 전에
   죽은 증분 run 이 남긴 마지막 `copy_batch.watermark_hi` 중 더 진행된 지점에서
   읽는다 (OOM/SIGKILL 로 죽어도 재복사 루프에 빠지지 않게).
-- retention(=source 삭제)은 파괴적이므로 직전에 `verify` 로 최근 watermark 구간의
+- retention(=source 삭제)은 copy 와 분리된 전용 DAG 에서 `config/retention.yaml`
+  정책(ts 컬럼 기준 cutoff)대로 돈다. 단 cutoff 는 finalize 된 watermark 가 가리키는
+  마지막 synced ts 로 캡핑한다 — copy 가 멈춘 동안 미복제 row 가 삭제되지 않게.
+- retention 은 파괴적이므로 직전에 `verify` 로 최근 watermark 구간의
   source `count(*)` vs target `uniqExact(watermark)` 를 비교한다. target 은 distinct
   watermark 로 세야 overlap 재전송 중복(ReplacingMergeTree 머지 전)이 누락을 가리지
   않는다. 비교 식별자는 watermark 컬럼뿐이다 — order_by/primary_key 는 드라이버 타입

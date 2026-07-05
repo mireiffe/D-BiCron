@@ -1,13 +1,16 @@
-"""pg2ch DAG factory — config/tables/*.yaml 당 DAG 1개를 동적 생성.
+"""pg2ch DAG factory — config/tables/*.yaml 당 DAG 1개 + retention 전용 DAG 를 동적 생성.
 
 테이블마다 적재 방식(append / full_reload)·주기가 다르므로 테이블당 독립 DAG 로
 만들어 스케줄·재시도·추적을 분리한다. dag_id 는 ``pg2ch_<table_id>``.
 
-각 DAG 은 precheck → copy → finalize_watermark → verify → retention 순서의 task 를
-가진다. verify 는 retention(=source 삭제) 직전에 최근 watermark 구간의 source/target
-row 수를 비교해 누락을 잡고, 누락 시 retention 을 막는다(integrity_on_mismatch=fail).
+각 테이블 DAG 은 precheck → copy → finalize_watermark → verify 순서의 task 를 가진다.
 batch/row 단위 진행·실패 추적은 pg2ch 메타 스키마(copy_run / copy_batch /
 copy_failed_row)에 기록한다.
+
+retention(=PG source 삭제)은 copy 경로에서 분리된 전용 DAG ``pg2ch_retention`` 으로
+돈다 (config/retention.yaml 로 스케줄·테이블별 정책 관리). retention 이 오래 걸려도
+copy 스케줄이 밀리지 않는다. 삭제는 파괴적이므로 테이블마다 verify(무결성 검사) task
+를 직전에 두어, 누락이 남으면(integrity_on_mismatch=fail) 그 테이블의 삭제를 막는다.
 
 Airflow 3.x (apache/airflow:3.2.2) 기준 import 사용:
   from airflow.sdk import DAG, get_current_context
@@ -21,7 +24,12 @@ import os
 from datetime import datetime, timedelta
 from typing import TYPE_CHECKING
 
-from pg2ch.config import TableConfig, load_all_table_configs
+from pg2ch.config import (
+    RetentionConfig,
+    TableConfig,
+    load_all_table_configs,
+    load_retention_config,
+)
 
 if TYPE_CHECKING:
     from airflow.sdk import DAG
@@ -128,7 +136,11 @@ def _make_finalize_callable(table_id: str):
 
 
 def _make_verify_callable(table_id: str):
-    """retention 직전 무결성 검사. 설정이 켜져 있고 누락이 잡히면 raise 해 retention 을 막는다."""
+    """무결성 검사 + 자가복구. 누락이 남으면 raise 해 downstream(retention)을 막는다.
+
+    copy DAG 에선 적재 직후 자가복구용으로, retention DAG 에선 삭제 직전 마지막
+    방어선으로 같은 검사를 쓴다.
+    """
 
     def _verify(**_):
         from pg2ch.integrity import IntegrityChecker
@@ -147,14 +159,22 @@ def _make_verify_callable(table_id: str):
     return _verify
 
 
+def _runtime_retention_policy(table_id: str):
+    rcfg = load_retention_config()
+    policy = rcfg.policy_for(table_id) if rcfg else None
+    if policy is None:
+        raise RuntimeError(f"retention policy for '{table_id}' not found at runtime")
+    return policy
+
+
 def _make_retention_callable(table_id: str):
-    """설정이 켜져 있으면 PG source retention 을 실행한다."""
+    """retention.yaml 정책대로 PG source retention 을 실행한다."""
 
     def _retention(**_):
         from pg2ch.retention import PgRetention
 
         cfg = _runtime_config(table_id)
-        result = PgRetention(cfg).run()
+        result = PgRetention(cfg, _runtime_retention_policy(table_id)).run()
         return result.as_dict()
 
     return _retention
@@ -250,7 +270,6 @@ def build_dag(cfg: TableConfig, copy_pool: str | None = None) -> DAG:
             f"- watermark: `{cfg.effective_watermark_column or '-'}`\n"
             f"- on_row_error: `{cfg.on_row_error}`\n"
             f"- integrity: `{'enabled' if cfg.integrity_enabled else 'disabled'}`\n"
-            f"- retention: `{'enabled' if cfg.retention_enabled else 'disabled'}`\n"
         ),
     )
     with dag:
@@ -276,12 +295,72 @@ def build_dag(cfg: TableConfig, copy_pool: str | None = None) -> DAG:
             task_display_name="4. verify",
             python_callable=_make_verify_callable(cfg.table_id),
         )
-        retention = PythonOperator(
-            task_id="retention",
-            task_display_name="5. retention",
-            python_callable=_make_retention_callable(cfg.table_id),
+        precheck >> copy >> finalize >> verify
+    return dag
+
+
+_RETENTION_DAG_ID = "pg2ch_retention"
+
+
+def build_retention_dag(rcfg: RetentionConfig, table_ids: set[str]) -> DAG | None:
+    """retention.yaml 의 정책들로 전용 retention DAG 하나를 만든다.
+
+    테이블마다 ``verify_<id> → retention_<id>`` 체인을 둔다 — 삭제는 파괴적이라
+    직전에 무결성 검사를 통과해야 한다(integrity 가 꺼진 테이블은 검사 없이 진행).
+    한 테이블의 실패가 다른 테이블의 삭제를 막지 않는다. 매칭되는 테이블 설정이
+    하나도 없으면 None.
+    """
+    from airflow.providers.standard.operators.python import PythonOperator
+    from airflow.sdk import DAG
+
+    policies = [p for p in rcfg.policies if p.table_id in table_ids]
+    for missing in (p for p in rcfg.policies if p.table_id not in table_ids):
+        log.warning(
+            "pg2ch: retention policy '%s' has no matching table config — skipped",
+            missing.table_id,
         )
-        precheck >> copy >> finalize >> verify >> retention
+    if not policies:
+        return None
+
+    dag = DAG(
+        dag_id=_RETENTION_DAG_ID,
+        description="pg2ch PG source retention (copy 와 분리된 전용 스케줄)",
+        schedule=rcfg.schedule,
+        start_date=_parse_start_date(rcfg.start_date),
+        catchup=rcfg.catchup,
+        max_active_runs=rcfg.max_active_runs,
+        default_args={
+            "retries": rcfg.retries,
+            "retry_delay": timedelta(seconds=rcfg.retry_delay_seconds),
+        },
+        tags=list(rcfg.tags),
+        doc_md=(
+            "**pg2ch retention** — 복제 완료된 오래된 PG source row 삭제.\n\n"
+            "테이블마다 `verify → retention` 순서로 실행되며, 무결성 검사에서 누락이 "
+            "남으면(integrity_on_mismatch=fail) 그 테이블의 삭제는 skip 된다. 삭제 "
+            "cutoff 는 finalize 된 watermark 가 가리키는 마지막 synced timestamp 로 "
+            "캡핑되어, copy 가 멈춘 동안에도 미복제 row 는 지워지지 않는다.\n\n"
+            + "\n".join(
+                f"- `{p.table_id}`: retention `{p.retention}`" for p in policies
+            )
+        ),
+        **(
+            {"max_active_tasks": rcfg.max_active_tasks}
+            if rcfg.max_active_tasks is not None
+            else {}
+        ),
+    )
+    with dag:
+        for policy in policies:
+            verify = PythonOperator(
+                task_id=f"verify_{policy.table_id}",
+                python_callable=_make_verify_callable(policy.table_id),
+            )
+            retention = PythonOperator(
+                task_id=f"retention_{policy.table_id}",
+                python_callable=_make_retention_callable(policy.table_id),
+            )
+            verify >> retention
     return dag
 
 
@@ -302,6 +381,17 @@ def register_dags(global_namespace: dict) -> int:
             continue
         global_namespace[dag.dag_id] = dag
         count += 1
+    try:
+        rcfg = load_retention_config()
+        if rcfg and rcfg.policies:
+            retention_dag = build_retention_dag(
+                rcfg, {cfg.table_id for cfg in configs}
+            )
+            if retention_dag is not None:
+                global_namespace[retention_dag.dag_id] = retention_dag
+                count += 1
+    except Exception:
+        log.exception("failed to build retention DAG")
     log.info("pg2ch: registered %d DAG(s)", count)
     return count
 

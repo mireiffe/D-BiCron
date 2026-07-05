@@ -9,6 +9,7 @@ import pytest
 from pg2ch.config import (
     TableConfig,
     load_all_table_configs,
+    load_retention_config,
     load_table_config,
     split_qualified,
 )
@@ -96,53 +97,18 @@ class TestValidation:
         with pytest.raises(ValueError, match="insert_types_check"):
             TableConfig.from_dict(_base(insert_types_check="false"))
 
-    def test_retention_flat_config_ok(self):
-        cfg = TableConfig.from_dict(
-            _base(
-                sync_mode="append",
-                watermark_column="id",
-                timestamp_column="created_at",
-                retention_enabled=True,
-                source_retention="180d",
-                source_retention_batch_size=5000,
-            )
-        )
-        assert cfg.retention_enabled is True
-        assert cfg.source_retention == "180d"
-        assert cfg.source_retention_batch_size == 5000
-
-    def test_retention_nested_config_ok(self):
-        cfg = TableConfig.from_dict(
-            _base(
-                sync_mode="append",
-                watermark_column="id",
-                timestamp_column="created_at",
-                retention={
-                    "enabled": True,
-                    "retention": "2026-01-01T00:00:00",
-                    "batch_size": 123,
-                    "lock_timeout_ms": 1000,
-                },
-            )
-        )
-        assert cfg.retention_enabled is True
-        assert cfg.source_retention == "2026-01-01T00:00:00"
-        assert cfg.source_retention_batch_size == 123
-        assert cfg.retention_lock_timeout_ms == 1000
-
-    def test_retention_enabled_requires_append(self):
-        with pytest.raises(ValueError, match="retention_enabled requires append"):
+    def test_legacy_retention_block_rejected_with_migration_hint(self):
+        with pytest.raises(ValueError, match="config/retention.yaml"):
             TableConfig.from_dict(
                 _base(
-                    sync_mode="full_reload",
-                    timestamp_column="created_at",
-                    retention_enabled=True,
-                    source_retention="180d",
+                    sync_mode="append",
+                    watermark_column="id",
+                    retention={"enabled": True, "source_retention": "180d"},
                 )
             )
 
-    def test_retention_enabled_requires_timestamp_column(self):
-        with pytest.raises(ValueError, match="source_retention requires timestamp_column"):
+    def test_legacy_flat_retention_keys_rejected(self):
+        with pytest.raises(ValueError, match="no longer configured per table"):
             TableConfig.from_dict(
                 _base(
                     sync_mode="append",
@@ -338,3 +304,119 @@ class TestLoaders:
 
     def test_missing_dir_returns_empty(self, tmp_path):
         assert load_all_table_configs(tmp_path / "nope") == []
+
+
+class TestRetentionConfig:
+    def _load(self, tmp_path, body):
+        f = tmp_path / "retention.yaml"
+        f.write_text(textwrap.dedent(body), encoding="utf-8")
+        return load_retention_config(f)
+
+    def test_missing_file_returns_none(self, tmp_path):
+        assert load_retention_config(tmp_path / "nope.yaml") is None
+
+    def test_load_full_config(self, tmp_path):
+        rcfg = self._load(tmp_path, """
+            schedule: "0 4 * * *"
+            start_date: "2026-01-01"
+            max_active_runs: 2
+            max_active_tasks: 3
+            tags: [pg2ch, retention]
+            defaults:
+              batch_size: 20000
+              lock_timeout_ms: 3000
+            tables:
+              orders:
+                retention: 180d
+              events:
+                retention: "2026-01-01T00:00:00"
+                batch_size: 500
+        """)
+        assert rcfg.schedule == "0 4 * * *"
+        assert rcfg.max_active_runs == 2
+        assert rcfg.max_active_tasks == 3
+        assert len(rcfg.policies) == 2
+        events = rcfg.policy_for("events")
+        assert events.retention == "2026-01-01T00:00:00"
+        assert events.batch_size == 500  # table override wins
+        assert events.lock_timeout_ms == 3000  # from defaults
+        orders = rcfg.policy_for("orders")
+        assert orders.retention == "180d"
+        assert orders.batch_size == 20000
+
+    def test_policy_defaults_without_defaults_block(self, tmp_path):
+        rcfg = self._load(tmp_path, """
+            tables:
+              orders:
+                retention: 180d
+        """)
+        policy = rcfg.policy_for("orders")
+        assert policy.batch_size == 10_000
+        assert policy.lock_timeout_ms == 5_000
+        assert rcfg.policy_for("unknown") is None
+
+    def test_disabled_table_dropped(self, tmp_path):
+        rcfg = self._load(tmp_path, """
+            tables:
+              orders:
+                retention: 180d
+                enabled: false
+        """)
+        assert rcfg.policies == []
+
+    def test_empty_tables_ok(self, tmp_path):
+        rcfg = self._load(tmp_path, "schedule: \"@daily\"\n")
+        assert rcfg.policies == []
+
+    def test_retention_value_required(self, tmp_path):
+        with pytest.raises(ValueError, match="retention is required"):
+            self._load(tmp_path, """
+                tables:
+                  orders:
+                    batch_size: 100
+            """)
+
+    def test_bad_retention_expr(self, tmp_path):
+        with pytest.raises(ValueError, match="relative like '180d'"):
+            self._load(tmp_path, """
+                tables:
+                  orders:
+                    retention: soon
+            """)
+
+    def test_bad_batch_size(self, tmp_path):
+        with pytest.raises(ValueError, match="batch_size must be a positive"):
+            self._load(tmp_path, """
+                tables:
+                  orders:
+                    retention: 180d
+                    batch_size: 0
+            """)
+
+    def test_unknown_top_level_key(self, tmp_path):
+        with pytest.raises(ValueError, match="unknown retention key"):
+            self._load(tmp_path, "sched: nope\ntables: {}\n")
+
+    def test_unknown_table_key(self, tmp_path):
+        with pytest.raises(ValueError, match="unknown key"):
+            self._load(tmp_path, """
+                tables:
+                  orders:
+                    retention: 180d
+                    typo_key: 1
+            """)
+
+    def test_unknown_defaults_key(self, tmp_path):
+        with pytest.raises(ValueError, match="unknown retention defaults key"):
+            self._load(tmp_path, """
+                defaults:
+                  retention: 180d
+                tables: {}
+            """)
+
+    def test_tables_must_be_mapping(self, tmp_path):
+        with pytest.raises(ValueError, match="tables must be a mapping"):
+            self._load(tmp_path, """
+                tables:
+                  - orders
+            """)

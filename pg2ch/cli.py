@@ -4,12 +4,13 @@
   pg2ch list                      설정된 테이블 파이프라인 목록
   pg2ch copy <table_id|all>       복사 1회 실행
   pg2ch verify <table_id|all>     최근 watermark 구간 무결성 검사 (source vs target)
-  pg2ch retention <table_id|all>  PG source retention 1회 실행
+  pg2ch retention <table_id|all>  PG source retention 1회 실행 (config/retention.yaml 기준)
   pg2ch status <table_id>         마지막 run / watermark / 미해결 실패 row 수
 
 경로는 환경변수로 조정:
-  PG2CH_CONNECTIONS (기본 config/connections.json)
-  PG2CH_TABLES_DIR  (기본 config/tables)
+  PG2CH_CONNECTIONS      (기본 config/connections.json)
+  PG2CH_TABLES_DIR       (기본 config/tables)
+  PG2CH_RETENTION_CONFIG (기본 config/retention.yaml)
 """
 
 from __future__ import annotations
@@ -18,7 +19,12 @@ import argparse
 import logging
 import sys
 
-from .config import load_all_table_configs, load_table_config, tables_dir
+from .config import (
+    load_all_table_configs,
+    load_retention_config,
+    load_table_config,
+    tables_dir,
+)
 from .connections import get_connection
 from .copier import TableCopier
 from .integrity import IntegrityChecker
@@ -59,11 +65,14 @@ def cmd_list(args) -> int:
     if not configs:
         print("(no table configs found)")
         return 0
+    rcfg = load_retention_config(args.retention_config)
     for c in configs:
+        policy = rcfg.policy_for(c.table_id) if rcfg else None
         print(
             f"{c.table_id:24s} {c.sync_mode:11s} "
             f"{c.source_table} -> {c.target_table}  "
-            f"[schedule={c.schedule or '-'} retention={'on' if c.retention_enabled else 'off'}]"
+            f"[schedule={c.schedule or '-'} "
+            f"retention={policy.retention if policy else 'off'}]"
         )
     return 0
 
@@ -128,23 +137,39 @@ def cmd_verify(args) -> int:
 
 
 def cmd_retention(args) -> int:
+    rcfg = load_retention_config(args.retention_config)
+    if rcfg is None:
+        raise SystemExit(
+            "no retention config found (config/retention.yaml — "
+            "see config/retention.example.yaml)"
+        )
     if args.table_id == "all":
-        configs = load_all_table_configs(args.tables_dir)
+        policies = rcfg.policies
+        if not policies:
+            print("(no tables in retention config)")
+            return 0
     else:
-        configs = [_find_config(args.table_id, args.tables_dir)]
+        policy = rcfg.policy_for(args.table_id)
+        if policy is None:
+            raise SystemExit(f"table '{args.table_id}' not in retention config")
+        policies = [policy]
 
     failures = 0
-    for cfg in configs:
+    for policy in policies:
         try:
-            result = PgRetention(cfg, connections_path=args.connections).run()
+            cfg = _find_config(policy.table_id, args.tables_dir)
+            result = PgRetention(
+                cfg, policy, connections_path=args.connections
+            ).run()
             print(
                 f"[{result.status}] {cfg.table_id}: deleted={result.rows_deleted} "
                 f"safe_cutoff={result.safe_cutoff or '-'} "
                 f"reason={result.reason or '-'}"
             )
-        except Exception as e:
+        except (Exception, SystemExit) as e:
+            # SystemExit: _find_config — retention 항목이 테이블 설정 없이 남은 경우
             failures += 1
-            print(f"[failed] {cfg.table_id}: {e}", file=sys.stderr)
+            print(f"[failed] {policy.table_id}: {e}", file=sys.stderr)
     return 1 if failures else 0
 
 
@@ -165,7 +190,12 @@ def cmd_status(args) -> int:
         if cfg.integrity_enabled else "disabled"
     )
     print(f"integrity       : {integrity_desc}")
-    print(f"retention       : {'enabled' if cfg.retention_enabled else 'disabled'}")
+    rcfg = load_retention_config(args.retention_config)
+    policy = rcfg.policy_for(cfg.table_id) if rcfg else None
+    retention_desc = (
+        f"enabled (retention={policy.retention})" if policy else "disabled"
+    )
+    print(f"retention       : {retention_desc}")
     print(f"unresolved failed rows: {unresolved}")
     return 0
 
@@ -175,6 +205,7 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("-v", "--verbose", action="store_true")
     p.add_argument("--connections", default=None, help="connections.json 경로")
     p.add_argument("--tables-dir", default=None, help="테이블 설정 디렉터리")
+    p.add_argument("--retention-config", default=None, help="retention.yaml 경로")
     sub = p.add_subparsers(dest="command", required=True)
 
     s = sub.add_parser("init-meta", help="메타 스키마 생성")
@@ -196,7 +227,9 @@ def build_parser() -> argparse.ArgumentParser:
     )
     s.set_defaults(func=cmd_verify)
 
-    s = sub.add_parser("retention", help="PG source retention 1회 실행")
+    s = sub.add_parser(
+        "retention", help="PG source retention 1회 실행 (retention.yaml 의 테이블만)"
+    )
     s.add_argument("table_id", help="table_id 또는 'all'")
     s.set_defaults(func=cmd_retention)
 

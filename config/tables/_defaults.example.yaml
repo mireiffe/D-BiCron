@@ -29,11 +29,7 @@ integrity:
   on_mismatch: fail   # (repair 후에도 누락 시) fail = retention 차단 | warn = 로그만
   tolerance: 0
 
-# PG source retention 기본값. 실제 삭제는 테이블별로 enabled: true 를 둔 경우만 실행된다.
-retention:
-  enabled: false
-  batch_size: 10000
-  lock_timeout_ms: 5000
+# PG source retention 은 config/retention.yaml 에서 관리한다 (전용 DAG).
 
 settings:
   index_granularity: 8192

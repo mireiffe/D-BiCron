@@ -1,8 +1,11 @@
 """PG source retention.
 
-복사가 성공적으로 finalize 된 watermark 를 기준으로 PostgreSQL source row 를
-배치 삭제한다. watermark 는 현재 프로젝트의 pg2ch_meta.copy_run 을 진실 소스로
-사용한다.
+copy 와 분리된 전용 DAG(pg2ch_retention)/CLI 에서 실행된다. 삭제 대상은
+timestamp_column 기준(``ts < cutoff``)이지만, cutoff 는 finalize 된 watermark
+(pg2ch_meta.copy_run)가 가리키는 마지막 synced timestamp 를 넘지 못하게 캡핑한다 —
+copy 가 멈춘 동안 retention 만 계속 돌아도 미복제 row 가 삭제되지 않는다.
+
+어떤 테이블을 얼마나 지울지는 config/retention.yaml 의 RetentionPolicy 로 정한다.
 """
 
 from __future__ import annotations
@@ -12,7 +15,7 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 
 from .chtypes import quote_pg_identifier
-from .config import TableConfig
+from .config import RetentionPolicy, TableConfig
 from .connections import get_connection, pg_connect
 from .tracking import MetaStore
 from .watermark import resolve_sync_since
@@ -24,7 +27,6 @@ log = logging.getLogger("pg2ch.retention")
 class RetentionResult:
     table_id: str
     status: str
-    enabled: bool
     rows_deleted: int = 0
     retention_cutoff: str | None = None
     last_synced_ts: str | None = None
@@ -52,24 +54,23 @@ class PgRetention:
     def __init__(
         self,
         cfg: TableConfig,
+        policy: RetentionPolicy,
         *,
         connections_path: str | None = None,
         logger: logging.Logger | None = None,
     ):
+        if policy.table_id != cfg.table_id:
+            raise ValueError(
+                f"retention policy table_id '{policy.table_id}' does not match "
+                f"table config '{cfg.table_id}'"
+            )
         self.cfg = cfg
+        self.policy = policy
         self.connections_path = connections_path
         self.log = logger or logging.getLogger(f"pg2ch.retention.{cfg.table_id}")
 
     def run(self) -> RetentionResult:
         cfg = self.cfg
-        if not cfg.retention_enabled:
-            return RetentionResult(
-                table_id=cfg.table_id,
-                status="disabled",
-                enabled=False,
-                reason="retention_enabled is false",
-            )
-
         src_cfg = get_connection(cfg.source, self.connections_path)
         meta_cfg = get_connection(cfg.meta, self.connections_path)
         if src_cfg.get("type") not in (None, "postgresql"):
@@ -89,22 +90,13 @@ class PgRetention:
 
     def purge(self, pg_conn, meta: MetaStore) -> RetentionResult:
         cfg = self.cfg
-        if not cfg.retention_enabled:
-            return RetentionResult(
-                table_id=cfg.table_id,
-                status="disabled",
-                enabled=False,
-                reason="retention_enabled is false",
-            )
+        policy = self.policy
         if cfg.sync_mode != "append":
             return RetentionResult(
                 table_id=cfg.table_id,
                 status="skipped",
-                enabled=True,
                 reason="retention requires append sync_mode",
             )
-        if not cfg.source_retention:
-            raise ValueError(f"{cfg.table_id}: source_retention is required")
         if not cfg.timestamp_column:
             raise ValueError(f"{cfg.table_id}: timestamp_column is required")
 
@@ -114,7 +106,6 @@ class PgRetention:
             return RetentionResult(
                 table_id=cfg.table_id,
                 status="skipped",
-                enabled=True,
                 reason="no finalized watermark",
             )
 
@@ -126,11 +117,10 @@ class PgRetention:
             return RetentionResult(
                 table_id=cfg.table_id,
                 status="skipped",
-                enabled=True,
                 reason="watermark resolves to no synced timestamp",
             )
 
-        retention_cutoff = resolve_sync_since(str(cfg.source_retention))
+        retention_cutoff = resolve_sync_since(str(policy.retention))
         safe_cutoff = self._safe_cutoff(retention_cutoff, last_synced_ts)
         rows_deleted = self._purge_source(
             pg_conn,
@@ -138,8 +128,8 @@ class PgRetention:
             src_name,
             cfg.timestamp_column,
             safe_cutoff,
-            batch_size=int(cfg.source_retention_batch_size),
-            lock_timeout_ms=int(cfg.retention_lock_timeout_ms),
+            batch_size=int(policy.batch_size),
+            lock_timeout_ms=int(policy.lock_timeout_ms),
         )
         self.log.info(
             "%s: retention deleted %d row(s), cutoff=%s safe_cutoff=%s",
@@ -151,7 +141,6 @@ class PgRetention:
         return RetentionResult(
             table_id=cfg.table_id,
             status="success",
-            enabled=True,
             rows_deleted=rows_deleted,
             retention_cutoff=retention_cutoff,
             last_synced_ts=last_synced_ts,

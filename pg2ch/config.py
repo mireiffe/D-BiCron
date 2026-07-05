@@ -3,7 +3,11 @@
 테이블당 YAML 파일 1개. (one DAG per table) 선택적으로 같은 디렉터리의
 ``_defaults.yaml`` 이 모든 테이블에 병합된다 (테이블별 값이 우선, settings 는 깊은 병합).
 
-설정 예시는 config/tables/*.example.yaml 참조.
+PG source retention 은 테이블 설정과 분리된 단일 파일(``config/retention.yaml``)로
+관리한다 — retention 은 copy 와 별개 스케줄의 전용 DAG(pg2ch_retention)에서 돌기
+때문이다. ``load_retention_config`` 참조.
+
+설정 예시는 config/tables/*.example.yaml, config/retention.example.yaml 참조.
 """
 
 from __future__ import annotations
@@ -17,6 +21,7 @@ from typing import Any
 from .watermark import parse_relative_to_timedelta
 
 DEFAULT_TABLES_DIR = "config/tables"
+DEFAULT_RETENTION_CONFIG = "config/retention.yaml"
 _DEFAULTS_FILE = "_defaults.yaml"
 
 _SYNC_MODES = {"append", "full_reload"}
@@ -30,6 +35,11 @@ _TABLE_ID_RE = _re.compile(r"^[A-Za-z0-9_.-]+$")
 
 def tables_dir(path: str | None = None) -> Path:
     raw = path or os.environ.get("PG2CH_TABLES_DIR") or DEFAULT_TABLES_DIR
+    return Path(raw)
+
+
+def retention_config_path(path: str | None = None) -> Path:
+    raw = path or os.environ.get("PG2CH_RETENTION_CONFIG") or DEFAULT_RETENTION_CONFIG
     return Path(raw)
 
 
@@ -96,12 +106,6 @@ class TableConfig:
     optimize_partitions: Any = None
     optimize_mutations_sync: int = 2
 
-    # PG source retention
-    retention_enabled: bool = False
-    source_retention: str | None = None
-    source_retention_batch_size: int = 10_000
-    retention_lock_timeout_ms: int = 5_000
-
     # 무결성 검사 (retention 전 누락 row 탐지)
     integrity_enabled: bool = False
     integrity_method: str = "count"  # count | key_diff
@@ -140,31 +144,24 @@ class TableConfig:
         return split_qualified(self.target_table, default_db)
 
     # ── 검증 ─────────────────────────────────────────────────
+    _LEGACY_RETENTION_KEYS = (
+        "retention",
+        "retention_enabled",
+        "source_retention",
+        "source_retention_batch_size",
+        "retention_lock_timeout_ms",
+    )
+
     @classmethod
     def from_dict(cls, data: dict) -> "TableConfig":
         d = dict(data)
-        retention = d.pop("retention", None)
-        if retention is not None:
-            if not isinstance(retention, dict):
-                raise ValueError("retention must be a mapping")
-            retention_keys = {
-                "enabled": "retention_enabled",
-                "source_retention": "source_retention",
-                "retention": "source_retention",
-                "batch_size": "source_retention_batch_size",
-                "source_retention_batch_size": "source_retention_batch_size",
-                "lock_timeout_ms": "retention_lock_timeout_ms",
-                "retention_lock_timeout_ms": "retention_lock_timeout_ms",
-            }
-            unknown_retention = set(retention) - set(retention_keys)
-            if unknown_retention:
-                raise ValueError(
-                    "unknown retention key(s): "
-                    + ", ".join(sorted(unknown_retention))
-                )
-            for src, dst in retention_keys.items():
-                if src in retention and dst not in d:
-                    d[dst] = retention[src]
+        legacy_retention = [k for k in cls._LEGACY_RETENTION_KEYS if k in d]
+        if legacy_retention:
+            raise ValueError(
+                f"retention is no longer configured per table "
+                f"(found: {', '.join(legacy_retention)}) — move it to "
+                f"{DEFAULT_RETENTION_CONFIG} (see config/retention.example.yaml)"
+            )
 
         integrity = d.pop("integrity", None)
         if integrity is not None:
@@ -236,16 +233,6 @@ class TableConfig:
             raise ValueError(f"{self.table_id}: insert_types_check must be boolean")
         if self.max_failed_rows is not None and int(self.max_failed_rows) < 0:
             raise ValueError(f"{self.table_id}: max_failed_rows must be >= 0")
-        if not isinstance(self.retention_enabled, bool):
-            raise ValueError(f"{self.table_id}: retention_enabled must be boolean")
-        if int(self.source_retention_batch_size) <= 0:
-            raise ValueError(
-                f"{self.table_id}: source_retention_batch_size must be a positive integer"
-            )
-        if int(self.retention_lock_timeout_ms) <= 0:
-            raise ValueError(
-                f"{self.table_id}: retention_lock_timeout_ms must be a positive integer"
-            )
 
         if self.integrity_method not in _INTEGRITY_METHODS:
             raise ValueError(
@@ -285,31 +272,18 @@ class TableConfig:
             raise ValueError(
                 f"{self.table_id}: sync_since requires timestamp_column to be set"
             )
-        if self.retention_enabled:
-            if self.sync_mode != "append":
-                raise ValueError(
-                    f"{self.table_id}: retention_enabled requires append sync_mode"
-                )
-            if not self.source_retention:
-                raise ValueError(
-                    f"{self.table_id}: retention_enabled requires source_retention"
-                )
-            if not self.timestamp_column:
-                raise ValueError(
-                    f"{self.table_id}: source_retention requires timestamp_column"
-                )
-            self._validate_time_expr("source_retention", self.source_retention)
 
-    def _validate_time_expr(self, name: str, value: str) -> None:
-        raw = str(value).strip()
-        if parse_relative_to_timedelta(raw) is not None:
-            return
-        try:
-            datetime.fromisoformat(raw)
-        except ValueError as e:
-            raise ValueError(
-                f"{self.table_id}: {name} must be relative like '180d' or an ISO timestamp"
-            ) from e
+
+def _validate_time_expr(owner: str, name: str, value: str) -> None:
+    raw = str(value).strip()
+    if parse_relative_to_timedelta(raw) is not None:
+        return
+    try:
+        datetime.fromisoformat(raw)
+    except ValueError as e:
+        raise ValueError(
+            f"{owner}: {name} must be relative like '180d' or an ISO timestamp"
+        ) from e
 
 
 def _read_yaml(path: Path) -> dict:
@@ -363,3 +337,137 @@ def load_all_table_configs(directory: str | Path | None = None) -> list[TableCon
         seen[cfg.table_id] = p.name
         configs.append(cfg)
     return configs
+
+
+# ── PG source retention 설정 (config/retention.yaml) ─────────────────
+# retention 은 copy DAG 와 분리된 전용 DAG(pg2ch_retention)에서 돈다. 삭제 조건은
+# timestamp_column 기준이지만, cutoff 상한은 여전히 finalize 된 watermark 가 가리키는
+# 마지막 synced timestamp 로 캡핑된다 (copy 가 멈춘 동안 미복제 row 삭제 방지).
+
+_RETENTION_TOP_KEYS = {
+    "schedule", "start_date", "catchup", "max_active_runs", "max_active_tasks",
+    "retries", "retry_delay_seconds", "tags", "defaults", "tables",
+}
+_RETENTION_DEFAULT_KEYS = {"batch_size", "lock_timeout_ms"}
+_RETENTION_TABLE_KEYS = {"enabled", "retention", "batch_size", "lock_timeout_ms"}
+
+
+@dataclass
+class RetentionPolicy:
+    """retention.yaml 의 테이블 한 항목 (삭제 규칙)."""
+
+    table_id: str
+    retention: str  # 삭제 후보 하한: timestamp_column < now - retention. "180d" | ISO
+    batch_size: int = 10_000
+    lock_timeout_ms: int = 5_000
+
+    def validate(self) -> None:
+        if not _TABLE_ID_RE.match(self.table_id):
+            raise ValueError(
+                f"retention table_id '{self.table_id}' invalid: use [A-Za-z0-9_.-] only"
+            )
+        if not self.retention:
+            raise ValueError(f"retention[{self.table_id}]: retention is required")
+        _validate_time_expr(f"retention[{self.table_id}]", "retention", self.retention)
+        if int(self.batch_size) <= 0:
+            raise ValueError(
+                f"retention[{self.table_id}]: batch_size must be a positive integer"
+            )
+        if int(self.lock_timeout_ms) <= 0:
+            raise ValueError(
+                f"retention[{self.table_id}]: lock_timeout_ms must be a positive integer"
+            )
+
+
+@dataclass
+class RetentionConfig:
+    """retention DAG 전체 설정 (스케줄 + 테이블별 정책)."""
+
+    schedule: str | None = None
+    start_date: str | None = None
+    catchup: bool = False
+    max_active_runs: int = 1
+    max_active_tasks: int | None = None  # 동시에 purge 할 테이블 수 제한 (None=Airflow 기본)
+    retries: int = 1
+    retry_delay_seconds: int = 300
+    tags: list = field(default_factory=lambda: ["pg2ch", "retention"])
+    policies: list = field(default_factory=list)
+
+    def policy_for(self, table_id: str) -> RetentionPolicy | None:
+        return next((p for p in self.policies if p.table_id == table_id), None)
+
+
+def load_retention_config(path: str | Path | None = None) -> RetentionConfig | None:
+    """retention.yaml 로드. 파일이 없으면 None (retention 전면 비활성).
+
+    테이블 항목은 존재 자체가 활성이며, ``enabled: false`` 로 항목을 지우지 않고
+    일시 비활성할 수 있다. table_id 가 실제 테이블 설정에 존재하는지는 여기서
+    검증하지 않는다 (DAG factory / CLI 가 매칭 시점에 처리).
+    """
+    p = Path(path) if path else retention_config_path()
+    if not p.exists():
+        return None
+    data = _read_yaml(p)
+
+    unknown = {k for k in data if k not in _RETENTION_TOP_KEYS and not k.startswith("_")}
+    if unknown:
+        raise ValueError(f"{p}: unknown retention key(s): {', '.join(sorted(unknown))}")
+
+    defaults = data.get("defaults") or {}
+    if not isinstance(defaults, dict):
+        raise ValueError(f"{p}: defaults must be a mapping")
+    unknown = {
+        k for k in defaults if k not in _RETENTION_DEFAULT_KEYS and not k.startswith("_")
+    }
+    if unknown:
+        raise ValueError(
+            f"{p}: unknown retention defaults key(s): {', '.join(sorted(unknown))}"
+        )
+
+    tables = data.get("tables") or {}
+    if not isinstance(tables, dict):
+        raise ValueError(f"{p}: tables must be a mapping of table_id to settings")
+
+    policies: list[RetentionPolicy] = []
+    for table_id, spec in sorted(tables.items()):
+        spec = spec or {}
+        if not isinstance(spec, dict):
+            raise ValueError(f"{p}: tables.{table_id} must be a mapping")
+        unknown = {
+            k for k in spec if k not in _RETENTION_TABLE_KEYS and not k.startswith("_")
+        }
+        if unknown:
+            raise ValueError(
+                f"{p}: tables.{table_id}: unknown key(s): {', '.join(sorted(unknown))}"
+            )
+        merged = {**defaults, **{k: v for k, v in spec.items() if not k.startswith("_")}}
+        if not merged.pop("enabled", True):
+            continue
+        if not merged.get("retention"):
+            raise ValueError(f"{p}: tables.{table_id}: retention is required")
+        policy = RetentionPolicy(table_id=str(table_id), **merged)
+        policy.validate()
+        policies.append(policy)
+
+    cfg = RetentionConfig(
+        schedule=data.get("schedule"),
+        start_date=data.get("start_date"),
+        catchup=bool(data.get("catchup", False)),
+        max_active_runs=int(data.get("max_active_runs", 1)),
+        max_active_tasks=(
+            int(data["max_active_tasks"])
+            if data.get("max_active_tasks") is not None
+            else None
+        ),
+        retries=int(data.get("retries", 1)),
+        retry_delay_seconds=int(data.get("retry_delay_seconds", 300)),
+        tags=list(data.get("tags") or ["pg2ch", "retention"]),
+        policies=policies,
+    )
+    if cfg.max_active_runs < 1:
+        raise ValueError(f"{p}: max_active_runs must be >= 1")
+    if cfg.max_active_tasks is not None and cfg.max_active_tasks < 1:
+        raise ValueError(f"{p}: max_active_tasks must be >= 1")
+    if cfg.retries < 0:
+        raise ValueError(f"{p}: retries must be >= 0")
+    return cfg

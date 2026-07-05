@@ -54,12 +54,13 @@ optimize_after_sync: true
 optimize_partitions: ["202606"]
 optimize_mutations_sync: 2
 
-# 무결성 검사 + 누락 row 자가복구 (retention 직전, append 전용)
+# 무결성 검사 + 누락 row 자가복구 (append 전용)
 #   최근 watermark 구간 (watermark_before, watermark_after] 에서 PG source 의 row 수와
 #   CH target 의 distinct watermark 수를 비교한다. 누락이 잡히면 그 watermark 값의 row 만
 #   골라 다시 복사하고(self-heal), 그래도 남으면 retention 을 막아 source 유실을 방지한다.
 #   검사 해상도는 watermark 값 단위 — serial/증가 id 처럼 unique 한 watermark 에서 정밀하다.
-#   retention 을 켤 거라면 함께 켜는 것을 권장.
+#   retention DAG 도 삭제 직전에 같은 검사를 게이트로 쓰므로, retention 대상 테이블이라면
+#   켜는 것을 권장.
 integrity:
   enabled: false                 # true 로 켜야 검사 실행
   method: count                  # count(값싼 게이트+누락분만 diff) | key_diff(항상 정밀)
@@ -69,9 +70,6 @@ integrity:
   on_mismatch: fail              # (repair 후에도 누락 시) fail = retention 차단 | warn = 로그만
   tolerance: 0                   # 허용 누락 수 (이보다 크면 mismatch)
 
-# PG source retention (복제 완료된 오래된 source row 삭제)
-retention:
-  enabled: false                 # true 로 켜야 삭제 실행
-  source_retention: 180d         # 이보다 오래된 row 삭제 후보
-  batch_size: 10000              # DELETE batch 크기
-  lock_timeout_ms: 5000          # lock 대기 제한
+# PG source retention(오래된 source row 삭제)은 테이블 설정이 아니라
+# config/retention.yaml 에서 관리한다 — copy 와 분리된 전용 DAG 로 돈다.
+# (config/retention.example.yaml 참조)          # lock 대기 제한

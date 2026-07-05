@@ -6,13 +6,17 @@
 주기가 다를 수 있고(설정으로 지정), 어디까지 복사되었는지 / 어느 batch 의 어느 row 가
 실패했는지를 정밀하게 추적한다.
 
-Airflow DAG 는 테이블마다 `precheck → copy → finalize_watermark → verify → retention`
+Airflow DAG 는 테이블마다 `precheck → copy → finalize_watermark → verify`
 순서로 실행된다. `precheck` 는 현재 watermark 기준 copy 계획(mode/cutoff)을 산출하고
 source/meta 접속을 fail-fast 검증한다(대상 row 수는 세지 않음 — COUNT 는 큰 테이블에서
 비싸고 적재 동작에 쓰이지 않는다). `copy` 는 데이터를 적재하되 watermark 를 아직 공개하지 않는다. `finalize_watermark`
 가 같은 `run_id` 의 `watermark_after` 를 확정한다. `verify` 는(켜진 경우) 최근 watermark
-구간의 source/target row 수를 비교해 누락을 잡고, 누락 시 `retention` 을 막는다.
-마지막으로 설정이 켜진 경우에만 `retention` 이 PostgreSQL source row 를 삭제한다.
+구간의 source/target row 수를 비교해 누락을 잡고 자가복구한다.
+
+`retention`(PG source 오래된 row 삭제)은 copy 경로와 분리된 **전용 DAG
+`pg2ch_retention`** 으로 돈다 (`config/retention.yaml` 로 스케줄·테이블별 정책 관리) —
+삭제가 오래 걸려도 copy 스케줄이 밀리지 않는다. 삭제는 파괴적이므로 retention DAG 안에서
+테이블마다 `verify → retention` 순서로 무결성 검사를 통과해야 삭제가 실행된다.
 
 > 이 저장소는 과거 cron 기반 다중 DB 관리 플랫폼(dbcron)을 완전히 대체한 것이다.
 > 옛 프로젝트는 `backup_cron` 브랜치에 보존되어 있다 → 아래 [기존 프로젝트](#기존-프로젝트-backup_cron) 참조.
@@ -76,7 +80,8 @@ dead-letter 에 보존됨) 파이프라인이 멈추지 않는다 — 이때 run
 
 `overlap` 을 걸어도 batch 경계 tie·크래시 등으로 CH 에 안 넘어간 row 가 드물게 생길 수
 있다. 그 상태로 `retention` 이 source 를 지우면 데이터가 영구 유실된다. 이를 막기 위해
-`retention` **직전에** `verify` task 가 최근 watermark 구간을 검사한다.
+`verify` task 가 최근 watermark 구간을 검사한다 — copy DAG 에서는 적재 직후 자가복구용으로,
+retention DAG 에서는 삭제 **직전** 마지막 방어선으로 같은 검사가 돈다.
 
 각 run 이 이미 기록한 구간 `(watermark_before, watermark_after]` 에 대해:
 
@@ -125,10 +130,11 @@ watermark 에서 정밀하다.
 #### 판정 & 차단
 
 `integrity_on_mismatch: fail`(기본)이면 (repair 후에도) 누락이 남을 때 `verify` 가 실패하고,
-하위 `retention` 은 자동으로 skip 되어 source 가 보존된다. `warn` 이면 로그만 남기고 진행.
+retention DAG 의 하위 `retention` task 는 자동으로 skip 되어 source 가 보존된다.
+`warn` 이면 로그만 남기고 진행.
 CLI 로 직접 점검하려면 `pg2ch verify <table_id>` (검사만 하려면 `--no-repair`).
 
-> append 전용(full_reload 는 watermark 구간이 없어 skip). retention 을 켤 거라면 함께
+> append 전용(full_reload 는 watermark 구간이 없어 skip). retention 대상 테이블이라면
 > 켜는 것을 권장한다 — 삭제 직전의 마지막 점검 + 자가복구다.
 
 ---
@@ -143,6 +149,7 @@ config/connections.json    ← PG/CH/meta 접속 정보 (ID 로 관리)
 config/tables/*.yaml         ← 테이블당 1개, 복사 규칙 + DDL + 스케줄
         └── dags/pg2ch_factory.py 가 읽어 pg2ch_<table_id> DAG 자동 생성
             또는  uv run pg2ch copy <table_id> 로 직접 실행
+config/retention.yaml      ← (선택) PG source retention — 전용 DAG pg2ch_retention
 추적 결과 → Postgres pg2ch_meta 스키마
 ```
 
@@ -230,7 +237,7 @@ max_failed_rows: 1000            # 누적 실패가 넘으면 run 실패 처리
 optimize_after_sync: true
 optimize_partitions: ["202606"]  # 생략 시 전체 테이블
 
-# 무결성 검사 + 누락 row 자가복구 (retention 직전, append 전용)
+# 무결성 검사 + 누락 row 자가복구 (append 전용; retention DAG 의 삭제 게이트로도 사용)
 integrity:
   enabled: false                  # true 로 켜야 검사 실행
   method: count                   # count(값싼 게이트+누락분만 diff) | key_diff(항상 정밀)
@@ -239,13 +246,6 @@ integrity:
   repair_attempts: 1              # 재복사→재검사 최대 반복 횟수
   on_mismatch: fail               # (repair 후에도 누락 시) fail = retention 차단 | warn = 로그만
   tolerance: 0                    # 허용 누락 수
-
-# PG source retention (복제 완료된 오래된 row 삭제)
-retention:
-  enabled: false                  # true 로 켜야 삭제 실행
-  source_retention: 180d          # 삭제 후보: timestamp_column < now-180d
-  batch_size: 10000               # DELETE batch 크기
-  lock_timeout_ms: 5000
 ```
 
 **B) 통째로 갈아엎는 테이블 → `full_reload`** (매 실행 TRUNCATE 후 전체 재적재)
@@ -278,7 +278,35 @@ use_nullable: false
 | 스케줄 | `schedule`, `start_date`, `catchup`, `max_active_runs`, `retries`, `retry_delay_seconds`, `tags` |
 | 후처리 | `optimize_after_sync`, `optimize_partitions`, `optimize_mutations_sync` |
 | 무결성 검사 | `integrity.enabled`, `integrity.method`(count\|key_diff), `integrity.lookback_runs`, `integrity.repair`, `integrity.repair_attempts`, `integrity.on_mismatch`(fail\|warn), `integrity.tolerance` |
-| PG retention | `retention.enabled`, `retention.source_retention`, `retention.batch_size`, `retention.lock_timeout_ms` |
+
+### 2-b. PG source retention — `config/retention.yaml` (선택, 단일 파일)
+
+복제 완료된 오래된 source row 삭제는 테이블 설정이 아니라 별도 파일로 관리한다.
+retention 은 copy 와 분리된 **전용 DAG `pg2ch_retention`** 으로 돌아서, 삭제가 오래
+걸려도 copy 스케줄이 밀리지 않는다. 전체 예시는 `config/retention.example.yaml` 참조.
+
+```yaml
+schedule: "0 4 * * *"            # retention DAG 스케줄 (copy 와 무관하게 조절)
+start_date: "2026-01-01"
+# max_active_tasks: 2            # 동시에 purge 할 테이블 수 제한
+
+defaults:                        # 테이블 공통 기본값 (테이블별 값 우선)
+  batch_size: 10000              # DELETE batch 크기
+  lock_timeout_ms: 5000          # lock 대기 제한
+
+tables:                          # key = 테이블 설정의 table_id (append 전용)
+  orders:
+    retention: 180d              # timestamp_column < now-180d 인 row 삭제 (ISO 절대값도 가능)
+  events:
+    retention: 90d
+    batch_size: 50000
+    # enabled: false             # 항목을 지우지 않고 일시 비활성
+```
+
+여기 등록된 테이블만 삭제 대상이다(등록 = 활성). 대상 테이블은 append 모드 +
+`timestamp_column` 이 필요하다. 삭제 직전 테이블마다 `verify`(무결성 검사)가 게이트로
+돌고, cutoff 는 finalize 된 watermark 가 가리키는 마지막 synced timestamp 로 캡핑된다 —
+copy 가 멈춘 동안에도 미복제 row 는 지워지지 않는다.
 
 ### 3-a. 실행 — Airflow (Docker, 운영 방식)
 
@@ -291,7 +319,9 @@ docker compose up -d
 ```
 
 테이블당 DAG `pg2ch_<table_id>` 가 자동 생성된다. UI 에서 토글을 켜면 `schedule` 대로 돈다.
-각 DAG 는 `precheck`, `copy`, `finalize_watermark`, `verify`, `retention` task 로 나뉜다.
+각 DAG 는 `precheck`, `copy`, `finalize_watermark`, `verify` task 로 나뉜다.
+`config/retention.yaml` 이 있으면 retention 전용 DAG `pg2ch_retention` 도 함께 등록된다
+(테이블마다 `verify_<table_id> → retention_<table_id>` 체인).
 `docker-compose.yaml` 은 Airflow 공식 3.x 템플릿을 LocalExecutor 로 단순화한 것이며,
 로컬 테스트용 ClickHouse 서비스를 포함한다.
 
@@ -317,16 +347,16 @@ uv run pg2ch list                # 설정된 테이블 목록
 uv run pg2ch copy orders         # 특정 테이블 복사 1회
 uv run pg2ch copy all            # 전체 복사
 uv run pg2ch verify orders       # 최근 watermark 구간 무결성 검사 (source vs target)
-uv run pg2ch retention orders    # PG source retention 1회 실행
+uv run pg2ch retention orders    # PG source retention 1회 실행 (retention.yaml 의 테이블만)
 uv run pg2ch status orders       # 마지막 run / watermark / 미해결 실패 row 수
 ```
 
-retention 은 `retention.enabled: true` 인 append 테이블에서만 실행된다. 삭제 cutoff 는
-`retention.source_retention` 과 마지막 finalize 된 watermark 가 가리키는 source timestamp 중
+retention 은 `config/retention.yaml` 에 등록된 append 테이블에서만 실행된다. 삭제 cutoff 는
+`retention` 값과 마지막 finalize 된 watermark 가 가리키는 source timestamp 중
 더 오래된 쪽으로 제한되어, sync 가 멈춘 동안 미복제 row 가 삭제되지 않도록 한다.
 
-경로는 `--connections` / `--tables-dir` 또는 `PG2CH_CONNECTIONS` / `PG2CH_TABLES_DIR`
-환경변수로 지정.
+경로는 `--connections` / `--tables-dir` / `--retention-config` 또는 `PG2CH_CONNECTIONS` /
+`PG2CH_TABLES_DIR` / `PG2CH_RETENTION_CONFIG` 환경변수로 지정.
 
 ---
 
@@ -396,15 +426,16 @@ pg2ch/                     엔진 패키지 (Airflow 비의존, 단위 테스트
 ├── transform.py           PG row → CH INSERT 호환 변환
 ├── watermark.py           sync_since / overlap 계산
 ├── connections.py         접속 레지스트리(JSON) + PG/CH/meta 커넥션
-├── config.py              테이블 설정(YAML) 로드/검증 (TableConfig)
+├── config.py              설정(YAML) 로드/검증 (TableConfig / RetentionConfig)
 ├── tracking.py            메타 저장소 (copy_run/copy_batch/copy_failed_row)
 ├── copier.py              복사 오케스트레이션 (모드 + batch/row 추적)
-├── integrity.py           retention 전 무결성 검사 (watermark 구간 source vs target)
-├── retention.py           finalize 된 watermark 기준 PG source retention
+├── integrity.py           무결성 검사 + 자가복구 (watermark 구간 source vs target)
+├── retention.py           PG source retention (watermark 캡핑된 ts cutoff 삭제)
 └── cli.py                 CLI
-dags/pg2ch_factory.py      config → DAG(테이블당 1개) 동적 생성
+dags/pg2ch_factory.py      config → 테이블 DAG + retention 전용 DAG 동적 생성
 sql/meta_schema.sql        메타 스키마 정본
-config/                    connections.json + tables/*.yaml (실제 설정은 gitignore)
+config/                    connections.json + tables/*.yaml + retention.yaml
+                           (실제 설정은 gitignore)
 docker-compose.yaml        Airflow 3.2.2 (LocalExecutor) + ClickHouse
 Dockerfile                 apache/airflow:3.2.2 + clickhouse-driver + pg2ch
 tests/                     pytest (mocked, DB 불필요)

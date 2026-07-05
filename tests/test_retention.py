@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
-from pg2ch.config import TableConfig
+import pytest
+
+from pg2ch.config import RetentionPolicy, TableConfig
 from pg2ch.retention import PgRetention
 
 
@@ -70,26 +72,45 @@ def _cfg(**over) -> TableConfig:
         "watermark_column": "id",
         "timestamp_column": "created_at",
         "order_by": ["id"],
-        "retention_enabled": True,
-        "source_retention": "2026-01-01T00:00:00",
-        "source_retention_batch_size": 10,
     }
     d.update(over)
     return TableConfig.from_dict(d)
 
 
-def test_disabled_retention_returns_without_delete():
-    cfg = _cfg(retention_enabled=False)
+def _policy(**over) -> RetentionPolicy:
+    d = {
+        "table_id": "events",
+        "retention": "2026-01-01T00:00:00",
+        "batch_size": 10,
+    }
+    d.update(over)
+    return RetentionPolicy(**d)
+
+
+def test_policy_table_id_must_match_config():
+    with pytest.raises(ValueError, match="does not match"):
+        PgRetention(_cfg(), _policy(table_id="other"))
+
+
+def test_retention_skips_non_append():
+    cfg = _cfg(sync_mode="full_reload", watermark_column=None)
     pg = FakePG()
-    result = PgRetention(cfg).purge(pg, FakeMeta(resume="100"))
-    assert result.status == "disabled"
+    result = PgRetention(cfg, _policy()).purge(pg, FakeMeta(resume="100"))
+    assert result.status == "skipped"
+    assert result.reason == "retention requires append sync_mode"
     assert pg.executed == []
+
+
+def test_retention_requires_timestamp_column():
+    cfg = _cfg(timestamp_column=None)
+    with pytest.raises(ValueError, match="timestamp_column is required"):
+        PgRetention(cfg, _policy()).purge(FakePG(), FakeMeta(resume="100"))
 
 
 def test_retention_skips_without_finalized_watermark():
     cfg = _cfg()
     pg = FakePG()
-    result = PgRetention(cfg).purge(pg, FakeMeta(resume=None))
+    result = PgRetention(cfg, _policy()).purge(pg, FakeMeta(resume=None))
     assert result.status == "skipped"
     assert result.reason == "no finalized watermark"
     assert pg.executed == []
@@ -98,7 +119,7 @@ def test_retention_skips_without_finalized_watermark():
 def test_retention_purges_in_batches_with_safe_cutoff():
     cfg = _cfg()
     pg = FakePG(max_ts="2026-06-01T00:00:00", delete_counts=[10, 3])
-    result = PgRetention(cfg).purge(pg, FakeMeta(resume="100"))
+    result = PgRetention(cfg, _policy()).purge(pg, FakeMeta(resume="100"))
     assert result.status == "success"
     assert result.rows_deleted == 13
     assert result.safe_cutoff == "2026-01-01T00:00:00"
@@ -108,9 +129,10 @@ def test_retention_purges_in_batches_with_safe_cutoff():
 
 
 def test_retention_cutoff_is_capped_to_last_synced_timestamp():
-    cfg = _cfg(source_retention="2026-06-20T00:00:00")
+    cfg = _cfg()
+    policy = _policy(retention="2026-06-20T00:00:00")
     pg = FakePG(max_ts="2026-06-01T00:00:00", delete_counts=[0])
-    result = PgRetention(cfg).purge(pg, FakeMeta(resume="100"))
+    result = PgRetention(cfg, policy).purge(pg, FakeMeta(resume="100"))
     assert result.status == "success"
     assert result.safe_cutoff == "2026-06-01T00:00:00"
     delete_calls = [call for call in pg.executed if call[0].startswith("DELETE")]
@@ -120,7 +142,7 @@ def test_retention_cutoff_is_capped_to_last_synced_timestamp():
 def test_same_timestamp_watermark_does_not_query_max_timestamp():
     cfg = _cfg(watermark_column="created_at")
     pg = FakePG(delete_counts=[0])
-    result = PgRetention(cfg).purge(
+    result = PgRetention(cfg, _policy()).purge(
         pg,
         FakeMeta(resume="2026-06-01T00:00:00"),
     )
