@@ -18,9 +18,10 @@ target_table: default.orders
 
 # 증분 기준
 watermark_column: updated_at     # 이 컬럼 > 마지막 watermark 인 row 만 전송
-timestamp_column: updated_at     # sync_since 하한 필터 / 정렬 기준
-sync_since: 90d                  # 최근 90일만 (첫 전체 복사 + 이후 증분 하한)
-overlap_minutes: 30              # watermark 를 30분 앞당겨 재전송(누락 방지, dedup 처리)
+watermark_type: timestamp        # serial | numeric | timestamp (컬럼 지정 시 필수)
+sync_since: 90d                  # watermark 하한 — timestamp: "90d"|ISO, serial/numeric: 숫자
+watermark_overlap: 30m           # watermark 를 30분 앞당겨 재전송(누락 방지, dedup 처리)
+                                 #   timestamp: "30m"/"12h"/"1d", serial/numeric: 숫자
 
 # DDL (대상 테이블이 없으면 이 정의대로 생성)
 engine: ReplacingMergeTree(updated_at)

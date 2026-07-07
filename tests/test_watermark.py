@@ -1,4 +1,4 @@
-"""Tests for pg2ch.watermark."""
+"""Tests for pg2ch.watermark (타입 인지 파싱/변환 유틸)."""
 
 from __future__ import annotations
 
@@ -24,65 +24,160 @@ class TestParseRelative:
         assert w.parse_relative_to_timedelta("2025-01-01T00:00:00") is None
 
 
-class TestResolveSyncSince:
-    def test_days(self):
-        now = datetime(2026, 6, 23, 0, 0, 0)
-        assert w.resolve_sync_since("30d", now=now) == (now - timedelta(days=30)).isoformat()
+class TestParseValue:
+    def test_serial(self):
+        assert w.parse_value("serial", "100") == 100
+        assert isinstance(w.parse_value("serial", "100"), int)
 
-    def test_absolute_passthrough(self):
-        ts = "2025-01-01T00:00:00"
-        assert w.resolve_sync_since(ts) == ts
+    def test_serial_rejects_fraction(self):
+        with pytest.raises(ValueError, match="not an integer"):
+            w.parse_value("serial", "100.5")
 
-    def test_whitespace(self):
+    def test_serial_rejects_timestamp(self):
+        with pytest.raises(ValueError, match="not a number"):
+            w.parse_value("serial", "2025-01-01T00:00:00")
+
+    def test_numeric(self):
+        assert w.parse_value("numeric", "100.5") == Decimal("100.5")
+
+    def test_timestamp(self):
+        assert w.parse_value("timestamp", "2025-01-01T00:00:00") == datetime(2025, 1, 1)
+
+    def test_timestamp_z_suffix(self):
+        assert w.parse_value("timestamp", "2025-01-01T09:00:00Z") == datetime(2025, 1, 1, 9)
+
+    def test_timestamp_tz_normalized_to_utc_naive(self):
+        assert w.parse_value("timestamp", "2025-01-01T09:00:00+09:00") == datetime(2025, 1, 1)
+
+    def test_timestamp_datetime_passthrough(self):
+        assert w.parse_value("timestamp", datetime(2025, 1, 1)) == datetime(2025, 1, 1)
+
+    def test_timestamp_rejects_number(self):
+        with pytest.raises(ValueError, match="not an ISO timestamp"):
+            w.parse_value("timestamp", "100")
+
+    def test_unknown_type(self):
+        with pytest.raises(ValueError, match="unknown watermark type"):
+            w.parse_value("uuid", "x")
+
+    def test_none_rejected(self):
+        with pytest.raises(ValueError, match="required"):
+            w.parse_value("serial", None)
+
+
+class TestResolveSince:
+    def test_timestamp_relative(self):
         now = datetime(2026, 6, 23)
-        assert w.resolve_sync_since("  7d  ", now=now) == (now - timedelta(days=7)).isoformat()
+        assert w.resolve_since("timestamp", "30d", now=now) == now - timedelta(days=30)
+
+    def test_timestamp_absolute(self):
+        assert w.resolve_since("timestamp", "2025-01-01T00:00:00") == datetime(2025, 1, 1)
+
+    def test_timestamp_whitespace(self):
+        now = datetime(2026, 6, 23)
+        assert w.resolve_since("timestamp", "  7d  ", now=now) == now - timedelta(days=7)
+
+    def test_serial_absolute(self):
+        assert w.resolve_since("serial", 100000) == 100000
+
+    def test_serial_rejects_relative(self):
+        with pytest.raises(ValueError, match="not a number"):
+            w.resolve_since("serial", "30d")
 
 
-class TestWatermarkOverlap:
-    def test_parse_zero_as_disabled(self):
-        assert w.parse_watermark_overlap(0) is None
-        assert w.parse_watermark_overlap("0") is None
-        assert w.parse_watermark_overlap(None) is None
+class TestParseOverlap:
+    def test_zero_and_none_disabled(self):
+        assert w.parse_overlap("serial", 0) is None
+        assert w.parse_overlap("serial", "0") is None
+        assert w.parse_overlap("serial", None) is None
+        assert w.parse_overlap("timestamp", 0) is None
+        assert w.parse_overlap("timestamp", "") is None
 
-    def test_parse_positive(self):
-        assert w.parse_watermark_overlap("1000") == Decimal("1000")
+    def test_serial(self):
+        assert w.parse_overlap("serial", "1000") == 1000
 
-    def test_rejects_negative(self):
-        with pytest.raises(ValueError, match="non-negative number"):
-            w.parse_watermark_overlap(-1)
+    def test_numeric(self):
+        assert w.parse_overlap("numeric", "0.5") == Decimal("0.5")
 
-    def test_rejects_non_numeric(self):
-        with pytest.raises(ValueError, match="non-negative number"):
-            w.parse_watermark_overlap("3d")
+    def test_timestamp(self):
+        assert w.parse_overlap("timestamp", "30m") == timedelta(minutes=30)
+
+    def test_serial_rejects_negative(self):
+        with pytest.raises(ValueError, match="non-negative"):
+            w.parse_overlap("serial", -1)
+
+    def test_serial_rejects_duration(self):
+        with pytest.raises(ValueError, match="not a number"):
+            w.parse_overlap("serial", "3d")
+
+    def test_timestamp_rejects_bare_number(self):
+        with pytest.raises(ValueError, match="relative like '30m'"):
+            w.parse_overlap("timestamp", 30)
 
     def test_rejects_bool(self):
         with pytest.raises(ValueError):
-            w.parse_watermark_overlap(True)
-
-    def test_apply_integer(self):
-        assert w.apply_watermark_overlap("public.events", "1000", 50) == 950
-
-    def test_apply_decimal(self):
-        assert w.apply_watermark_overlap("public.events", "1000.5", "0.5") == 1000
-
-    def test_apply_requires_numeric_watermark(self):
-        with pytest.raises(ValueError, match="requires a numeric watermark value"):
-            w.apply_watermark_overlap("public.events", "2025-01-01T00:00:00", 100)
+            w.parse_overlap("serial", True)
 
 
 class TestApplyOverlap:
-    def test_timestamp_overlap_minutes(self):
-        assert (
-            w.apply_overlap("t", "2025-06-01T00:00:00", overlap_minutes=30)
-            == "2025-05-31T23:30:00"
+    def test_timestamp(self):
+        assert w.apply_overlap(
+            "timestamp", datetime(2025, 6, 1), "30m"
+        ) == datetime(2025, 5, 31, 23, 30)
+
+    def test_serial(self):
+        assert w.apply_overlap("serial", 1000, 20) == 980
+
+    def test_disabled_returns_value(self):
+        assert w.apply_overlap("serial", 1000, 0) == 1000
+        assert w.apply_overlap("timestamp", datetime(2025, 6, 1), None) == datetime(2025, 6, 1)
+
+
+class TestResolveRetentionCutoff:
+    def test_timestamp_relative(self):
+        now = datetime(2026, 7, 1)
+        cutoff = w.resolve_retention_cutoff(
+            "timestamp", "180d", last_synced=datetime(2026, 6, 1), now=now
         )
+        assert cutoff == now - timedelta(days=180)
 
-    def test_numeric_watermark_overlap(self):
-        assert w.apply_overlap("t", "1000", watermark_overlap=20) == 980
+    def test_timestamp_absolute(self):
+        cutoff = w.resolve_retention_cutoff(
+            "timestamp", "2026-01-01T00:00:00", last_synced=datetime(2026, 6, 1)
+        )
+        assert cutoff == datetime(2026, 1, 1)
 
-    def test_no_overlap_returns_watermark(self):
-        assert w.apply_overlap("t", "1000") == "1000"
+    def test_serial_keep_last_n(self):
+        # serial 은 마지막 synced 값 기준 keep-last-N
+        assert w.resolve_retention_cutoff("serial", 100000, last_synced=250000) == 150000
 
-    def test_overlap_minutes_ignored_for_numeric_falls_back(self):
-        # overlap_minutes 가 설정돼도 숫자 watermark 는 watermark_overlap 으로 처리
-        assert w.apply_overlap("t", "1000", overlap_minutes=30, watermark_overlap=20) == 980
+    def test_serial_zero_deletes_all_synced(self):
+        assert w.resolve_retention_cutoff("serial", 0, last_synced=250000) == 250000
+
+    def test_serial_rejects_negative(self):
+        with pytest.raises(ValueError, match="non-negative"):
+            w.resolve_retention_cutoff("serial", -5, last_synced=100)
+
+    def test_serial_rejects_duration(self):
+        with pytest.raises(ValueError, match="not a number"):
+            w.resolve_retention_cutoff("serial", "180d", last_synced=100)
+
+
+class TestValidateRetentionExpr:
+    def test_typed_timestamp(self):
+        w.validate_retention_expr("timestamp", "180d")
+        w.validate_retention_expr("timestamp", "2026-01-01T00:00:00")
+        with pytest.raises(ValueError):
+            w.validate_retention_expr("timestamp", 100000)
+
+    def test_typed_serial(self):
+        w.validate_retention_expr("serial", 100000)
+        with pytest.raises(ValueError):
+            w.validate_retention_expr("serial", "180d")
+
+    def test_untyped_accepts_either_format(self):
+        # 유효 타입 미확정(로드 시점) → 시간 표현/숫자 중 한쪽이면 통과
+        w.validate_retention_expr(None, "180d")
+        w.validate_retention_expr(None, 100000)
+        with pytest.raises(ValueError, match="relative like '180d'"):
+            w.validate_retention_expr(None, "soon")

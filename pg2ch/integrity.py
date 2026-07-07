@@ -287,7 +287,7 @@ class IntegrityChecker:
                 method=method, reason="integrity check requires append sync_mode",
             )
 
-        wm_col = cfg.effective_watermark_column
+        wm_col = cfg.watermark_column
         if not wm_col:
             return IntegrityResult(
                 table_id=cfg.table_id, status="skipped", enabled=True,

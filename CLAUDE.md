@@ -12,6 +12,8 @@ PostgreSQL → ClickHouse 복사 전용 파이프라인 (Apache Airflow 3.2.2 �
 ## 적재 모드 (테이블별 `sync_mode`)
 
 - `append` — watermark 이후 증분. 첫 실행은 전체 복사 후 watermark 설정.
+  `watermark_column` + `watermark_type`(serial|numeric|timestamp) 필수 —
+  sync_since/overlap/retention 값이 전부 이 타입으로 파싱된다 (추측 없음).
 - `full_reload` — 매 실행 TRUNCATE 후 전체 재적재.
 
 ## Quick ref
@@ -45,8 +47,12 @@ retention 전용 DAG(`pg2ch_retention`)는 테이블마다 `verify_<id> → rete
   죽은 증분 run 이 남긴 마지막 `copy_batch.watermark_hi` 중 더 진행된 지점에서
   읽는다 (OOM/SIGKILL 로 죽어도 재복사 루프에 빠지지 않게).
 - retention(=source 삭제)은 copy 와 분리된 전용 DAG 에서 `config/retention.yaml`
-  정책(ts 컬럼 기준 cutoff)대로 돈다. 단 cutoff 는 finalize 된 watermark 가 가리키는
-  마지막 synced ts 로 캡핑한다 — copy 가 멈춘 동안 미복제 row 가 삭제되지 않게.
+  정책대로 돈다. 삭제 기준 컬럼은 기본 watermark 컬럼이고 항목별 `column`/`type` 으로
+  별도 지정 가능. retention 값은 타입별 해석 — timestamp: "180d"|ISO(now 기준),
+  serial/numeric: 숫자 N(마지막 synced 값 − N, keep-last-N). cutoff 는 finalize 된
+  watermark 가 가리키는 마지막 synced 값(삭제 컬럼으로 환산)으로 캡핑한다 —
+  copy 가 멈춘 동안 미복제 row 가 삭제되지 않게. 별도 컬럼은 watermark 와 함께
+  증가하는 컬럼(삽입 시각 등)만 안전하다.
 - retention 은 파괴적이므로 직전에 `verify` 로 최근 watermark 구간의
   source `count(*)` vs target `uniqExact(watermark)` 를 비교한다. target 은 distinct
   watermark 로 세야 overlap 재전송 중복(ReplacingMergeTree 머지 전)이 누락을 가리지

@@ -1,13 +1,21 @@
 # PG source retention 설정 — copy 와 분리된 전용 DAG(pg2ch_retention)로 실행된다.
 #   retention 이 오래 걸려도 copy 스케줄이 밀리지 않도록 테이블 DAG 밖에서 돈다.
 #   여기 등록된 테이블만 삭제 대상이며, 각 테이블은 config/tables/<table_id>.yaml 에
-#   append 모드 + timestamp_column 이 설정되어 있어야 한다.
+#   append 모드(watermark_column + watermark_type)가 설정되어 있어야 한다.
+#
+#   삭제 기준 컬럼은 기본적으로 테이블의 watermark_column 이고, 테이블 항목의
+#   column/type 으로 다른 컬럼을 지정할 수 있다. retention 값은 컬럼 타입에 따라:
+#   - timestamp      : "180d"(now 기준 상대) 또는 ISO 절대 → col < cutoff
+#   - serial/numeric : 숫자 N → 마지막 synced 값 - N (keep-last-N)
 #
 #   안전장치 (retention 은 파괴적이므로):
 #   - 삭제 직전 테이블마다 verify(무결성 검사+자가복구)가 돌고, 누락이 남으면
 #     (integrity_on_mismatch=fail) 그 테이블의 삭제는 skip 된다.
-#   - 삭제 cutoff 는 finalize 된 watermark 가 가리키는 마지막 synced timestamp 로
-#     캡핑된다 — copy 가 멈춰 있는 동안 미복제 row 가 지워지지 않는다.
+#   - 삭제 cutoff 는 finalize 된 watermark 가 가리키는 마지막 synced 값(삭제 기준
+#     컬럼으로 환산)으로 캡핑된다 — copy 가 멈춰 있는 동안 미복제 row 가 지워지지 않는다.
+#   - 삭제 기준 컬럼을 watermark 와 다르게 지정할 때는 두 컬럼이 함께 증가해야
+#     안전하다 (예: serial id watermark + 삽입 시각 created_at). watermark 순서와
+#     무관하게 갱신되는 컬럼(updated_at 등)은 쓰지 말 것.
 #
 # 사용하려면 retention.yaml 로 복사해 값을 맞춘다.
 
@@ -29,8 +37,13 @@ defaults:
 # 테이블별 정책 — key 는 config/tables/<table_id>.yaml 의 table_id
 tables:
   orders:
-    retention: 180d              # timestamp_column < now-180d 인 row 삭제 (ISO 절대값도 가능)
+    retention: 180d              # watermark(timestamp) < now-180d 인 row 삭제 (ISO 절대값도 가능)
   events:
+    # watermark 는 serial id 지만 삭제는 삽입 시각 기준으로 — 컬럼/타입 별도 지정
+    column: created_at
+    type: timestamp
     retention: 90d
     batch_size: 50000            # 테이블별 override
     # enabled: false             # 항목을 지우지 않고 일시 비활성
+  event_log:
+    retention: 10000000          # serial watermark 기준 keep-last-N (마지막 synced id - N 미만 삭제)

@@ -14,11 +14,15 @@ from __future__ import annotations
 
 import os
 from dataclasses import dataclass, field
-from datetime import datetime
 from pathlib import Path
 from typing import Any
 
-from .watermark import parse_relative_to_timedelta
+from .watermark import (
+    WATERMARK_TYPES,
+    parse_overlap,
+    resolve_since,
+    validate_retention_expr,
+)
 
 DEFAULT_TABLES_DIR = "config/tables"
 DEFAULT_RETENTION_CONFIG = "config/retention.yaml"
@@ -76,12 +80,11 @@ class TableConfig:
 
     meta: str = "meta"
 
-    # append 모드
+    # append 모드 — watermark 컬럼 하나로 증분/sync_since/overlap 을 전부 관리한다.
     watermark_column: str | None = None
-    timestamp_column: str | None = None
-    watermark_overlap: Any = 0
-    overlap_minutes: int = 0
-    sync_since: str | None = None
+    watermark_type: str | None = None  # serial | numeric | timestamp (컬럼 지정 시 필수)
+    watermark_overlap: Any = 0  # timestamp → "30m" 상대 표현, serial/numeric → 숫자
+    sync_since: Any = None  # watermark 하한: timestamp → "30d"|ISO, serial/numeric → 숫자
 
     # DDL
     engine: str = "ReplacingMergeTree"
@@ -129,11 +132,6 @@ class TableConfig:
 
     # ── 파생 속성 ────────────────────────────────────────────
     @property
-    def effective_watermark_column(self) -> str | None:
-        """증분 cutoff 에 쓰는 실제 컬럼 (watermark_column 우선, 없으면 timestamp_column)."""
-        return self.watermark_column or self.timestamp_column
-
-    @property
     def dag_id(self) -> str:
         return f"pg2ch_{self.table_id}"
 
@@ -151,6 +149,18 @@ class TableConfig:
         "source_retention_batch_size",
         "retention_lock_timeout_ms",
     )
+    # 제거된 copy 설정 키 → 마이그레이션 힌트. watermark 컬럼 하나(+타입)로 통합됐다.
+    _LEGACY_COPY_KEY_HINTS = {
+        "timestamp_column": (
+            "removed — incremental copy / sync_since are driven by "
+            "watermark_column + watermark_type; the retention column is set in "
+            f"{DEFAULT_RETENTION_CONFIG} (column/type)"
+        ),
+        "overlap_minutes": (
+            "removed — use watermark_overlap (relative like '30m' when "
+            "watermark_type is 'timestamp')"
+        ),
+    }
 
     @classmethod
     def from_dict(cls, data: dict) -> "TableConfig":
@@ -162,6 +172,9 @@ class TableConfig:
                 f"(found: {', '.join(legacy_retention)}) — move it to "
                 f"{DEFAULT_RETENTION_CONFIG} (see config/retention.example.yaml)"
             )
+        for key, hint in cls._LEGACY_COPY_KEY_HINTS.items():
+            if key in d:
+                raise ValueError(f"{key}: {hint}")
 
         integrity = d.pop("integrity", None)
         if integrity is not None:
@@ -263,27 +276,45 @@ class TableConfig:
                 f"{self.table_id}: integrity_enabled requires append sync_mode"
             )
 
-        if self.sync_mode == "append" and not self.effective_watermark_column:
+        if self.sync_mode == "append" and not self.watermark_column:
             raise ValueError(
                 f"{self.table_id}: append mode requires watermark_column "
-                f"(or timestamp_column as fallback)"
+                f"(+ watermark_type)"
             )
-        if self.sync_since and not self.timestamp_column:
+        if self.watermark_column and not self.watermark_type:
             raise ValueError(
-                f"{self.table_id}: sync_since requires timestamp_column to be set"
+                f"{self.table_id}: watermark_column requires watermark_type "
+                f"({' | '.join(WATERMARK_TYPES)})"
             )
-
-
-def _validate_time_expr(owner: str, name: str, value: str) -> None:
-    raw = str(value).strip()
-    if parse_relative_to_timedelta(raw) is not None:
-        return
-    try:
-        datetime.fromisoformat(raw)
-    except ValueError as e:
-        raise ValueError(
-            f"{owner}: {name} must be relative like '180d' or an ISO timestamp"
-        ) from e
+        if self.watermark_type and not self.watermark_column:
+            raise ValueError(
+                f"{self.table_id}: watermark_type requires watermark_column"
+            )
+        if self.watermark_type is not None and self.watermark_type not in WATERMARK_TYPES:
+            raise ValueError(
+                f"{self.table_id}: watermark_type must be one of "
+                f"{sorted(WATERMARK_TYPES)}, got '{self.watermark_type}'"
+            )
+        if self.sync_since is not None:
+            if not self.watermark_type:
+                raise ValueError(
+                    f"{self.table_id}: sync_since requires watermark_column "
+                    f"and watermark_type to be set"
+                )
+            try:
+                resolve_since(self.watermark_type, self.sync_since)
+            except ValueError as e:
+                raise ValueError(f"{self.table_id}: sync_since: {e}") from e
+        if self.watermark_overlap not in (None, 0, "0", ""):
+            if not self.watermark_type:
+                raise ValueError(
+                    f"{self.table_id}: watermark_overlap requires watermark_column "
+                    f"and watermark_type to be set"
+                )
+            try:
+                parse_overlap(self.watermark_type, self.watermark_overlap)
+            except ValueError as e:
+                raise ValueError(f"{self.table_id}: {e}") from e
 
 
 def _read_yaml(path: Path) -> dict:
@@ -340,24 +371,35 @@ def load_all_table_configs(directory: str | Path | None = None) -> list[TableCon
 
 
 # ── PG source retention 설정 (config/retention.yaml) ─────────────────
-# retention 은 copy DAG 와 분리된 전용 DAG(pg2ch_retention)에서 돈다. 삭제 조건은
-# timestamp_column 기준이지만, cutoff 상한은 여전히 finalize 된 watermark 가 가리키는
-# 마지막 synced timestamp 로 캡핑된다 (copy 가 멈춘 동안 미복제 row 삭제 방지).
+# retention 은 copy DAG 와 분리된 전용 DAG(pg2ch_retention)에서 돈다. 삭제 기준
+# 컬럼/타입은 기본적으로 테이블의 watermark_column/watermark_type 을 따르고,
+# 테이블 항목의 column/type 으로 다른 컬럼을 지정할 수 있다. cutoff 상한은 여전히
+# finalize 된 watermark 가 가리키는 마지막 synced 값으로 캡핑된다
+# (copy 가 멈춘 동안 미복제 row 삭제 방지).
 
 _RETENTION_TOP_KEYS = {
     "schedule", "start_date", "catchup", "max_active_runs", "max_active_tasks",
     "retries", "retry_delay_seconds", "tags", "defaults", "tables",
 }
 _RETENTION_DEFAULT_KEYS = {"batch_size", "lock_timeout_ms"}
-_RETENTION_TABLE_KEYS = {"enabled", "retention", "batch_size", "lock_timeout_ms"}
+_RETENTION_TABLE_KEYS = {
+    "enabled", "retention", "column", "type", "batch_size", "lock_timeout_ms",
+}
 
 
 @dataclass
 class RetentionPolicy:
-    """retention.yaml 의 테이블 한 항목 (삭제 규칙)."""
+    """retention.yaml 의 테이블 한 항목 (삭제 규칙).
+
+    retention 값은 삭제 기준 컬럼의 타입에 따라 해석된다:
+      - timestamp     : "180d"(now 기준 상대) 또는 ISO 절대 → col < cutoff
+      - serial/numeric: 숫자 N → 마지막 synced 값 - N (keep-last-N)
+    """
 
     table_id: str
-    retention: str  # 삭제 후보 하한: timestamp_column < now - retention. "180d" | ISO
+    retention: Any  # 삭제 후보 상한 (타입별 해석 — 클래스 docstring 참조)
+    column: str | None = None  # 삭제 기준 컬럼 (기본: 테이블의 watermark_column)
+    type: str | None = None  # column 의 타입 (column 지정 시 필수)
     batch_size: int = 10_000
     lock_timeout_ms: int = 5_000
 
@@ -366,9 +408,24 @@ class RetentionPolicy:
             raise ValueError(
                 f"retention table_id '{self.table_id}' invalid: use [A-Za-z0-9_.-] only"
             )
-        if not self.retention:
+        if self.retention is None or self.retention == "":
             raise ValueError(f"retention[{self.table_id}]: retention is required")
-        _validate_time_expr(f"retention[{self.table_id}]", "retention", self.retention)
+        if (self.column is None) != (self.type is None):
+            raise ValueError(
+                f"retention[{self.table_id}]: column and type must be set together "
+                f"(omit both to use the table's watermark column)"
+            )
+        if self.type is not None and self.type not in WATERMARK_TYPES:
+            raise ValueError(
+                f"retention[{self.table_id}]: type must be one of "
+                f"{sorted(WATERMARK_TYPES)}, got '{self.type}'"
+            )
+        # type 미지정이면 유효 타입(=테이블 watermark_type)이 로드 시점에 미확정
+        # → 형식만 느슨히 검증하고, 엄밀한 검증은 PgRetention 실행 시점에 한다.
+        try:
+            validate_retention_expr(self.type, self.retention)
+        except ValueError as e:
+            raise ValueError(f"retention[{self.table_id}]: {e}") from e
         if int(self.batch_size) <= 0:
             raise ValueError(
                 f"retention[{self.table_id}]: batch_size must be a positive integer"
@@ -443,7 +500,7 @@ def load_retention_config(path: str | Path | None = None) -> RetentionConfig | N
         merged = {**defaults, **{k: v for k, v in spec.items() if not k.startswith("_")}}
         if not merged.pop("enabled", True):
             continue
-        if not merged.get("retention"):
+        if merged.get("retention") is None or merged.get("retention") == "":
             raise ValueError(f"{p}: tables.{table_id}: retention is required")
         policy = RetentionPolicy(table_id=str(table_id), **merged)
         policy.validate()

@@ -38,7 +38,7 @@ from .connections import ch_connect, get_connection, pg_connect
 from .ddl import build_ch_columns, build_create_table_ddl, extract_ch_key_columns
 from .tracking import MetaStore, row_to_json
 from .transform import build_transformer
-from .watermark import apply_overlap, resolve_sync_since
+from .watermark import apply_overlap, parse_value, resolve_since
 
 logger = logging.getLogger("pg2ch.copier")
 
@@ -202,8 +202,7 @@ class TableCopier:
         finalize_run: bool = True,
     ) -> RunResult:
         cfg = self.cfg
-        wm_col = cfg.effective_watermark_column
-        ts_col = cfg.timestamp_column
+        wm_col = cfg.watermark_column
         is_append = cfg.sync_mode == "append"
 
         # 1~2) PG introspection + CH 컬럼 매핑 + 대상 테이블 보장
@@ -217,7 +216,7 @@ class TableCopier:
         if window["planned_mode"] == "incremental":
             cutoff = window["copy_cutoff"]
             query, params = self._incremental_query(
-                src_schema, src_name, ch_columns, wm_col, ts_col, cutoff, sync_since
+                src_schema, src_name, ch_columns, wm_col, cutoff, sync_since
             )
             watermark_before = window["watermark_before"]
             self.log.info(
@@ -231,7 +230,7 @@ class TableCopier:
                     f"{quote_ch_identifier(tgt_db)}.{quote_ch_identifier(tgt_name)}"
                 )
             query, params = self._full_query(
-                src_schema, src_name, ch_columns, ts_col, sync_since
+                src_schema, src_name, ch_columns, wm_col, sync_since
             )
             watermark_before = window["watermark_before"]
             self.log.info(
@@ -383,7 +382,7 @@ class TableCopier:
             f"INSERT INTO {quote_ch_identifier(tgt_db)}."
             f"{quote_ch_identifier(tgt_name)} ({col_insert}) VALUES"
         )
-        wm_col = cfg.effective_watermark_column
+        wm_col = cfg.watermark_column
         wm_idx = col_names.index(wm_col) if wm_col and wm_col in col_names else None
         key_idx = [col_names.index(c) for c in key_cols]
         select_list = self._pg_select_list(ch_columns)
@@ -514,29 +513,35 @@ class TableCopier:
             target_table=cfg.target_table,
             planned_mode=window["planned_mode"],
             rows_to_copy=None,
-            watermark_column=cfg.effective_watermark_column if cfg.sync_mode == "append" else None,
+            watermark_column=cfg.watermark_column if cfg.sync_mode == "append" else None,
             resume_watermark=window["resume_watermark"],
             copy_cutoff=_wm_str(window["copy_cutoff"]),
-            sync_since=window["sync_since"],
+            sync_since=_wm_str(window["sync_since"]),
         )
 
     def _copy_window(self, meta: MetaStore) -> dict:
+        """모드/cutoff 계산. cutoff·sync_since 는 watermark_type 으로 파싱된 typed 값."""
         cfg = self.cfg
-        wm_col = cfg.effective_watermark_column
+        wm_col = cfg.watermark_column
+        wm_type = cfg.watermark_type
         is_append = cfg.sync_mode == "append"
-        sync_since = resolve_sync_since(cfg.sync_since) if cfg.sync_since else None
+        sync_since = (
+            resolve_since(wm_type, cfg.sync_since)
+            if cfg.sync_since is not None
+            else None
+        )
         resume_wm = (
             meta.get_resume_watermark(cfg.table_id, wm_col)
             if (is_append and wm_col)
             else None
         )
         if is_append and resume_wm is not None:
-            cutoff = apply_overlap(
-                cfg.source_table,
-                resume_wm,
-                overlap_minutes=cfg.overlap_minutes,
-                watermark_overlap=cfg.watermark_overlap,
-            )
+            try:
+                cutoff = apply_overlap(
+                    wm_type, parse_value(wm_type, resume_wm), cfg.watermark_overlap
+                )
+            except ValueError as e:
+                raise ValueError(f"{cfg.table_id}: resume watermark: {e}") from e
             return {
                 "planned_mode": "incremental",
                 "resume_watermark": str(resume_wm),
@@ -747,12 +752,10 @@ class TableCopier:
 
     @classmethod
     def _incremental_query(
-        cls, src_schema, src_name, select_items, wm_col, ts_col, cutoff, sync_since
+        cls, src_schema, src_name, select_items, wm_col, cutoff, sync_since
     ):
         col_list = cls._pg_select_list(select_items)
-        conditions, params = cls._incremental_conditions(
-            wm_col, ts_col, cutoff, sync_since
-        )
+        conditions, params = cls._incremental_conditions(wm_col, cutoff, sync_since)
         where = " AND ".join(conditions)
         query = (
             f"SELECT {col_list} FROM {quote_pg_identifier(src_schema)}."
@@ -762,7 +765,7 @@ class TableCopier:
         return query, tuple(params)
 
     @classmethod
-    def _full_query(cls, src_schema, src_name, select_items, ts_col, sync_since):
+    def _full_query(cls, src_schema, src_name, select_items, wm_col, sync_since):
         # full copy 는 정렬 없이 seq scan 으로 스트리밍한다.
         # PG 의 ORDER BY 는 server-side cursor 와 만나면 첫 row 를 내보내기 전에
         # 전체 테이블 정렬(blocking sort)을 강제해, 대용량 첫 실행에서 데이터가
@@ -774,28 +777,26 @@ class TableCopier:
             f"SELECT {col_list} FROM {quote_pg_identifier(src_schema)}."
             f"{quote_pg_identifier(src_name)}"
         )
-        conditions, params = cls._full_conditions(ts_col, sync_since)
+        conditions, params = cls._full_conditions(wm_col, sync_since)
         if conditions:
             query += " WHERE " + " AND ".join(conditions)
         return query, params
 
     @staticmethod
-    def _incremental_conditions(wm_col, ts_col, cutoff, sync_since):
+    def _incremental_conditions(wm_col, cutoff, sync_since):
+        # cutoff(재개점, exclusive)와 sync_since(하한, inclusive)를 둘 다 조건으로
+        # 건다 — 어느 쪽이 더 진행됐는지 파이썬에서 비교하지 않아도 정확하다.
         conditions = [f"{quote_pg_identifier(wm_col)} > %s"]
         params: list = [cutoff]
-        if sync_since and ts_col:
-            if ts_col == wm_col:
-                if str(sync_since) > str(cutoff):
-                    params[0] = sync_since
-            else:
-                conditions.append(f"{quote_pg_identifier(ts_col)} >= %s")
-                params.append(sync_since)
+        if sync_since is not None:
+            conditions.append(f"{quote_pg_identifier(wm_col)} >= %s")
+            params.append(sync_since)
         return conditions, tuple(params)
 
     @staticmethod
-    def _full_conditions(ts_col, sync_since):
-        if sync_since and ts_col:
-            return [f"{quote_pg_identifier(ts_col)} >= %s"], (sync_since,)
+    def _full_conditions(wm_col, sync_since):
+        if sync_since is not None and wm_col:
+            return [f"{quote_pg_identifier(wm_col)} >= %s"], (sync_since,)
         return [], None
 
     # ── post-sync OPTIMIZE ───────────────────────────────────

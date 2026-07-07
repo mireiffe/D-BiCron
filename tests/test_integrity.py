@@ -95,7 +95,7 @@ def _cfg(**over) -> TableConfig:
         "target_table": "default.events",
         "sync_mode": "append",
         "watermark_column": "id",
-        "timestamp_column": "created_at",
+        "watermark_type": "serial",
         "order_by": ["id"],
         "engine": "ReplacingMergeTree",
         "integrity_enabled": True,

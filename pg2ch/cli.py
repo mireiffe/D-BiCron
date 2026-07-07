@@ -177,12 +177,15 @@ def cmd_status(args) -> int:
     cfg = _find_config(args.table_id, args.tables_dir)
     meta_cfg = get_connection(cfg.meta, args.connections)
     with MetaStore.connect(meta_cfg) as meta:
-        wm_col = cfg.effective_watermark_column
+        wm_col = cfg.watermark_column
         wm = meta.get_resume_watermark(cfg.table_id, wm_col) if wm_col else None
         unresolved = meta.unresolved_failed_count(cfg.table_id)
     print(f"table_id        : {cfg.table_id}")
     print(f"sync_mode       : {cfg.sync_mode}")
-    print(f"watermark_column: {wm_col or '-'}")
+    print(
+        f"watermark_column: "
+        f"{f'{wm_col} ({cfg.watermark_type})' if wm_col else '-'}"
+    )
     print(f"resume watermark: {wm or '(none — next run is a full copy)'}")
     integrity_desc = (
         f"enabled (method={cfg.integrity_method}, "
@@ -193,7 +196,9 @@ def cmd_status(args) -> int:
     rcfg = load_retention_config(args.retention_config)
     policy = rcfg.policy_for(cfg.table_id) if rcfg else None
     retention_desc = (
-        f"enabled (retention={policy.retention})" if policy else "disabled"
+        f"enabled (retention={policy.retention}, "
+        f"column={policy.column or wm_col or '-'})"
+        if policy else "disabled"
     )
     print(f"retention       : {retention_desc}")
     print(f"unresolved failed rows: {unresolved}")

@@ -1,9 +1,21 @@
 """PG source retention.
 
-copy 와 분리된 전용 DAG(pg2ch_retention)/CLI 에서 실행된다. 삭제 대상은
-timestamp_column 기준(``ts < cutoff``)이지만, cutoff 는 finalize 된 watermark
-(pg2ch_meta.copy_run)가 가리키는 마지막 synced timestamp 를 넘지 못하게 캡핑한다 —
-copy 가 멈춘 동안 retention 만 계속 돌아도 미복제 row 가 삭제되지 않는다.
+copy 와 분리된 전용 DAG(pg2ch_retention)/CLI 에서 실행된다. 삭제 기준 컬럼은
+기본적으로 테이블의 watermark_column 이고, retention.yaml 테이블 항목의
+``column``/``type`` 으로 다른 컬럼을 지정할 수 있다. 삭제 조건은
+``col < cutoff`` 이며, retention 값은 컬럼 타입에 따라 해석된다:
+
+  - timestamp     : "180d"(now 기준 상대) 또는 ISO 절대 → cutoff
+  - serial/numeric: 숫자 N → 마지막 synced 값 - N (keep-last-N)
+
+cutoff 는 finalize 된 watermark(pg2ch_meta.copy_run)가 가리키는 마지막 synced
+값(삭제 기준 컬럼으로 환산)을 넘지 못하게 캡핑한다 — copy 가 멈춘 동안
+retention 만 계속 돌아도 미복제 row 가 삭제되지 않는다.
+
+⚠️ 삭제 기준 컬럼을 watermark 와 다르게 지정할 때는 두 컬럼이 함께 증가해야
+안전하다 (예: serial id watermark + 삽입 시각 created_at). watermark 순서와
+무관하게 갱신되는 컬럼(updated_at 등)을 쓰면, 아직 sync 되지 않은 갱신을 가진
+row 가 오래된 삭제 기준 값 때문에 지워질 수 있다.
 
 어떤 테이블을 얼마나 지울지는 config/retention.yaml 의 RetentionPolicy 로 정한다.
 """
@@ -12,15 +24,23 @@ from __future__ import annotations
 
 import logging
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import datetime
 
 from .chtypes import quote_pg_identifier
 from .config import RetentionPolicy, TableConfig
 from .connections import get_connection, pg_connect
 from .tracking import MetaStore
-from .watermark import resolve_sync_since
+from .watermark import parse_value, resolve_retention_cutoff, validate_retention_expr
 
 log = logging.getLogger("pg2ch.retention")
+
+
+def _as_str(value) -> str | None:
+    if value is None:
+        return None
+    if isinstance(value, datetime):
+        return value.isoformat()
+    return str(value)
 
 
 @dataclass
@@ -28,26 +48,14 @@ class RetentionResult:
     table_id: str
     status: str
     rows_deleted: int = 0
+    column: str | None = None
     retention_cutoff: str | None = None
-    last_synced_ts: str | None = None
+    last_synced: str | None = None
     safe_cutoff: str | None = None
     reason: str | None = None
 
     def as_dict(self) -> dict:
         return {k: getattr(self, k) for k in self.__dataclass_fields__}
-
-
-def _parse_dt(value) -> datetime:
-    if isinstance(value, datetime):
-        dt = value
-    else:
-        raw = str(value).strip()
-        if raw.endswith("Z"):
-            raw = raw[:-1] + "+00:00"
-        dt = datetime.fromisoformat(raw)
-    if dt.tzinfo is not None:
-        dt = dt.astimezone(timezone.utc).replace(tzinfo=None)
-    return dt
 
 
 class PgRetention:
@@ -97,44 +105,63 @@ class PgRetention:
                 status="skipped",
                 reason="retention requires append sync_mode",
             )
-        if not cfg.timestamp_column:
-            raise ValueError(f"{cfg.table_id}: timestamp_column is required")
 
-        wm_col = cfg.effective_watermark_column
+        wm_col = cfg.watermark_column
+        wm_type = cfg.watermark_type
+        # 삭제 기준 컬럼/타입: 정책 override 가 없으면 watermark 컬럼을 그대로 쓴다.
+        ret_col = policy.column or wm_col
+        ret_type = policy.type or wm_type
+        # 유효 타입이 정해졌으니 retention 표현을 엄밀히 재검증한다
+        # (로드 시점에는 type 미지정 항목을 느슨하게만 검증했다).
+        try:
+            validate_retention_expr(ret_type, policy.retention)
+        except ValueError as e:
+            raise ValueError(f"{cfg.table_id}: retention: {e}") from e
+
         watermark = meta.get_resume_watermark(cfg.table_id, wm_col)
         if watermark is None:
             return RetentionResult(
                 table_id=cfg.table_id,
                 status="skipped",
+                column=ret_col,
                 reason="no finalized watermark",
             )
+        try:
+            wm_value = parse_value(wm_type, watermark)
+        except ValueError as e:
+            raise ValueError(f"{cfg.table_id}: watermark: {e}") from e
 
         src_schema, src_name = cfg.source_parts()
-        last_synced_ts = self._resolve_watermark_to_ts(
-            pg_conn, src_schema, src_name, cfg.timestamp_column, wm_col, watermark
+        last_synced = self._last_synced_value(
+            pg_conn, src_schema, src_name, ret_col, ret_type, wm_col, wm_value
         )
-        if last_synced_ts is None:
+        if last_synced is None:
             return RetentionResult(
                 table_id=cfg.table_id,
                 status="skipped",
-                reason="watermark resolves to no synced timestamp",
+                column=ret_col,
+                reason="watermark resolves to no synced value",
             )
 
-        retention_cutoff = resolve_sync_since(str(policy.retention))
-        safe_cutoff = self._safe_cutoff(retention_cutoff, last_synced_ts)
+        retention_cutoff = resolve_retention_cutoff(
+            ret_type, policy.retention, last_synced=last_synced
+        )
+        # 캡핑: 마지막 synced 값 이후(=아직 미복제일 수 있는 구간)는 지우지 않는다.
+        safe_cutoff = min(retention_cutoff, last_synced)
         rows_deleted = self._purge_source(
             pg_conn,
             src_schema,
             src_name,
-            cfg.timestamp_column,
+            ret_col,
             safe_cutoff,
             batch_size=int(policy.batch_size),
             lock_timeout_ms=int(policy.lock_timeout_ms),
         )
         self.log.info(
-            "%s: retention deleted %d row(s), cutoff=%s safe_cutoff=%s",
+            "%s: retention deleted %d row(s) by %s, cutoff=%s safe_cutoff=%s",
             cfg.source_table,
             rows_deleted,
+            ret_col,
             retention_cutoff,
             safe_cutoff,
         )
@@ -142,44 +169,30 @@ class PgRetention:
             table_id=cfg.table_id,
             status="success",
             rows_deleted=rows_deleted,
-            retention_cutoff=retention_cutoff,
-            last_synced_ts=last_synced_ts,
-            safe_cutoff=safe_cutoff,
+            column=ret_col,
+            retention_cutoff=_as_str(retention_cutoff),
+            last_synced=_as_str(last_synced),
+            safe_cutoff=_as_str(safe_cutoff),
         )
 
-    def _safe_cutoff(self, retention_cutoff: str, last_synced_ts: str) -> str:
-        try:
-            retention_dt = _parse_dt(retention_cutoff)
-            synced_dt = _parse_dt(last_synced_ts)
-        except ValueError as e:
-            raise ValueError(
-                f"{self.cfg.table_id}: retention cutoff and last synced timestamp "
-                "must be ISO timestamps"
-            ) from e
-        return retention_cutoff if retention_dt <= synced_dt else last_synced_ts
-
     @staticmethod
-    def _resolve_watermark_to_ts(
-        pg_conn,
-        src_schema: str,
-        src_name: str,
-        ts_col: str,
-        wm_col: str,
-        watermark: str,
-    ) -> str | None:
-        if wm_col == ts_col:
-            try:
-                _parse_dt(watermark)
-            except ValueError:
-                return None
-            return str(watermark)
+    def _last_synced_value(
+        pg_conn, src_schema, src_name, ret_col, ret_type, wm_col, wm_value,
+    ):
+        """watermark 가 가리키는 "마지막 synced 지점"을 삭제 기준 컬럼 값으로 환산.
+
+        삭제 기준 컬럼이 watermark 컬럼과 같으면 watermark 값 그대로, 다르면
+        synced 구간(wm <= watermark)의 MAX(ret_col) 을 source 에서 읽는다.
+        """
+        if ret_col == wm_col:
+            return wm_value
 
         src_fqn = f"{quote_pg_identifier(src_schema)}.{quote_pg_identifier(src_name)}"
         with pg_conn.cursor() as cur:
             cur.execute(
-                f"SELECT MAX({quote_pg_identifier(ts_col)}) FROM {src_fqn} "
+                f"SELECT MAX({quote_pg_identifier(ret_col)}) FROM {src_fqn} "
                 f"WHERE {quote_pg_identifier(wm_col)} <= %s",
-                (watermark,),
+                (wm_value,),
             )
             row = cur.fetchone()
         try:
@@ -188,16 +201,15 @@ class PgRetention:
             pass
         if not row or row[0] is None:
             return None
-        value = row[0]
-        return value.isoformat() if hasattr(value, "isoformat") else str(value)
+        return parse_value(ret_type, row[0])
 
     def _purge_source(
         self,
         pg_conn,
         src_schema: str,
         src_name: str,
-        ts_col: str,
-        cutoff: str,
+        ret_col: str,
+        cutoff,
         *,
         batch_size: int,
         lock_timeout_ms: int,
@@ -213,7 +225,7 @@ class PgRetention:
                         f"DELETE FROM {src_fqn} "
                         f"WHERE ctid = ANY(ARRAY("
                         f"  SELECT ctid FROM {src_fqn} "
-                        f"  WHERE {quote_pg_identifier(ts_col)} < %s "
+                        f"  WHERE {quote_pg_identifier(ret_col)} < %s "
                         f"  LIMIT %s"
                         f"))",
                         (cutoff, batch_size),

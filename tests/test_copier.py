@@ -152,27 +152,20 @@ def _cfg(**over) -> TableConfig:
 class TestQueryBuilders:
     def test_incremental_query(self):
         q, p = TableCopier._incremental_query(
-            "public", "orders", ["id", "name"], "id", None, "1", None
+            "public", "orders", ["id", "name"], "id", 1, None
         )
         assert '"id" > %s' in q
         assert 'ORDER BY "id"' in q
-        assert p == ("1",)
+        assert p == (1,)
 
-    def test_incremental_with_separate_sync_since(self):
+    def test_incremental_with_sync_since_adds_lower_bound(self):
+        # cutoff(재개점)와 sync_since(하한)를 둘 다 조건으로 건다.
         q, p = TableCopier._incremental_query(
-            "public", "events", ["sync_id", "created_at"], "sync_id", "created_at",
-            "100", "2025-01-01T00:00:00",
+            "public", "events", ["id", "name"], "id", 100, 5000
         )
-        assert '"sync_id" > %s' in q
-        assert '"created_at" >= %s' in q
-        assert p == ("100", "2025-01-01T00:00:00")
-
-    def test_incremental_sync_since_same_column_overrides_older_cutoff(self):
-        q, p = TableCopier._incremental_query(
-            "public", "orders", ["updated_at"], "updated_at", "updated_at",
-            "2024-01-01T00:00:00", "2025-01-01T00:00:00",
-        )
-        assert p == ("2025-01-01T00:00:00",)
+        assert '"id" > %s' in q
+        assert '"id" >= %s' in q
+        assert p == (100, 5000)
 
     def test_full_query_no_filter(self):
         q, p = TableCopier._full_query("public", "orders", ["id", "name"], None, None)
@@ -182,12 +175,14 @@ class TestQueryBuilders:
         assert p is None
 
     def test_full_query_with_sync_since(self):
+        from datetime import datetime
+
         q, p = TableCopier._full_query(
-            "public", "orders", ["id", "ts"], "ts", "2025-01-01T00:00:00"
+            "public", "orders", ["id", "ts"], "ts", datetime(2025, 1, 1)
         )
         assert '"ts" >= %s' in q
         assert "ORDER BY" not in q
-        assert p == ("2025-01-01T00:00:00",)
+        assert p == (datetime(2025, 1, 1),)
 
     def test_full_query_pushes_pg_casts_for_expensive_types(self):
         q, _ = TableCopier._full_query(
@@ -291,7 +286,7 @@ class TestCopyFlow:
         assert any("CREATE TABLE IF NOT EXISTS `default`.`orders`" in s for s in ch.executed)
 
     def test_append_first_run_copies_all_and_sets_watermark(self):
-        cfg = _cfg(sync_mode="append", watermark_column="id")
+        cfg = _cfg(sync_mode="append", watermark_column="id", watermark_type="serial")
         result, pg, ch, meta = self._run(cfg, [(1, "a"), (2, "b"), (3, "c")], resume=None)
         # append 첫 실행은 TRUNCATE 하지 않는다
         assert not any("TRUNCATE" in s for s in ch.executed)
@@ -304,17 +299,46 @@ class TestCopyFlow:
         assert "ORDER BY" not in pg.stream.query
 
     def test_append_incremental_uses_cutoff(self):
-        cfg = _cfg(sync_mode="append", watermark_column="id")
+        cfg = _cfg(sync_mode="append", watermark_column="id", watermark_type="serial")
         result, pg, ch, meta = self._run(cfg, [(2, "b"), (3, "c")], resume="1")
         assert pg.stream.query is not None
         assert '"id" > %s' in pg.stream.query
-        assert pg.stream.params == ("1",)
+        # 메타(TEXT)의 resume watermark 는 watermark_type 으로 파싱돼 typed 로 바인딩된다.
+        assert pg.stream.params == (1,)
         assert result.watermark_before == "1"
         assert result.watermark_after == "3"
         assert result.status == "success"
 
+    def test_append_incremental_applies_typed_overlap(self):
+        cfg = _cfg(
+            sync_mode="append", watermark_column="id", watermark_type="serial",
+            watermark_overlap=20,
+        )
+        _, pg, _, _ = self._run(cfg, [(2, "b")], resume="100")
+        assert pg.stream.params == (80,)
+
+    def test_append_incremental_with_sync_since_lower_bound(self):
+        cfg = _cfg(
+            sync_mode="append", watermark_column="id", watermark_type="serial",
+            sync_since=5000,
+        )
+        _, pg, _, _ = self._run(cfg, [(6000, "x")], resume="100")
+        assert '"id" > %s' in pg.stream.query
+        assert '"id" >= %s' in pg.stream.query
+        assert pg.stream.params == (100, 5000)
+
+    def test_resume_watermark_must_match_declared_type(self):
+        # serial watermark 가 쌓인 테이블에 watermark_type=timestamp 로 잘못 설정
+        # → 추측해서 넘어가지 않고 즉시 실패한다.
+        cfg = _cfg(
+            sync_mode="append", watermark_column="id", watermark_type="timestamp",
+        )
+        pg = FakePG(COLS, [])
+        with pytest.raises(ValueError, match="resume watermark"):
+            TableCopier(cfg).copy(pg, FakeCH(), FakeMeta(resume="1"))
+
     def test_precheck_plans_incremental_without_count(self):
-        cfg = _cfg(sync_mode="append", watermark_column="id")
+        cfg = _cfg(sync_mode="append", watermark_column="id", watermark_type="serial")
         meta = FakeMeta(resume="10")
         plan = TableCopier(cfg).inspect_copy_plan(meta)
         assert plan.planned_mode == "incremental"
@@ -333,7 +357,7 @@ class TestCopyFlow:
         assert plan.watermark_column is None
 
     def test_precheck_plans_append_first_run(self):
-        cfg = _cfg(sync_mode="append", watermark_column="id")
+        cfg = _cfg(sync_mode="append", watermark_column="id", watermark_type="serial")
         meta = FakeMeta(resume=None)
         plan = TableCopier(cfg).inspect_copy_plan(meta)
         assert plan.planned_mode == "append_first_run"
@@ -341,7 +365,7 @@ class TestCopyFlow:
         assert plan.rows_to_copy is None
 
     def test_deferred_copy_does_not_publish_watermark(self):
-        cfg = _cfg(sync_mode="append", watermark_column="id")
+        cfg = _cfg(sync_mode="append", watermark_column="id", watermark_type="serial")
         pg = FakePG(COLS, [(1, "a"), (2, "b"), (3, "c")])
         ch = FakeCH()
         meta = FakeMeta(resume=None)
@@ -354,7 +378,10 @@ class TestCopyFlow:
         assert meta.finished["watermark_after"] is None
 
     def test_partial_run_dead_letters_bad_row(self):
-        cfg = _cfg(sync_mode="append", watermark_column="id", on_row_error="dead_letter")
+        cfg = _cfg(
+            sync_mode="append", watermark_column="id", watermark_type="serial",
+            on_row_error="dead_letter",
+        )
         result, pg, ch, meta = self._run(
             cfg, [(1, "a"), (2, "BAD"), (3, "c")], resume=None, bad=lambda r: r[1] == "BAD"
         )
@@ -370,7 +397,10 @@ class TestCopyFlow:
         assert meta.finished["status"] == "partial"
 
     def test_skip_policy_does_not_record_failed_rows(self):
-        cfg = _cfg(sync_mode="append", watermark_column="id", on_row_error="skip")
+        cfg = _cfg(
+            sync_mode="append", watermark_column="id", watermark_type="serial",
+            on_row_error="skip",
+        )
         result, pg, ch, meta = self._run(
             cfg, [(1, "a"), (2, "BAD")], resume=None, bad=lambda r: r[1] == "BAD"
         )
@@ -379,7 +409,7 @@ class TestCopyFlow:
 
     def test_max_failed_rows_aborts(self):
         cfg = _cfg(
-            sync_mode="append", watermark_column="id",
+            sync_mode="append", watermark_column="id", watermark_type="serial",
             on_row_error="dead_letter", max_failed_rows=0, batch_size=10,
         )
         pg = FakePG(COLS, [(1, "a"), (2, "BAD")])
@@ -419,7 +449,10 @@ class TestCopyFlow:
 
 class TestCopyMissingKeys:
     def test_recopies_only_missing_keys_and_keeps_watermark(self):
-        cfg = _cfg(sync_mode="append", watermark_column="id", engine="ReplacingMergeTree")
+        cfg = _cfg(
+            sync_mode="append", watermark_column="id", watermark_type="serial",
+            engine="ReplacingMergeTree",
+        )
         pg = FakePG(COLS, [(1, "a"), (2, "b"), (3, "c"), (4, "d")])
         ch = FakeCH()
         meta = FakeMeta()
@@ -443,7 +476,7 @@ class TestCopyMissingKeys:
         # wm_lo/wm_hi 를 주면 스캔이 watermark 구간으로 제한된다 (source seq scan 방지).
         cfg = _cfg(
             sync_mode="append", watermark_column="updated_at",
-            engine="ReplacingMergeTree",
+            watermark_type="timestamp", engine="ReplacingMergeTree",
         )
         pg = FakePG(COLS, [(2, "b"), (4, "d")])
         ch = FakeCH()
@@ -458,7 +491,10 @@ class TestCopyMissingKeys:
 
     def test_early_stops_once_all_missing_found(self):
         # 모든 누락 key 를 찾으면 window 끝까지 스캔하지 않는다.
-        cfg = _cfg(sync_mode="append", watermark_column="id", batch_size=1)
+        cfg = _cfg(
+            sync_mode="append", watermark_column="id", watermark_type="serial",
+            batch_size=1,
+        )
         pg = FakePG(COLS, [(1, "a"), (2, "b"), (3, "c"), (4, "d"), (5, "e")])
         ch = FakeCH()
         meta = FakeMeta()
@@ -472,7 +508,10 @@ class TestCopyMissingKeys:
     def test_recopies_all_rows_sharing_a_key_in_batch(self):
         # key(=integrity 의 watermark 값)가 row 를 유일 식별하지 않아도,
         # 스캔 중 만난 같은 key 의 row 는 첫 매칭 후에도 전부 재적재된다.
-        cfg = _cfg(sync_mode="append", watermark_column="id", engine="ReplacingMergeTree")
+        cfg = _cfg(
+            sync_mode="append", watermark_column="id", watermark_type="serial",
+            engine="ReplacingMergeTree",
+        )
         pg = FakePG(COLS, [(1, "a"), (2, "b1"), (2, "b2")])
         ch = FakeCH()
         meta = FakeMeta()
@@ -484,7 +523,7 @@ class TestCopyMissingKeys:
         assert (1, "a") not in ch.inserted
 
     def test_empty_keys_is_noop(self):
-        cfg = _cfg(sync_mode="append", watermark_column="id")
+        cfg = _cfg(sync_mode="append", watermark_column="id", watermark_type="serial")
         pg = FakePG(COLS, [])
         ch = FakeCH()
         meta = FakeMeta()
@@ -495,7 +534,7 @@ class TestCopyMissingKeys:
 
     def test_dead_letters_rows_that_still_fail(self):
         cfg = _cfg(
-            sync_mode="append", watermark_column="id",
+            sync_mode="append", watermark_column="id", watermark_type="serial",
             engine="ReplacingMergeTree", on_row_error="dead_letter",
         )
         pg = FakePG(COLS, [(2, "b"), (3, "BAD")])

@@ -48,12 +48,57 @@ class TestValidation:
             TableConfig.from_dict(_base(sync_mode="append"))
 
     def test_append_with_watermark_ok(self):
-        cfg = TableConfig.from_dict(_base(sync_mode="append", watermark_column="updated_at"))
-        assert cfg.effective_watermark_column == "updated_at"
+        cfg = TableConfig.from_dict(
+            _base(
+                sync_mode="append",
+                watermark_column="updated_at",
+                watermark_type="timestamp",
+            )
+        )
+        assert cfg.watermark_column == "updated_at"
+        assert cfg.watermark_type == "timestamp"
 
-    def test_append_with_timestamp_fallback(self):
-        cfg = TableConfig.from_dict(_base(sync_mode="append", timestamp_column="updated_at"))
-        assert cfg.effective_watermark_column == "updated_at"
+    def test_watermark_column_requires_type(self):
+        with pytest.raises(ValueError, match="watermark_column requires watermark_type"):
+            TableConfig.from_dict(
+                _base(sync_mode="append", watermark_column="updated_at")
+            )
+
+    def test_watermark_type_requires_column(self):
+        with pytest.raises(ValueError, match="watermark_type requires watermark_column"):
+            TableConfig.from_dict(_base(watermark_type="serial"))
+
+    def test_unknown_watermark_type(self):
+        with pytest.raises(ValueError, match="watermark_type must be one of"):
+            TableConfig.from_dict(
+                _base(
+                    sync_mode="append",
+                    watermark_column="id",
+                    watermark_type="uuid",
+                )
+            )
+
+    def test_legacy_timestamp_column_rejected_with_hint(self):
+        with pytest.raises(ValueError, match="watermark_column \\+ watermark_type"):
+            TableConfig.from_dict(
+                _base(
+                    sync_mode="append",
+                    watermark_column="updated_at",
+                    watermark_type="timestamp",
+                    timestamp_column="updated_at",
+                )
+            )
+
+    def test_legacy_overlap_minutes_rejected_with_hint(self):
+        with pytest.raises(ValueError, match="use watermark_overlap"):
+            TableConfig.from_dict(
+                _base(
+                    sync_mode="append",
+                    watermark_column="updated_at",
+                    watermark_type="timestamp",
+                    overlap_minutes=30,
+                )
+            )
 
     def test_bad_sync_mode(self):
         with pytest.raises(ValueError, match="sync_mode must be"):
@@ -81,9 +126,53 @@ class TestValidation:
         with pytest.raises(ValueError, match="table_id"):
             TableConfig.from_dict(_base(table_id="bad id!"))
 
-    def test_sync_since_requires_timestamp(self):
-        with pytest.raises(ValueError, match="sync_since requires timestamp_column"):
+    def test_sync_since_requires_watermark(self):
+        with pytest.raises(ValueError, match="sync_since requires watermark_column"):
             TableConfig.from_dict(_base(sync_since="30d"))
+
+    def test_sync_since_validated_against_watermark_type(self):
+        with pytest.raises(ValueError, match="sync_since.*not a number"):
+            TableConfig.from_dict(
+                _base(
+                    sync_mode="append",
+                    watermark_column="id",
+                    watermark_type="serial",
+                    sync_since="30d",
+                )
+            )
+
+    def test_sync_since_serial_number_ok(self):
+        cfg = TableConfig.from_dict(
+            _base(
+                sync_mode="append",
+                watermark_column="id",
+                watermark_type="serial",
+                sync_since=100000,
+            )
+        )
+        assert cfg.sync_since == 100000
+
+    def test_overlap_validated_against_watermark_type(self):
+        with pytest.raises(ValueError, match="relative like '30m'"):
+            TableConfig.from_dict(
+                _base(
+                    sync_mode="append",
+                    watermark_column="updated_at",
+                    watermark_type="timestamp",
+                    watermark_overlap=30,
+                )
+            )
+
+    def test_overlap_timestamp_relative_ok(self):
+        cfg = TableConfig.from_dict(
+            _base(
+                sync_mode="append",
+                watermark_column="updated_at",
+                watermark_type="timestamp",
+                watermark_overlap="30m",
+            )
+        )
+        assert cfg.watermark_overlap == "30m"
 
     def test_empty_order_by(self):
         with pytest.raises(ValueError, match="order_by is required"):
@@ -119,7 +208,9 @@ class TestValidation:
             )
 
     def test_integrity_defaults(self):
-        cfg = TableConfig.from_dict(_base(sync_mode="append", watermark_column="id"))
+        cfg = TableConfig.from_dict(
+            _base(sync_mode="append", watermark_column="id", watermark_type="serial")
+        )
         assert cfg.integrity_enabled is False
         assert cfg.integrity_method == "count"
         assert cfg.integrity_lookback_runs == 1
@@ -133,6 +224,7 @@ class TestValidation:
             _base(
                 sync_mode="append",
                 watermark_column="id",
+                watermark_type="serial",
                 integrity={
                     "enabled": True,
                     "method": "key_diff",
@@ -175,6 +267,7 @@ class TestValidation:
             _base(
                 sync_mode="append",
                 watermark_column="id",
+                watermark_type="serial",
                 integrity_enabled=True,
                 integrity_lookback_runs=2,
             )
@@ -229,11 +322,13 @@ class TestLoaders:
             target_table: default.orders
             sync_mode: append
             watermark_column: updated_at
+            watermark_type: timestamp
             order_by: [id]
         """)
         cfg = load_table_config(f)
         assert cfg.sync_mode == "append"
         assert cfg.watermark_column == "updated_at"
+        assert cfg.watermark_type == "timestamp"
 
     def test_table_id_defaults_to_stem(self, tmp_path):
         f = tmp_path / "events.yaml"
@@ -382,6 +477,66 @@ class TestRetentionConfig:
                 tables:
                   orders:
                     retention: soon
+            """)
+
+    def test_retention_column_with_type_ok(self, tmp_path):
+        rcfg = self._load(tmp_path, """
+            tables:
+              events:
+                retention: 90d
+                column: created_at
+                type: timestamp
+        """)
+        policy = rcfg.policy_for("events")
+        assert policy.column == "created_at"
+        assert policy.type == "timestamp"
+
+    def test_retention_serial_number_ok(self, tmp_path):
+        rcfg = self._load(tmp_path, """
+            tables:
+              events:
+                retention: 100000
+                column: id
+                type: serial
+        """)
+        assert rcfg.policy_for("events").retention == 100000
+
+    def test_retention_column_requires_type(self, tmp_path):
+        with pytest.raises(ValueError, match="column and type must be set together"):
+            self._load(tmp_path, """
+                tables:
+                  events:
+                    retention: 90d
+                    column: created_at
+            """)
+
+    def test_retention_type_requires_column(self, tmp_path):
+        with pytest.raises(ValueError, match="column and type must be set together"):
+            self._load(tmp_path, """
+                tables:
+                  events:
+                    retention: 90d
+                    type: timestamp
+            """)
+
+    def test_retention_unknown_type(self, tmp_path):
+        with pytest.raises(ValueError, match="type must be one of"):
+            self._load(tmp_path, """
+                tables:
+                  events:
+                    retention: 90d
+                    column: created_at
+                    type: uuid
+            """)
+
+    def test_retention_value_must_match_declared_type(self, tmp_path):
+        with pytest.raises(ValueError, match="not a number"):
+            self._load(tmp_path, """
+                tables:
+                  events:
+                    retention: 90d
+                    column: id
+                    type: serial
             """)
 
     def test_bad_batch_size(self, tmp_path):

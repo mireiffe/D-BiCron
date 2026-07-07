@@ -16,8 +16,7 @@ tags: [pg2ch, reference]
 source_table: public.price_book
 target_table: default.price_book
 
-# full_reload 는 watermark 가 필요 없다. (정렬용으로만 timestamp_column 사용 가능)
-timestamp_column: refreshed_at
+# full_reload 는 watermark 가 필요 없다.
 
 engine: MergeTree
 order_by: [sku]

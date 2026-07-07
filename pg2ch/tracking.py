@@ -243,7 +243,7 @@ class MetaStore:
 
         ⚠️ batch 경계에서 동일 watermark(tie) 가 쪼개지면 strict
         ``wm > cutoff`` 가 아직 복사 안 된 동률 row 를 건너뛸 수 있다.
-        mid-run 재개에 의존한다면 overlap_minutes / watermark_overlap 을
+        mid-run 재개에 의존한다면 watermark_overlap 을
         설정해 경계를 재읽도록 한다.
         """
         # 1) finalize 전에 죽은 증분 run 까지 포함해, 마지막으로 커밋된 batch 진행점.
@@ -268,7 +268,7 @@ class MetaStore:
                 logger.warning(
                     "%s: resuming from un-finalized batch progress "
                     "watermark_hi=%s (last run status=%s); set "
-                    "overlap_minutes/watermark_overlap to avoid skipping "
+                    "watermark_overlap to avoid skipping "
                     "boundary rows",
                     table_id, wm, status,
                 )

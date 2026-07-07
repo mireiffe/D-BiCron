@@ -267,7 +267,13 @@ def build_dag(cfg: TableConfig, copy_pool: str | None = None) -> DAG:
         doc_md=(
             f"**pg2ch copy** `{cfg.source_table}` → `{cfg.target_table}`\n\n"
             f"- mode: `{cfg.sync_mode}`\n"
-            f"- watermark: `{cfg.effective_watermark_column or '-'}`\n"
+            f"- watermark: "
+            + (
+                f"`{cfg.watermark_column}` (`{cfg.watermark_type}`)"
+                if cfg.watermark_column
+                else "`-`"
+            )
+            + "\n"
             f"- on_row_error: `{cfg.on_row_error}`\n"
             f"- integrity: `{'enabled' if cfg.integrity_enabled else 'disabled'}`\n"
         ),
@@ -338,10 +344,12 @@ def build_retention_dag(rcfg: RetentionConfig, table_ids: set[str]) -> DAG | Non
             "**pg2ch retention** — 복제 완료된 오래된 PG source row 삭제.\n\n"
             "테이블마다 `verify → retention` 순서로 실행되며, 무결성 검사에서 누락이 "
             "남으면(integrity_on_mismatch=fail) 그 테이블의 삭제는 skip 된다. 삭제 "
-            "cutoff 는 finalize 된 watermark 가 가리키는 마지막 synced timestamp 로 "
+            "cutoff 는 finalize 된 watermark 가 가리키는 마지막 synced 값으로 "
             "캡핑되어, copy 가 멈춘 동안에도 미복제 row 는 지워지지 않는다.\n\n"
             + "\n".join(
-                f"- `{p.table_id}`: retention `{p.retention}`" for p in policies
+                f"- `{p.table_id}`: retention `{p.retention}`"
+                + (f" on `{p.column}` (`{p.type}`)" if p.column else "")
+                for p in policies
             )
         ),
         **(

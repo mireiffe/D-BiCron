@@ -200,12 +200,12 @@ start_date: "2026-01-01"
 source_table: public.orders
 target_table: default.orders
 
-# append 증분 기준
+# append 증분 기준 — watermark 컬럼 하나로 증분/sync_since/overlap 을 전부 관리
 watermark_column: updated_at     # 이 컬럼 > 마지막 watermark 인 row 만 전송
-timestamp_column: updated_at     # sync_since 하한 / 정렬 기준
-sync_since: 90d                  # 30d/12h/90m 상대값 또는 ISO 절대값
-overlap_minutes: 30              # timestamp watermark 를 N분 앞당겨 재전송 (dedup 됨)
-# watermark_overlap: 1000        # 숫자형 watermark 일 때 N 만큼 앞당겨 재전송
+watermark_type: timestamp        # serial | numeric | timestamp (컬럼 지정 시 필수)
+sync_since: 90d                  # watermark 하한 — timestamp: "90d"|ISO, serial/numeric: 숫자
+watermark_overlap: 30m           # watermark 를 앞당겨 재전송 (누락 방지, dedup 됨)
+                                 #   timestamp: "30m"/"12h"/"1d", serial/numeric: 숫자
 
 # DDL (대상 테이블이 없으면 이대로 생성)
 engine: ReplacingMergeTree(updated_at)
@@ -272,7 +272,7 @@ use_nullable: false
 | 위치 | `source_table`, `target_table` (`schema.table`) |
 | DDL | `engine`, `order_by`, `primary_key`, `partition_by`, `indexes`, `settings` |
 | 타입/컬럼 | `column_overrides`, `drop_columns`, `use_nullable` |
-| 증분(append) | `watermark_column`, `timestamp_column`, `sync_since`, `overlap_minutes`, `watermark_overlap` |
+| 증분(append) | `watermark_column`, `watermark_type`(serial\|numeric\|timestamp), `sync_since`, `watermark_overlap` |
 | 배치/성능 | `batch_size`, `insert_types_check` |
 | 에러 | `on_row_error`(dead_letter\|skip\|fail), `max_failed_rows` |
 | 스케줄 | `schedule`, `start_date`, `catchup`, `max_active_runs`, `retries`, `retry_delay_seconds`, `tags` |
@@ -296,17 +296,28 @@ defaults:                        # 테이블 공통 기본값 (테이블별 값 
 
 tables:                          # key = 테이블 설정의 table_id (append 전용)
   orders:
-    retention: 180d              # timestamp_column < now-180d 인 row 삭제 (ISO 절대값도 가능)
+    retention: 180d              # watermark(timestamp) < now-180d 인 row 삭제 (ISO 절대값도 가능)
   events:
+    column: created_at           # 삭제 기준 컬럼 override (기본: watermark_column)
+    type: timestamp              # column 의 타입 (column 지정 시 필수)
     retention: 90d
     batch_size: 50000
     # enabled: false             # 항목을 지우지 않고 일시 비활성
+  event_log:
+    retention: 10000000          # serial watermark → keep-last-N (마지막 synced id - N 미만 삭제)
 ```
 
-여기 등록된 테이블만 삭제 대상이다(등록 = 활성). 대상 테이블은 append 모드 +
-`timestamp_column` 이 필요하다. 삭제 직전 테이블마다 `verify`(무결성 검사)가 게이트로
-돌고, cutoff 는 finalize 된 watermark 가 가리키는 마지막 synced timestamp 로 캡핑된다 —
-copy 가 멈춘 동안에도 미복제 row 는 지워지지 않는다.
+여기 등록된 테이블만 삭제 대상이다(등록 = 활성). 대상 테이블은 append 모드
+(`watermark_column` + `watermark_type`)가 필요하다. 삭제 기준 컬럼은 기본적으로
+watermark 컬럼이고, `column`/`type` 으로 별도 지정할 수 있다 — 이때 `retention` 값은
+그 타입으로 해석된다 (timestamp: `"180d"`|ISO, serial/numeric: 숫자 N = 마지막 synced
+값 − N, keep-last-N). 삭제 직전 테이블마다 `verify`(무결성 검사)가 게이트로 돌고,
+cutoff 는 finalize 된 watermark 가 가리키는 마지막 synced 값(삭제 기준 컬럼으로 환산)
+으로 캡핑된다 — copy 가 멈춘 동안에도 미복제 row 는 지워지지 않는다.
+
+> ⚠️ 삭제 기준 컬럼을 watermark 와 다르게 지정할 때는 두 컬럼이 함께 증가해야
+> 안전하다 (예: serial id watermark + 삽입 시각 `created_at`). watermark 순서와
+> 무관하게 갱신되는 컬럼(`updated_at` 등)을 쓰면 미복제 갱신이 지워질 수 있다.
 
 ### 3-a. 실행 — Airflow (Docker, 운영 방식)
 
@@ -424,13 +435,13 @@ pg2ch/                     엔진 패키지 (Airflow 비의존, 단위 테스트
 ├── chtypes.py             PG→CH 타입 매핑 / CH 타입 문자열 유틸
 ├── ddl.py                 CH 컬럼 매핑 + CREATE TABLE DDL 생성
 ├── transform.py           PG row → CH INSERT 호환 변환
-├── watermark.py           sync_since / overlap 계산
+├── watermark.py           watermark 타입(serial/numeric/timestamp) 파싱 + since/overlap/retention 계산
 ├── connections.py         접속 레지스트리(JSON) + PG/CH/meta 커넥션
 ├── config.py              설정(YAML) 로드/검증 (TableConfig / RetentionConfig)
 ├── tracking.py            메타 저장소 (copy_run/copy_batch/copy_failed_row)
 ├── copier.py              복사 오케스트레이션 (모드 + batch/row 추적)
 ├── integrity.py           무결성 검사 + 자가복구 (watermark 구간 source vs target)
-├── retention.py           PG source retention (watermark 캡핑된 ts cutoff 삭제)
+├── retention.py           PG source retention (watermark 캡핑된 타입별 cutoff 삭제)
 └── cli.py                 CLI
 dags/pg2ch_factory.py      config → 테이블 DAG + retention 전용 DAG 동적 생성
 sql/meta_schema.sql        메타 스키마 정본
