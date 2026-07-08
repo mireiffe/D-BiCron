@@ -48,7 +48,10 @@ retention 전용 DAG(`pg2ch_retention`)는 테이블마다 `verify_<id> → rete
   읽는다 (OOM/SIGKILL 로 죽어도 재복사 루프에 빠지지 않게).
 - retention(=source 삭제)은 copy 와 분리된 전용 DAG 에서 `config/retention.yaml`
   정책대로 돈다. 삭제 기준 컬럼은 기본 watermark 컬럼이고 항목별 `column`/`type` 으로
-  별도 지정 가능. retention 값은 타입별 해석 — timestamp: "180d"|ISO(now 기준),
+  별도 지정 가능. 삭제는 그 컬럼 값을 오름차순 전진(keyset)하며 `(lo, hi]` 구간씩
+  batch DELETE 한다 — lo 가 삭제 지점을 넘어 전진하므로 이미 지운 앞구간(dead tuple)을
+  재스캔하지 않아 수억 행에서도 선형으로 끝난다. 삭제 기준 컬럼엔 source 인덱스가
+  있어야 하며(없으면 batch 마다 정렬), 없으면 실행 시 경고를 남긴다. retention 값은 타입별 해석 — timestamp: "180d"|ISO(now 기준),
   serial/numeric: 숫자 N(마지막 synced 값 − N, keep-last-N). cutoff 는 finalize 된
   watermark 가 가리키는 마지막 synced 값(삭제 컬럼으로 환산)으로 캡핑한다 —
   copy 가 멈춘 동안 미복제 row 가 삭제되지 않게. 별도 컬럼은 watermark 와 함께

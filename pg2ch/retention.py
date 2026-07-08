@@ -214,22 +214,71 @@ class PgRetention:
         batch_size: int,
         lock_timeout_ms: int,
     ) -> int:
+        """``ret_col < cutoff`` 인 row 를 batch 로 삭제. 삭제 총 row 수 반환.
+
+        ret_col 값을 오름차순으로 **전진(keyset)** 하며 ``(lo, hi]`` 구간씩 지운다.
+        lo 가 매 batch 삭제 지점을 넘어 전진하므로 이미 삭제한 앞구간(=dead tuple
+        무더기)을 다시 스캔하지 않는다 — 전체 삭제가 선형이라 수억 행에서도 끝난다.
+        (예전 ``WHERE ret_col < cutoff LIMIT n`` 반복은 매 batch heap 앞쪽부터 재스캔해
+        O(n²) 로 사실상 hang 했다.) 각 batch 는 독립 트랜잭션으로 commit 해 락 보유
+        시간을 짧게 유지한다. ret_col 오름차순 인덱스를 전제로 하며(없으면 batch 마다
+        정렬), 인덱스가 없으면 경고만 남기고 진행한다.
+        """
         src_fqn = f"{quote_pg_identifier(src_schema)}.{quote_pg_identifier(src_name)}"
+        col = quote_pg_identifier(ret_col)
+        self._warn_if_unindexed(pg_conn, src_schema, src_name, ret_col)
+
         total_deleted = 0
+        batches = 0
+        lo = None  # 이미 삭제 끝난 상한 (ret_col <= lo 완료). 오름차순 전진.
 
         while True:
             try:
                 with pg_conn.cursor() as cur:
                     cur.execute(f"SET LOCAL lock_timeout = '{lock_timeout_ms}ms'")
-                    cur.execute(
-                        f"DELETE FROM {src_fqn} "
-                        f"WHERE ctid = ANY(ARRAY("
-                        f"  SELECT ctid FROM {src_fqn} "
-                        f"  WHERE {quote_pg_identifier(ret_col)} < %s "
-                        f"  LIMIT %s"
-                        f"))",
-                        (cutoff, batch_size),
-                    )
+                    # 이번 batch 상한 hi = (lo, cutoff) 구간에서 오름차순 batch_size
+                    # 번째 값. lo 직후부터 인덱스로만 걷는다 (앞구간 재스캔 없음).
+                    if lo is None:
+                        cur.execute(
+                            f"SELECT {col} FROM {src_fqn} WHERE {col} < %s "
+                            f"ORDER BY {col} OFFSET %s LIMIT 1",
+                            (cutoff, batch_size - 1),
+                        )
+                    else:
+                        cur.execute(
+                            f"SELECT {col} FROM {src_fqn} "
+                            f"WHERE {col} > %s AND {col} < %s "
+                            f"ORDER BY {col} OFFSET %s LIMIT 1",
+                            (lo, cutoff, batch_size - 1),
+                        )
+                    probe = cur.fetchone()
+                    hi = probe[0] if probe and probe[0] is not None else None
+
+                    # hi 가 있으면 (lo, hi] 삭제, 없으면(잔여 < batch_size) (lo, cutoff)
+                    # 잔여 전부 삭제 후 종료. hi <= 값경계라 같은 값의 row 를 쪼개지
+                    # 않아 누락 없이 다음 batch 로 넘어간다.
+                    if hi is not None:
+                        if lo is None:
+                            cur.execute(
+                                f"DELETE FROM {src_fqn} WHERE {col} <= %s", (hi,)
+                            )
+                        else:
+                            cur.execute(
+                                f"DELETE FROM {src_fqn} "
+                                f"WHERE {col} > %s AND {col} <= %s",
+                                (lo, hi),
+                            )
+                    else:
+                        if lo is None:
+                            cur.execute(
+                                f"DELETE FROM {src_fqn} WHERE {col} < %s", (cutoff,)
+                            )
+                        else:
+                            cur.execute(
+                                f"DELETE FROM {src_fqn} "
+                                f"WHERE {col} > %s AND {col} < %s",
+                                (lo, cutoff),
+                            )
                     deleted = int(cur.rowcount)
                 pg_conn.commit()
             except Exception as e:
@@ -246,7 +295,47 @@ class PgRetention:
                 raise
 
             total_deleted += deleted
-            if deleted < batch_size:
+            batches += 1
+            self.log.info(
+                "%s.%s: retention batch %d deleted %d row(s) (total=%d, cursor=%s)",
+                src_schema, src_name, batches, deleted, total_deleted, _as_str(hi),
+            )
+            if hi is None:
                 break
+            lo = hi
 
         return total_deleted
+
+    def _warn_if_unindexed(self, pg_conn, src_schema, src_name, ret_col) -> None:
+        """ret_col 이 어떤 인덱스의 선행 컬럼도 아니면 경고 (best-effort).
+
+        batch 삭제는 ret_col 오름차순 keyset 스캔에 의존하므로 인덱스가 없으면 batch
+        마다 정렬이 일어나 오히려 느리다. 권한 등으로 확인 불가 시 조용히 넘어간다.
+        """
+        found = True  # 확인 실패 시 경고하지 않는다(정상 인덱스 가정)
+        try:
+            with pg_conn.cursor() as cur:
+                cur.execute(
+                    "SELECT 1 FROM pg_index i "
+                    "JOIN pg_class c ON c.oid = i.indrelid "
+                    "JOIN pg_namespace n ON n.oid = c.relnamespace "
+                    "JOIN pg_attribute a "
+                    "  ON a.attrelid = c.oid AND a.attnum = i.indkey[0] "
+                    "WHERE n.nspname = %s AND c.relname = %s AND a.attname = %s "
+                    "LIMIT 1",
+                    (src_schema, src_name, ret_col),
+                )
+                found = cur.fetchone() is not None
+        except Exception:
+            found = True
+        finally:
+            try:
+                pg_conn.rollback()
+            except Exception:
+                pass
+        if not found:
+            self.log.warning(
+                "%s.%s: retention column %r is not the leading column of any index; "
+                "batched delete will be slow (sorts each batch) — create an index on it",
+                src_schema, src_name, ret_col,
+            )
