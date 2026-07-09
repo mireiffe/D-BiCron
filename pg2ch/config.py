@@ -117,9 +117,11 @@ class TableConfig:
     integrity_tolerance: int = 0
     integrity_repair: bool = True
     integrity_repair_attempts: int = 1
-    # 검사 window 를 이 만큼의 wm 값 조각으로 나눠 걷는다 (CH uniqExact / 파이썬 key
-    # set 메모리를 조각당 distinct 수로 묶어 대형 window 에서 CH 메모리 초과를 막는다).
-    integrity_batch_size: int = 1_000_000
+    # 검사 질의를 이 ts 파티션 컬럼 >= (now - period) 로 제한해 CH 파티션을 프루닝한다
+    # (watermark 가 파티션 키가 아닐 때 window 전체 스캔/uniqExact 메모리 초과 방지).
+    # 둘 다 지정하거나 둘 다 비운다. period: "30d"/"12h" 상대 또는 ISO 절대.
+    integrity_partition_column: str | None = None
+    integrity_partition_period: str | None = None
 
     # Airflow 스케줄링 메타 (DAG factory 가 사용)
     schedule: str | None = None
@@ -198,8 +200,10 @@ class TableConfig:
                 "integrity_repair": "integrity_repair",
                 "repair_attempts": "integrity_repair_attempts",
                 "integrity_repair_attempts": "integrity_repair_attempts",
-                "batch_size": "integrity_batch_size",
-                "integrity_batch_size": "integrity_batch_size",
+                "partition_column": "integrity_partition_column",
+                "integrity_partition_column": "integrity_partition_column",
+                "partition_period": "integrity_partition_period",
+                "integrity_partition_period": "integrity_partition_period",
             }
             unknown_integrity = set(integrity) - set(integrity_keys)
             if unknown_integrity:
@@ -276,10 +280,21 @@ class TableConfig:
             raise ValueError(
                 f"{self.table_id}: integrity_repair_attempts must be >= 1"
             )
-        if int(self.integrity_batch_size) <= 0:
+        if (self.integrity_partition_column is None) != (
+            self.integrity_partition_period is None
+        ):
             raise ValueError(
-                f"{self.table_id}: integrity_batch_size must be a positive integer"
+                f"{self.table_id}: integrity_partition_column and "
+                f"integrity_partition_period must be set together (omit both to "
+                f"scan the whole watermark window)"
             )
+        if self.integrity_partition_period is not None:
+            try:
+                resolve_since("timestamp", self.integrity_partition_period)
+            except ValueError as e:
+                raise ValueError(
+                    f"{self.table_id}: integrity_partition_period: {e}"
+                ) from e
         if self.integrity_enabled and self.sync_mode != "append":
             raise ValueError(
                 f"{self.table_id}: integrity_enabled requires append sync_mode"

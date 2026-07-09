@@ -218,7 +218,8 @@ class TestValidation:
         assert cfg.integrity_tolerance == 0
         assert cfg.integrity_repair is True
         assert cfg.integrity_repair_attempts == 1
-        assert cfg.integrity_batch_size == 1_000_000
+        assert cfg.integrity_partition_column is None
+        assert cfg.integrity_partition_period is None
 
     def test_integrity_nested_config_ok(self):
         cfg = TableConfig.from_dict(
@@ -234,7 +235,8 @@ class TestValidation:
                     "tolerance": 5,
                     "repair": False,
                     "repair_attempts": 2,
-                    "batch_size": 250_000,
+                    "partition_column": "created_at",
+                    "partition_period": "30d",
                 },
             )
         )
@@ -245,7 +247,8 @@ class TestValidation:
         assert cfg.integrity_tolerance == 5
         assert cfg.integrity_repair is False
         assert cfg.integrity_repair_attempts == 2
-        assert cfg.integrity_batch_size == 250_000
+        assert cfg.integrity_partition_column == "created_at"
+        assert cfg.integrity_partition_period == "30d"
 
     def test_integrity_bad_method(self):
         with pytest.raises(ValueError, match="integrity_method must be"):
@@ -265,12 +268,21 @@ class TestValidation:
                 )
             )
 
-    def test_integrity_batch_size_must_be_positive(self):
-        with pytest.raises(ValueError, match="integrity_batch_size must be a positive"):
+    def test_integrity_partition_requires_both(self):
+        with pytest.raises(ValueError, match="must be set together"):
             TableConfig.from_dict(
                 _base(
                     sync_mode="append", watermark_column="id",
-                    integrity={"batch_size": 0},
+                    integrity={"partition_column": "ts"},  # period 없음
+                )
+            )
+
+    def test_integrity_partition_period_bad_format(self):
+        with pytest.raises(ValueError, match="integrity_partition_period"):
+            TableConfig.from_dict(
+                _base(
+                    sync_mode="append", watermark_column="id",
+                    integrity={"partition_column": "ts", "partition_period": "nope"},
                 )
             )
 

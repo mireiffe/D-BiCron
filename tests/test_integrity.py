@@ -25,13 +25,7 @@ class VPGCur:
 
     def execute(self, sql, params=None):
         self.pg.sql.append((sql, params))
-        s = sql.strip()
-        if "OFFSET" in s:  # sub-window 경계 probe (keyset walk)
-            if self.pg.probes is None:
-                self._r = [(None,)]  # 미설정 → 단일 조각(=window 전체)
-            else:
-                self._r = [(self.pg.probes.pop(0) if self.pg.probes else None,)]
-        elif s.startswith("SELECT count(*)"):
+        if sql.strip().startswith("SELECT count(*)"):
             self._r = [(self.pg.counts.pop(0),)]
         else:  # SELECT <key cols> FROM ... WHERE wm > .. (window keys)
             self._r = list(self.pg.keys.pop(0))
@@ -44,12 +38,9 @@ class VPGCur:
 
 
 class VPG:
-    def __init__(self, counts=(), keys=(), probes=None):
+    def __init__(self, counts=(), keys=()):
         self.counts = list(counts)
         self.keys = list(keys)
-        # probes=None → 단일 조각. list → sub-window 경계값을 순서대로 내주고,
-        # 소진되면 None(=마지막 조각을 hi 로 닫음)을 돌려준다.
-        self.probes = None if probes is None else list(probes)
         self.sql = []
 
     def cursor(self):
@@ -300,73 +291,45 @@ class TestWatermarkKey:
         assert seen["cols"] == ["id"]
 
 
-# ── sub-window keyset walk (window 을 조각으로 나눠 검사) ──────────
+# ── 파티션 ts 필터 (CH 파티션 프루닝) ────────────────────────────
 
 
-class TestSubWindowWalk:
-    def test_walk_splits_window_and_sums(self):
-        # window (0,100] 를 3 조각((0,40],(40,80],(80,100])으로 나눠 count 게이트만.
-        pg = VPG(counts=[4, 4, 2], probes=[40, 80])
-        ch = VCH(counts=[4, 4, 2])
-        r = IntegrityChecker(_cfg()).verify(pg, ch, VMeta([_win(5, "0", "100")]))
-        assert r.status == "ok"
-        # 조각별 count/distinct 를 그대로 더하면 window 전체 값과 같다.
-        assert r.source_rows == 10 and r.target_rows == 10
-        assert r.windows_checked == 1  # meta window 은 1 개 (조각은 내부 분할)
-        # count 게이트 통과 → key 조회(DISTINCT) 없음
-        assert not any("DISTINCT" in s for s in ch.sql)
-        # window 전체 한 번이 아니라 조각 수(3)만큼 uniqExact 를 보낸다
-        assert sum("uniqExact" in s for s in ch.sql) == 3
+class TestPartitionFilter:
+    def test_no_filter_by_default(self):
+        # 파티션 설정이 없으면 질의에 ts 조건이 붙지 않는다 (예전 그대로).
+        pg = VPG(counts=[5], keys=[[(1,), (2,), (3,), (4,), (5,)]])
+        ch = VCH(counts=[2], keys=[[(1,), (2,)]])
+        IntegrityChecker(_cfg()).verify(pg, ch, VMeta([_win(5, "0", "10")]))
+        assert not any(">= '" in s for s in ch.sql)  # CH ts 리터럴 없음
+        assert all(">= %s" not in s for (s, _) in pg.sql)  # PG ts 파라미터 없음
 
-    def test_batch_size_drives_probe_offset(self):
-        pg = VPG(counts=[1])  # probes=None → 단일 조각
-        ch = VCH(counts=[1])
-        IntegrityChecker(_cfg(integrity_batch_size=500)).verify(
-            pg, ch, VMeta([_win(5, "0", "10")])
+    def test_filter_applied_to_both_sides(self):
+        # partition_column/period 지정 시 PG·CH 양쪽에 동일 조건이 붙는다.
+        cfg = _cfg(
+            integrity_partition_column="ts", integrity_partition_period="30d"
         )
-        probes = [(s, p) for (s, p) in pg.sql if "OFFSET" in s]
-        assert len(probes) == 1  # 단일 조각이면 probe 1 번(경계 없음 확인)
-        assert probes[0][1][2] == 499  # OFFSET = batch_size - 1
-
-    def test_keydiff_only_on_shortfall_chunk(self):
-        # 조각1 ok, 조각2 부족(→keydiff), 조각3 ok. key set 이 조각 하나로 묶인다.
-        pg = VPG(
-            counts=[3, 3, 3],
-            keys=[[(41,), (42,), (43,)]],  # 부족 조각(조각2) source keys 만
-            probes=[40, 80],
+        pg = VPG(counts=[5], keys=[[(1,), (2,), (3,), (4,), (5,)]])
+        ch = VCH(counts=[2], keys=[[(1,), (2,)]])
+        r = IntegrityChecker(cfg).verify(pg, ch, VMeta([_win(5, "0", "10")]))
+        assert r.status == "mismatch"  # 필터가 붙어도 검사 자체는 그대로 동작
+        # CH: uniqExact / DISTINCT 둘 다 ts 컬럼 조건 포함
+        assert all(
+            "`ts` >= '" in s for s in ch.sql if "uniqExact" in s or "DISTINCT" in s
         )
-        ch = VCH(counts=[3, 1, 3], keys=[[(41,)]])  # 조각2 만 1 < 3
-        r = IntegrityChecker(_cfg()).verify(pg, ch, VMeta([_win(5, "0", "120")]))
-        assert r.status == "mismatch"
-        assert r.missing_rows == 2
-        assert set(r._repair_keys) == {(42,), (43,)}
-        # DISTINCT(target key 조회)는 부족 조각에서 한 번만
-        assert sum("DISTINCT" in s for s in ch.sql) == 1
+        # PG: count / keys 질의에 ts 파라미터 조건 포함
+        pg_data = [(s, p) for (s, p) in pg.sql]
+        assert all('"ts" >= %s' in s for (s, _) in pg_data)
+        assert all(isinstance(p[-1], datetime) for (_, p) in pg_data)
 
-    def test_missing_across_multiple_chunks_aggregates(self):
-        # 두 조각 모두 부족 → 조각별 누락을 합쳐 재복사 대상으로 싣는다.
-        pg = VPG(
-            counts=[2, 2],
-            keys=[[(1,), (2,)], [(41,), (42,)]],
-            probes=[40],  # 2 조각: (0,40], (40,80]
+    def test_absolute_period_literal(self):
+        # ISO 절대 기간 → CH 리터럴이 결정적으로 그 시각.
+        cfg = _cfg(
+            integrity_partition_column="ts",
+            integrity_partition_period="2026-06-01T00:00:00",
         )
-        ch = VCH(counts=[1, 1], keys=[[(1,)], [(41,)]])
-        r = IntegrityChecker(_cfg()).verify(pg, ch, VMeta([_win(5, "0", "80")]))
-        assert r.status == "mismatch"
-        assert r.missing_rows == 2
-        assert set(r._repair_keys) == {(2,), (42,)}
-
-    def test_key_diff_method_is_chunked(self):
-        # key_diff 도 조각마다 값 집합을 비교한다 (파이썬 set 이 조각당으로 묶임).
-        pg = VPG(keys=[[(1,), (2,)], [(41,), (42,)]], probes=[40])
-        ch = VCH(keys=[[(1,), (2,)], [(41,)]])  # 조각2 에서 42 누락
-        r = IntegrityChecker(_cfg(integrity_method="key_diff")).verify(
-            pg, ch, VMeta([_win(5, "0", "80")])
-        )
-        assert r.status == "mismatch"
-        assert set(r._repair_keys) == {(42,)}
-        assert sum("DISTINCT" in s for s in ch.sql) == 2  # 조각 수(2)만큼
-        assert not any("uniqExact" in s for s in ch.sql)  # count 게이트 안 씀
+        pg, ch = VPG(counts=[1]), VCH(counts=[1])
+        IntegrityChecker(cfg).verify(pg, ch, VMeta([_win(5, "0", "10")]))
+        assert any("`ts` >= '2026-06-01 00:00:00.000000'" in s for s in ch.sql)
 
 
 # ── 자가복구 (_run_with_repair) 통합 ─────────────────────────────
@@ -385,9 +348,7 @@ class HealPGCur:
 
     def execute(self, sql, params=None):
         s = sql.strip()
-        if "OFFSET" in s:  # sub-window 경계 probe → 단일 조각(window 전체)
-            self._rows = [(None,)]
-        elif s.startswith("SELECT column_name"):
+        if s.startswith("SELECT column_name"):
             self._rows = [
                 ("id", "integer", "NO", None, None),
                 ("name", "text", "YES", None, None),

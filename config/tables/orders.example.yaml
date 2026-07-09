@@ -70,8 +70,15 @@ integrity:
   repair_attempts: 1             # 재복사→재검사 최대 반복 횟수
   on_mismatch: fail              # (repair 후에도 누락 시) fail = retention 차단 | warn = 로그만
   tolerance: 0                   # 허용 누락 수 (이보다 크면 mismatch)
-  batch_size: 1000000            # window 를 이 만큼의 wm 값 조각으로 나눠 검사
-                                 #   (조각당 distinct 수로 CH uniqExact 메모리를 묶음)
+  # 파티션 프루닝(선택): watermark 가 파티션 키가 아니면 CH 가 window 질의에 파티션을
+  # 못 쳐내 uniqExact 가 메모리를 초과할 수 있다. 파티션 ts 컬럼 + 기간을 주면 양쪽
+  # 질의에 `col >= now-period` 를 동일하게 걸어 최근 파티션만 스캔한다.
+  #   ⚠️ 검사 범위가 그 기간으로 한정된다. 이 테이블은 watermark=updated_at 이고
+  #   partition=created_at 이라, 오래 전에 만들어졌지만 최근 갱신된(=updated_at 최근,
+  #   created_at 과거) row 는 검사에서 빠질 수 있다. 파티션 컬럼이 watermark 와 함께
+  #   증가하는 append-only 성격일 때만 안전하다.
+  # partition_column: created_at
+  # partition_period: 90d          # "30d"/"12h" 상대 또는 ISO 절대
 
 # PG source retention(오래된 source row 삭제)은 테이블 설정이 아니라
 # config/retention.yaml 에서 관리한다 — copy 와 분리된 전용 DAG 로 돈다.

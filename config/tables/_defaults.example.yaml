@@ -28,7 +28,8 @@ integrity:
   repair_attempts: 1
   on_mismatch: fail   # (repair 후에도 누락 시) fail = retention 차단 | warn = 로그만
   tolerance: 0
-  batch_size: 1000000 # window 를 이 만큼의 wm 값 조각으로 나눠 검사(CH 메모리 상한)
+  # partition_column/partition_period(선택): 파티션 ts 컬럼 >= now-period 로 검사
+  #   질의를 제한해 CH 파티션을 프루닝한다. 테이블별로 설정 (orders.example 참조).
 
 # PG source retention 은 config/retention.yaml 에서 관리한다 (전용 DAG).
 

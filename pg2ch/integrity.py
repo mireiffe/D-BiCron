@@ -19,14 +19,15 @@ false mismatch 를 만들 수 있다. watermark 는 증분 축이라 양쪽에�
   - key_diff: 항상 양쪽 watermark 값 집합을 끌어와 차집합을 구한다. count 가 우연히
               같아 가려지는 경우까지 잡지만 전송 비용이 크다.
 
-검사 window ``(before, after]`` 는 한 번에 세지 않고 wm 값 오름차순으로
-``integrity_batch_size`` 조각(``(sub_lo, sub_hi]``)씩 나눠 걷는다. 조각 경계는
-source 의 실제 wm 값이라 조각들이 window 를 겹침·누락 없이 분할하고, 각 wm 값은
-한 조각에만 속하므로 조각별 count/distinct/누락을 그대로 더하면 window 전체 값과
-같다. 이렇게 하면 CH ``uniqExact`` 와 key_diff 의 파이썬 key set 이 window 전체가
-아니라 조각당 distinct 수만큼만 메모리를 쓴다 — 예전엔 수억 distinct 를 한 번에
-올려 CH 메모리 한계를 넘겼다 (retention 삭제가 keyset walk 으로 O(n²) 를 푼 것과
-같은 접근). 조각 경계 산정은 source wm 오름차순 인덱스를 전제로 한다.
+파티션 프루닝(integrity_partition_column/period):
+  watermark 가 파티션 키가 아니면(예: serial id watermark + ts 파티션) CH 는 wm
+  범위 질의에 파티션을 못 쳐내 모든 파티션을 열고, window 가 크면 ``uniqExact`` 가
+  수억 distinct 를 RAM 에 올려 메모리 한계를 넘긴다. partition_column(=ts 파티션
+  키) + partition_period 를 주면 양쪽 질의에 ``partition_column >= now-period`` 를
+  **똑같이** 걸어(동일 조건이라 count/distinct 비교는 그대로 성립) CH 스캔을 최근
+  파티션으로 좁힌다. 대신 검사 범위가 그 기간으로 한정된다 — window 의 row 는
+  최근 복사분이라 보통 그 기간 안에 든다(늦게 도착한 오래된 ts 는 검사에서 빠질 수
+  있으니 period 를 넉넉히 준다).
 
 왜 target 을 distinct watermark 로 보나:
   overlap 재전송으로 ReplacingMergeTree 에 같은 row 가 머지 전까지 중복 존재할 수
@@ -53,6 +54,7 @@ from .config import TableConfig
 from .connections import ch_connect, get_connection, pg_connect
 from .copier import TableCopier
 from .tracking import MetaStore
+from .watermark import resolve_since
 
 log = logging.getLogger("pg2ch.integrity")
 
@@ -129,6 +131,20 @@ def _ch_literal(value) -> str:
     if isinstance(v, (int, Decimal)):
         return str(v)
     return quote_ch_string(str(v))
+
+
+def _pg_part_clause(part_col, part_cutoff) -> tuple[str, tuple]:
+    """파티션 ts 필터의 PG WHERE 조각 + 파라미터. 미설정이면 빈 조각."""
+    if part_col and part_cutoff is not None:
+        return f" AND {quote_pg_identifier(part_col)} >= %s", (part_cutoff,)
+    return "", ()
+
+
+def _ch_part_clause(part_col, part_cutoff) -> str:
+    """파티션 ts 필터의 CH WHERE 조각 (리터럴 인라인). 미설정이면 빈 문자열."""
+    if part_col and part_cutoff is not None:
+        return f" AND {quote_ch_identifier(part_col)} >= {_ch_literal(part_cutoff)}"
+    return ""
 
 
 def _canon_scalar(v) -> str | None:
@@ -304,7 +320,13 @@ class IntegrityChecker:
             )
         lookback = int(cfg.integrity_lookback_runs)
         tolerance = int(cfg.integrity_tolerance)
-        batch_size = int(cfg.integrity_batch_size)
+        # 파티션 ts 필터: 설정되면 양쪽 질의에 동일하게 걸어 CH 파티션을 프루닝한다.
+        part_col = cfg.integrity_partition_column
+        part_cutoff = (
+            resolve_since("timestamp", cfg.integrity_partition_period)
+            if part_col and cfg.integrity_partition_period
+            else None
+        )
         windows = meta.recent_run_windows(cfg.table_id, wm_col, lookback)
         if not windows:
             return IntegrityResult(
@@ -341,7 +363,7 @@ class IntegrityChecker:
 
             src_n, tgt_n, missing_keys, dl_hit = self._check_window(
                 pg_conn, ch, src_schema, src_name, tgt_db, tgt_name,
-                wm_col, key_cols, deadletter, lo, hi, method, batch_size,
+                wm_col, key_cols, deadletter, lo, hi, method, part_col, part_cutoff,
             )
             missing = len(missing_keys)
             checked += 1
@@ -407,88 +429,38 @@ class IntegrityChecker:
 
     def _check_window(
         self, pg_conn, ch, src_schema, src_name, tgt_db, tgt_name,
-        wm_col, key_cols, deadletter, lo, hi, method, batch_size,
+        wm_col, key_cols, deadletter, lo, hi, method, part_col, part_cutoff,
     ):
-        """한 run window ``(lo, hi]`` 를 batch_size 조각으로 나눠 검사 → 합산.
-
-        window 전체를 한 번에 세면 CH ``uniqExact`` / 파이썬 key set 이 window 크기
-        (수억 distinct)만큼 메모리를 먹어 CH 메모리 한계를 넘긴다. 조각은 source wm
-        값으로 ``(lo, hi]`` 를 겹침·누락 없이 분할하므로(각 값은 한 조각에만 속함)
-        조각별 count/distinct/누락을 그대로 더하면 window 전체 값과 같다.
-        """
-        total_src = total_tgt = total_dl = 0
-        missing_keys: list[tuple] = []
-        for sub_lo, sub_hi in self._sub_windows(
-            pg_conn, src_schema, src_name, wm_col, lo, hi, batch_size
-        ):
-            s_n, t_n, m_keys, dl = self._check_range(
-                pg_conn, ch, src_schema, src_name, tgt_db, tgt_name,
-                wm_col, key_cols, deadletter, sub_lo, sub_hi, method,
-            )
-            total_src += s_n
-            total_tgt += t_n
-            missing_keys.extend(m_keys)
-            total_dl += dl
-        return total_src, total_tgt, missing_keys, total_dl
-
-    @staticmethod
-    def _sub_windows(pg_conn, src_schema, src_name, wm_col, lo, hi, batch_size):
-        """``(lo, hi]`` 를 source wm 값 오름차순으로 batch_size 씩 끊어 산출.
-
-        각 조각의 상한 ``sub_hi`` 는 source 의 실제 wm 값이라(같은 값을 경계에서
-        쪼개지 않음) 조각들이 ``(lo, hi]`` 를 분할한다. 마지막 조각은 hi 로 닫는다.
-        source 를 기준으로 걷는 건 retention 삭제 walk 과 같은 이유다 — 정본이
-        source 이고 검사 대상이 recent window 라 조각당 distinct wm 수가 batch_size
-        안쪽으로 묶인다. source wm 오름차순 인덱스를 전제로 한다(없으면 조각마다 정렬).
-        """
-        src_fqn = f"{quote_pg_identifier(src_schema)}.{quote_pg_identifier(src_name)}"
-        col = quote_pg_identifier(wm_col)
-        offset = max(int(batch_size) - 1, 0)
-        sub_lo = lo
-        while True:
-            # (sub_lo, hi] 에서 오름차순 batch_size 번째 값 = 이번 조각 상한.
-            # sub_lo 직후부터 인덱스로만 걸어 앞구간 재스캔이 없다.
-            with pg_conn.cursor() as cur:
-                cur.execute(
-                    f"SELECT {col} FROM {src_fqn} "
-                    f"WHERE {col} > %s AND {col} <= %s "
-                    f"ORDER BY {col} OFFSET %s LIMIT 1",
-                    (_coerce_watermark(sub_lo), _coerce_watermark(hi), offset),
-                )
-                row = cur.fetchone()
-            _rollback(pg_conn)
-            boundary = row[0] if row and row[0] is not None else None
-            # boundary 가 없으면(잔여 < batch_size) 이 조각을 hi 로 닫고 종료.
-            yield sub_lo, (boundary if boundary is not None else hi)
-            if boundary is None:
-                break
-            sub_lo = boundary  # boundary 는 WHERE 상 sub_lo 보다 크므로 반드시 전진
-
-    def _check_range(
-        self, pg_conn, ch, src_schema, src_name, tgt_db, tgt_name,
-        wm_col, key_cols, deadletter, lo, hi, method,
-    ):
-        """조각 하나 검사 → (source_count, target_count, missing_keys, deadletter_hit).
+        """한 구간 검사 → (source_count, target_count, missing_keys, deadletter_hit).
 
         key_cols 는 항상 ``[watermark]`` 다. count 방식은 값싼 count 게이트를 먼저
         보고 모자랄 때만 watermark 값 diff 로 무엇이 빠졌는지 찾는다. key_diff
-        방식은 항상 값 집합을 비교한다.
+        방식은 항상 값 집합을 비교한다. part_col/part_cutoff 가 있으면 양쪽 질의에
+        ``part_col >= part_cutoff`` 를 **똑같이** 걸어(동일 조건이라 count/distinct
+        비교는 그대로 성립) CH 파티션 프루닝으로 스캔을 최근 파티션으로 좁힌다.
         """
         if method == "count":
-            src_n = self._pg_count(pg_conn, src_schema, src_name, wm_col, lo, hi)
-            tgt_n = self._ch_count(ch, tgt_db, tgt_name, wm_col, key_cols, lo, hi)
+            src_n = self._pg_count(
+                pg_conn, src_schema, src_name, wm_col, lo, hi, part_col, part_cutoff,
+            )
+            tgt_n = self._ch_count(
+                ch, tgt_db, tgt_name, wm_col, key_cols, lo, hi, part_col, part_cutoff,
+            )
             if src_n <= tgt_n:
                 return src_n, tgt_n, [], 0
             # count 가 모자란 구간만 정확히 어떤 key 가 빠졌는지 확인.
 
         src_map = {}
         for row in self._pg_keys(
-            pg_conn, src_schema, src_name, wm_col, key_cols, lo, hi
+            pg_conn, src_schema, src_name, wm_col, key_cols, lo, hi,
+            part_col, part_cutoff,
         ):
             src_map.setdefault(_canon_key(row), tuple(row))
         tgt_set = {
             _canon_key(row)
-            for row in self._ch_keys(ch, tgt_db, tgt_name, wm_col, key_cols, lo, hi)
+            for row in self._ch_keys(
+                ch, tgt_db, tgt_name, wm_col, key_cols, lo, hi, part_col, part_cutoff,
+            )
         }
         absent = set(src_map) - tgt_set
         dl_hit = absent & deadletter
@@ -498,54 +470,70 @@ class IntegrityChecker:
 
     # ── counts / key sets ────────────────────────────────────
     @staticmethod
-    def _pg_count(pg_conn, src_schema, src_name, wm_col, lo, hi) -> int:
+    def _pg_count(
+        pg_conn, src_schema, src_name, wm_col, lo, hi, part_col, part_cutoff,
+    ) -> int:
         src_fqn = f"{quote_pg_identifier(src_schema)}.{quote_pg_identifier(src_name)}"
+        part_sql, part_params = _pg_part_clause(part_col, part_cutoff)
         sql = (
             f"SELECT count(*) FROM {src_fqn} "
             f"WHERE {quote_pg_identifier(wm_col)} > %s "
-            f"AND {quote_pg_identifier(wm_col)} <= %s"
+            f"AND {quote_pg_identifier(wm_col)} <= %s{part_sql}"
         )
         with pg_conn.cursor() as cur:
-            cur.execute(sql, (_coerce_watermark(lo), _coerce_watermark(hi)))
+            cur.execute(
+                sql, (_coerce_watermark(lo), _coerce_watermark(hi), *part_params)
+            )
             row = cur.fetchone()
         _rollback(pg_conn)
         return int(row[0]) if row and row[0] is not None else 0
 
     @staticmethod
-    def _ch_count(ch, tgt_db, tgt_name, wm_col, key_cols, lo, hi) -> int:
+    def _ch_count(
+        ch, tgt_db, tgt_name, wm_col, key_cols, lo, hi, part_col, part_cutoff,
+    ) -> int:
         tgt_fqn = f"{quote_ch_identifier(tgt_db)}.{quote_ch_identifier(tgt_name)}"
         key_expr = ", ".join(quote_ch_identifier(c) for c in key_cols)
         sql = (
             f"SELECT uniqExact({key_expr}) FROM {tgt_fqn} "
             f"WHERE {quote_ch_identifier(wm_col)} > {_ch_literal(lo)} "
             f"AND {quote_ch_identifier(wm_col)} <= {_ch_literal(hi)}"
+            f"{_ch_part_clause(part_col, part_cutoff)}"
         )
         res = ch.execute(sql)
         return int(res[0][0]) if res else 0
 
     @staticmethod
-    def _pg_keys(pg_conn, src_schema, src_name, wm_col, key_cols, lo, hi):
+    def _pg_keys(
+        pg_conn, src_schema, src_name, wm_col, key_cols, lo, hi, part_col, part_cutoff,
+    ):
         src_fqn = f"{quote_pg_identifier(src_schema)}.{quote_pg_identifier(src_name)}"
         cols = ", ".join(quote_pg_identifier(c) for c in key_cols)
+        part_sql, part_params = _pg_part_clause(part_col, part_cutoff)
         sql = (
             f"SELECT {cols} FROM {src_fqn} "
             f"WHERE {quote_pg_identifier(wm_col)} > %s "
-            f"AND {quote_pg_identifier(wm_col)} <= %s"
+            f"AND {quote_pg_identifier(wm_col)} <= %s{part_sql}"
         )
         with pg_conn.cursor() as cur:
-            cur.execute(sql, (_coerce_watermark(lo), _coerce_watermark(hi)))
+            cur.execute(
+                sql, (_coerce_watermark(lo), _coerce_watermark(hi), *part_params)
+            )
             rows = cur.fetchall()
         _rollback(pg_conn)
         return rows
 
     @staticmethod
-    def _ch_keys(ch, tgt_db, tgt_name, wm_col, key_cols, lo, hi):
+    def _ch_keys(
+        ch, tgt_db, tgt_name, wm_col, key_cols, lo, hi, part_col, part_cutoff,
+    ):
         tgt_fqn = f"{quote_ch_identifier(tgt_db)}.{quote_ch_identifier(tgt_name)}"
         cols = ", ".join(quote_ch_identifier(c) for c in key_cols)
         sql = (
             f"SELECT DISTINCT {cols} FROM {tgt_fqn} "
             f"WHERE {quote_ch_identifier(wm_col)} > {_ch_literal(lo)} "
             f"AND {quote_ch_identifier(wm_col)} <= {_ch_literal(hi)}"
+            f"{_ch_part_clause(part_col, part_cutoff)}"
         )
         return ch.execute(sql) or []
 
