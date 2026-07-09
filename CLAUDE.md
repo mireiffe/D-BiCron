@@ -62,6 +62,12 @@ retention 전용 DAG(`pg2ch_retention`)는 테이블마다 `verify_<id> → rete
   않는다. 비교 식별자는 watermark 컬럼뿐이다 — order_by/primary_key 는 드라이버 타입
   표현 차이(Decimal scale, timestamp 정밀도 등)로 false mismatch 를 만들 수 있어 쓰지
   않는다. 검사 해상도는 watermark 값 단위 (serial/증가 id 처럼 unique 할 때 정밀).
+  검사 window `(before, after]` 는 한 번에 세지 않고 `integrity_batch_size` 만큼의
+  wm 값 조각으로 나눠 걷는다 (retention 삭제 keyset walk 과 같은 접근). 조각 경계는
+  source 의 실제 wm 값이라 조각들이 window 를 겹침·누락 없이 분할하고, 각 wm 값이 한
+  조각에만 속해 조각별 count/distinct/누락을 그대로 합치면 window 전체와 같다 — CH
+  `uniqExact` 와 key_diff 의 파이썬 key set 이 window 전체(수억 distinct → CH 메모리
+  초과)가 아니라 조각당 distinct 수만큼만 메모리를 쓴다.
 - 누락이 잡히면 그 watermark 값만 골라 재복사(self-heal)한다: source−target watermark
   값 diff → `copier.copy_missing_keys` (watermark 전진 안 함 → resume 무영향,
   ReplacingMergeTree 계열만, dead-letter 는 제외해 무한 재시도 방지). repair 후에도

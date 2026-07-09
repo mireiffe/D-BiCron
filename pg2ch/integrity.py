@@ -19,6 +19,15 @@ false mismatch 를 만들 수 있다. watermark 는 증분 축이라 양쪽에�
   - key_diff: 항상 양쪽 watermark 값 집합을 끌어와 차집합을 구한다. count 가 우연히
               같아 가려지는 경우까지 잡지만 전송 비용이 크다.
 
+검사 window ``(before, after]`` 는 한 번에 세지 않고 wm 값 오름차순으로
+``integrity_batch_size`` 조각(``(sub_lo, sub_hi]``)씩 나눠 걷는다. 조각 경계는
+source 의 실제 wm 값이라 조각들이 window 를 겹침·누락 없이 분할하고, 각 wm 값은
+한 조각에만 속하므로 조각별 count/distinct/누락을 그대로 더하면 window 전체 값과
+같다. 이렇게 하면 CH ``uniqExact`` 와 key_diff 의 파이썬 key set 이 window 전체가
+아니라 조각당 distinct 수만큼만 메모리를 쓴다 — 예전엔 수억 distinct 를 한 번에
+올려 CH 메모리 한계를 넘겼다 (retention 삭제가 keyset walk 으로 O(n²) 를 푼 것과
+같은 접근). 조각 경계 산정은 source wm 오름차순 인덱스를 전제로 한다.
+
 왜 target 을 distinct watermark 로 보나:
   overlap 재전송으로 ReplacingMergeTree 에 같은 row 가 머지 전까지 중복 존재할 수
   있어, target 의 ``count(*)`` 는 누락을 가릴 수 있다. 중복은 같은 row(=같은
@@ -295,6 +304,7 @@ class IntegrityChecker:
             )
         lookback = int(cfg.integrity_lookback_runs)
         tolerance = int(cfg.integrity_tolerance)
+        batch_size = int(cfg.integrity_batch_size)
         windows = meta.recent_run_windows(cfg.table_id, wm_col, lookback)
         if not windows:
             return IntegrityResult(
@@ -331,7 +341,7 @@ class IntegrityChecker:
 
             src_n, tgt_n, missing_keys, dl_hit = self._check_window(
                 pg_conn, ch, src_schema, src_name, tgt_db, tgt_name,
-                wm_col, key_cols, deadletter, lo, hi, method,
+                wm_col, key_cols, deadletter, lo, hi, method, batch_size,
             )
             missing = len(missing_keys)
             checked += 1
@@ -397,9 +407,68 @@ class IntegrityChecker:
 
     def _check_window(
         self, pg_conn, ch, src_schema, src_name, tgt_db, tgt_name,
+        wm_col, key_cols, deadletter, lo, hi, method, batch_size,
+    ):
+        """한 run window ``(lo, hi]`` 를 batch_size 조각으로 나눠 검사 → 합산.
+
+        window 전체를 한 번에 세면 CH ``uniqExact`` / 파이썬 key set 이 window 크기
+        (수억 distinct)만큼 메모리를 먹어 CH 메모리 한계를 넘긴다. 조각은 source wm
+        값으로 ``(lo, hi]`` 를 겹침·누락 없이 분할하므로(각 값은 한 조각에만 속함)
+        조각별 count/distinct/누락을 그대로 더하면 window 전체 값과 같다.
+        """
+        total_src = total_tgt = total_dl = 0
+        missing_keys: list[tuple] = []
+        for sub_lo, sub_hi in self._sub_windows(
+            pg_conn, src_schema, src_name, wm_col, lo, hi, batch_size
+        ):
+            s_n, t_n, m_keys, dl = self._check_range(
+                pg_conn, ch, src_schema, src_name, tgt_db, tgt_name,
+                wm_col, key_cols, deadletter, sub_lo, sub_hi, method,
+            )
+            total_src += s_n
+            total_tgt += t_n
+            missing_keys.extend(m_keys)
+            total_dl += dl
+        return total_src, total_tgt, missing_keys, total_dl
+
+    @staticmethod
+    def _sub_windows(pg_conn, src_schema, src_name, wm_col, lo, hi, batch_size):
+        """``(lo, hi]`` 를 source wm 값 오름차순으로 batch_size 씩 끊어 산출.
+
+        각 조각의 상한 ``sub_hi`` 는 source 의 실제 wm 값이라(같은 값을 경계에서
+        쪼개지 않음) 조각들이 ``(lo, hi]`` 를 분할한다. 마지막 조각은 hi 로 닫는다.
+        source 를 기준으로 걷는 건 retention 삭제 walk 과 같은 이유다 — 정본이
+        source 이고 검사 대상이 recent window 라 조각당 distinct wm 수가 batch_size
+        안쪽으로 묶인다. source wm 오름차순 인덱스를 전제로 한다(없으면 조각마다 정렬).
+        """
+        src_fqn = f"{quote_pg_identifier(src_schema)}.{quote_pg_identifier(src_name)}"
+        col = quote_pg_identifier(wm_col)
+        offset = max(int(batch_size) - 1, 0)
+        sub_lo = lo
+        while True:
+            # (sub_lo, hi] 에서 오름차순 batch_size 번째 값 = 이번 조각 상한.
+            # sub_lo 직후부터 인덱스로만 걸어 앞구간 재스캔이 없다.
+            with pg_conn.cursor() as cur:
+                cur.execute(
+                    f"SELECT {col} FROM {src_fqn} "
+                    f"WHERE {col} > %s AND {col} <= %s "
+                    f"ORDER BY {col} OFFSET %s LIMIT 1",
+                    (_coerce_watermark(sub_lo), _coerce_watermark(hi), offset),
+                )
+                row = cur.fetchone()
+            _rollback(pg_conn)
+            boundary = row[0] if row and row[0] is not None else None
+            # boundary 가 없으면(잔여 < batch_size) 이 조각을 hi 로 닫고 종료.
+            yield sub_lo, (boundary if boundary is not None else hi)
+            if boundary is None:
+                break
+            sub_lo = boundary  # boundary 는 WHERE 상 sub_lo 보다 크므로 반드시 전진
+
+    def _check_range(
+        self, pg_conn, ch, src_schema, src_name, tgt_db, tgt_name,
         wm_col, key_cols, deadletter, lo, hi, method,
     ):
-        """한 구간 검사 → (source_count, target_count, missing_keys, deadletter_hit).
+        """조각 하나 검사 → (source_count, target_count, missing_keys, deadletter_hit).
 
         key_cols 는 항상 ``[watermark]`` 다. count 방식은 값싼 count 게이트를 먼저
         보고 모자랄 때만 watermark 값 diff 로 무엇이 빠졌는지 찾는다. key_diff

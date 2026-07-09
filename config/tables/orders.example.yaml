@@ -70,6 +70,8 @@ integrity:
   repair_attempts: 1             # 재복사→재검사 최대 반복 횟수
   on_mismatch: fail              # (repair 후에도 누락 시) fail = retention 차단 | warn = 로그만
   tolerance: 0                   # 허용 누락 수 (이보다 크면 mismatch)
+  batch_size: 1000000            # window 를 이 만큼의 wm 값 조각으로 나눠 검사
+                                 #   (조각당 distinct 수로 CH uniqExact 메모리를 묶음)
 
 # PG source retention(오래된 source row 삭제)은 테이블 설정이 아니라
 # config/retention.yaml 에서 관리한다 — copy 와 분리된 전용 DAG 로 돈다.

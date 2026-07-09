@@ -117,6 +117,9 @@ class TableConfig:
     integrity_tolerance: int = 0
     integrity_repair: bool = True
     integrity_repair_attempts: int = 1
+    # 검사 window 를 이 만큼의 wm 값 조각으로 나눠 걷는다 (CH uniqExact / 파이썬 key
+    # set 메모리를 조각당 distinct 수로 묶어 대형 window 에서 CH 메모리 초과를 막는다).
+    integrity_batch_size: int = 1_000_000
 
     # Airflow 스케줄링 메타 (DAG factory 가 사용)
     schedule: str | None = None
@@ -195,6 +198,8 @@ class TableConfig:
                 "integrity_repair": "integrity_repair",
                 "repair_attempts": "integrity_repair_attempts",
                 "integrity_repair_attempts": "integrity_repair_attempts",
+                "batch_size": "integrity_batch_size",
+                "integrity_batch_size": "integrity_batch_size",
             }
             unknown_integrity = set(integrity) - set(integrity_keys)
             if unknown_integrity:
@@ -270,6 +275,10 @@ class TableConfig:
         if int(self.integrity_repair_attempts) < 1:
             raise ValueError(
                 f"{self.table_id}: integrity_repair_attempts must be >= 1"
+            )
+        if int(self.integrity_batch_size) <= 0:
+            raise ValueError(
+                f"{self.table_id}: integrity_batch_size must be a positive integer"
             )
         if self.integrity_enabled and self.sync_mode != "append":
             raise ValueError(

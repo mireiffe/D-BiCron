@@ -218,6 +218,7 @@ class TestValidation:
         assert cfg.integrity_tolerance == 0
         assert cfg.integrity_repair is True
         assert cfg.integrity_repair_attempts == 1
+        assert cfg.integrity_batch_size == 1_000_000
 
     def test_integrity_nested_config_ok(self):
         cfg = TableConfig.from_dict(
@@ -233,6 +234,7 @@ class TestValidation:
                     "tolerance": 5,
                     "repair": False,
                     "repair_attempts": 2,
+                    "batch_size": 250_000,
                 },
             )
         )
@@ -243,6 +245,7 @@ class TestValidation:
         assert cfg.integrity_tolerance == 5
         assert cfg.integrity_repair is False
         assert cfg.integrity_repair_attempts == 2
+        assert cfg.integrity_batch_size == 250_000
 
     def test_integrity_bad_method(self):
         with pytest.raises(ValueError, match="integrity_method must be"):
@@ -259,6 +262,15 @@ class TestValidation:
                 _base(
                     sync_mode="append", watermark_column="id",
                     integrity={"repair_attempts": 0},
+                )
+            )
+
+    def test_integrity_batch_size_must_be_positive(self):
+        with pytest.raises(ValueError, match="integrity_batch_size must be a positive"):
+            TableConfig.from_dict(
+                _base(
+                    sync_mode="append", watermark_column="id",
+                    integrity={"batch_size": 0},
                 )
             )
 
