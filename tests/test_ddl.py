@@ -42,6 +42,49 @@ class TestBuildChColumns:
         with pytest.raises(ValueError, match="must include 'type'"):
             ddl.build_ch_columns(PG_COLS, set(), {"status": {"parse_format": "x"}}, [])
 
+    def test_delimited_integer_array_override(self):
+        cols = [
+            {
+                "name": "ids",
+                "pg_type": "text",
+                "nullable": True,
+                "precision": None,
+                "scale": None,
+            }
+        ]
+        result = ddl.build_ch_columns(
+            cols,
+            set(),
+            {"ids": {"type": "Array(Int16)", "delimiter": ","}},
+            [],
+        )
+        assert result == [
+            {
+                "name": "ids",
+                "pg_type": "text",
+                "ch_type": "Array(Int16)",
+                "override": {"delimiter": ","},
+            }
+        ]
+
+    def test_delimited_array_requires_pg_string_source(self):
+        cols = [
+            {
+                "name": "ids",
+                "pg_type": "ARRAY",
+                "nullable": True,
+                "precision": None,
+                "scale": None,
+            }
+        ]
+        with pytest.raises(ValueError, match="requires a PostgreSQL text"):
+            ddl.build_ch_columns(
+                cols,
+                set(),
+                {"ids": {"type": "Array(Int16)", "delimiter": ","}},
+                [],
+            )
+
     def test_order_by_removes_nullable(self):
         result = ddl.build_ch_columns(PG_COLS, set(), {}, ["name"])
         name = [c for c in result if c["name"] == "name"][0]

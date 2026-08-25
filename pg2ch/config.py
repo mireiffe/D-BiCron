@@ -17,6 +17,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
+from .chtypes import extract_ch_array_integer_type
 from .watermark import (
     WATERMARK_TYPES,
     parse_overlap,
@@ -255,6 +256,39 @@ class TableConfig:
             raise ValueError(f"{self.table_id}: insert_types_check must be boolean")
         if self.max_failed_rows is not None and int(self.max_failed_rows) < 0:
             raise ValueError(f"{self.table_id}: max_failed_rows must be >= 0")
+
+        if not isinstance(self.column_overrides, dict):
+            raise ValueError(f"{self.table_id}: column_overrides must be a mapping")
+        for name, override in self.column_overrides.items():
+            if isinstance(override, str):
+                if not override.strip():
+                    raise ValueError(
+                        f"{self.table_id}: column_overrides[{name}] type must not be empty"
+                    )
+                continue
+            if not isinstance(override, dict):
+                raise ValueError(
+                    f"{self.table_id}: column_overrides[{name}] must be a type string "
+                    f"or mapping"
+                )
+            ch_type = override.get("type")
+            if not isinstance(ch_type, str) or not ch_type.strip():
+                raise ValueError(
+                    f"{self.table_id}: column_overrides[{name}] must include a "
+                    f"non-empty 'type'"
+                )
+            if "delimiter" in override:
+                delimiter = override["delimiter"]
+                if not isinstance(delimiter, str) or delimiter == "":
+                    raise ValueError(
+                        f"{self.table_id}: column_overrides[{name}].delimiter "
+                        f"must be a non-empty string"
+                    )
+                if extract_ch_array_integer_type(ch_type) is None:
+                    raise ValueError(
+                        f"{self.table_id}: column_overrides[{name}].delimiter "
+                        f"requires type Array(Int*) or Array(UInt*)"
+                    )
 
         if self.integrity_method not in _INTEGRITY_METHODS:
             raise ValueError(

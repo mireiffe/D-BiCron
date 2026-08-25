@@ -10,14 +10,21 @@ clickhouse-driver 가 types_check=True 로 INSERT 할 때 만족시켜야 하는
 from __future__ import annotations
 
 import json as _json
+import re
 from datetime import date, datetime
 from typing import Callable
 
 from .chtypes import (
+    ch_integer_bounds,
     ch_datetime_tzinfo,
+    extract_ch_array_integer_type,
     extract_ch_datetime_tz,
     unwrap_ch_type,
 )
+
+
+_PG_STRING_TYPES = {"character varying", "character", "text"}
+_INTEGER_TOKEN_RE = re.compile(r"^[+-]?[0-9]+$")
 
 # non-nullable CH 컬럼에 NULL 유입 시 타입별 기본값
 _CH_DEFAULTS: dict[str, object] = {
@@ -55,10 +62,73 @@ def build_transformer(columns: list[dict]):
         override = col.get("override") or {}
         parse_format = override.get("parse_format")
 
-        # 2) PG text → CH DateTime* (column_overrides.parse_format)
-        if (
+        # 2) PG delimiter-separated text → CH Array(Int*) / Array(UInt*)
+        if "delimiter" in override:
+            delimiter = override["delimiter"]
+            _name = col["name"]
+            _item_type = extract_ch_array_integer_type(ch_type)
+            if not isinstance(delimiter, str) or delimiter == "":
+                raise ValueError(
+                    f"column_overrides[{_name}].delimiter must be a non-empty string"
+                )
+            if _item_type is None:
+                raise ValueError(
+                    f"column_overrides[{_name}].delimiter requires type "
+                    f"Array(Int*) or Array(UInt*)"
+                )
+            if pg_t not in _PG_STRING_TYPES:
+                raise ValueError(
+                    f"column_overrides[{_name}].delimiter requires a PostgreSQL "
+                    f"text/varchar/char source column, got {pg_t}"
+                )
+            _lower, _upper = ch_integer_bounds(_item_type)
+
+            def _arrayconv(
+                v,
+                _delimiter=delimiter,
+                _name=_name,
+                _item_type=_item_type,
+                _lower=_lower,
+                _upper=_upper,
+            ):
+                if v is None:
+                    return []
+                if not isinstance(v, str):
+                    raise ValueError(
+                        f"{_name}: expected string for delimiter parsing, "
+                        f"got {type(v).__name__}"
+                    )
+                if not v.strip():
+                    return []
+
+                result = []
+                for position, raw_item in enumerate(v.split(_delimiter), start=1):
+                    item = raw_item.strip()
+                    if not item:
+                        raise ValueError(
+                            f"{_name}: empty {_item_type} array item at position "
+                            f"{position} in {v!r}"
+                        )
+                    if not _INTEGER_TOKEN_RE.fullmatch(item):
+                        raise ValueError(
+                            f"{_name}: invalid {_item_type} array item {item!r} "
+                            f"at position {position}"
+                        )
+                    value = int(item, 10)
+                    if not _lower <= value <= _upper:
+                        raise ValueError(
+                            f"{_name}: {_item_type} array item {value} out of range "
+                            f"[{_lower}, {_upper}] at position {position}"
+                        )
+                    result.append(value)
+                return result
+
+            transforms[i] = _arrayconv
+
+        # 3) PG text → CH DateTime* (column_overrides.parse_format)
+        elif (
             parse_format
-            and pg_t in ("character varying", "character", "text")
+            and pg_t in _PG_STRING_TYPES
             and base.startswith("DateTime")
         ):
             _fmt = parse_format
@@ -97,7 +167,7 @@ def build_transformer(columns: list[dict]):
 
             transforms[i] = _dtparse
 
-        # 3) PG naive timestamp → CH DateTime* (tz 부착)
+        # 4) PG naive timestamp → CH DateTime* (tz 부착)
         elif pg_t == "timestamp without time zone" and base.startswith("DateTime"):
             _tz = ch_datetime_tzinfo(ch_type)
 
@@ -108,7 +178,7 @@ def build_transformer(columns: list[dict]):
 
             transforms[i] = _tsconv
 
-        # 4) PG json/jsonb → CH String
+        # 5) PG json/jsonb → CH String
         elif pg_t in ("json", "jsonb"):
 
             def _jconv(v):
@@ -118,7 +188,7 @@ def build_transformer(columns: list[dict]):
 
             transforms[i] = _jconv
 
-        # 5) PG boolean → CH UInt8
+        # 6) PG boolean → CH UInt8
         elif pg_t == "boolean":
 
             def _bconv(v):
@@ -126,8 +196,8 @@ def build_transformer(columns: list[dict]):
 
             transforms[i] = _bconv
 
-        # 6) PG string → CH numeric (override)
-        elif pg_t in ("character varying", "character", "text") and base.startswith(
+        # 7) PG string → CH numeric (override)
+        elif pg_t in _PG_STRING_TYPES and base.startswith(
             ("Int", "UInt", "Float", "Decimal")
         ):
             if base.startswith("Float"):
@@ -146,7 +216,7 @@ def build_transformer(columns: list[dict]):
 
             transforms[i] = _nconv
 
-        # 7) PG numeric(Decimal) → CH Int/Float (override)
+        # 8) PG numeric(Decimal) → CH Int/Float (override)
         elif pg_t == "numeric" and base.startswith(("Int", "UInt", "Float")):
             _conv = float if base.startswith("Float") else int
 
@@ -157,12 +227,8 @@ def build_transformer(columns: list[dict]):
 
             transforms[i] = _dconv
 
-        # 8) PG non-string (bytea/interval/inet/array 등) → CH String
-        elif base == "String" and pg_t not in (
-            "character varying",
-            "character",
-            "text",
-        ):
+        # 9) PG non-string (bytea/interval/inet/array 등) → CH String
+        elif base == "String" and pg_t not in _PG_STRING_TYPES:
 
             def _sconv(v):
                 if v is not None and not isinstance(v, str):

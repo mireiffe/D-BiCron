@@ -4,6 +4,8 @@ from __future__ import annotations
 
 from decimal import Decimal
 
+import pytest
+
 from pg2ch.transform import build_transformer
 
 
@@ -102,3 +104,80 @@ def test_parse_format_text_to_datetime():
     out = fn(("20260101 120000",))[0]
     assert out.year == 2026 and out.hour == 12
     assert out.tzinfo == timezone.utc
+
+
+def _delimited_array_transformer(
+    *, ch_type="Array(Int16)", delimiter=",", pg_type="text"
+):
+    return build_transformer(
+        [
+            {
+                "name": "ids",
+                "pg_type": pg_type,
+                "ch_type": ch_type,
+                "override": {"delimiter": delimiter},
+            }
+        ]
+    )
+
+
+def test_delimited_text_to_int16_array():
+    fn = _delimited_array_transformer()
+    assert fn is not None
+    assert fn(("1,2,3,4",)) == ([1, 2, 3, 4],)
+    assert fn((" -32768, 0, +32767 ",)) == ([-32768, 0, 32767],)
+
+
+def test_delimited_text_to_integer_array_custom_delimiter():
+    fn = _delimited_array_transformer(ch_type="Array(UInt8)", delimiter="|")
+    assert fn((" 1 | 2 | 255 ",)) == ([1, 2, 255],)
+
+
+@pytest.mark.parametrize("value", [None, "", "   "])
+def test_delimited_text_empty_value_becomes_empty_array(value):
+    fn = _delimited_array_transformer()
+    assert fn((value,)) == ([],)
+
+
+@pytest.mark.parametrize("value", ["1,,3", ",1", "1,"])
+def test_delimited_text_rejects_empty_items(value):
+    fn = _delimited_array_transformer()
+    with pytest.raises(ValueError, match=r"ids: empty Int16 array item"):
+        fn((value,))
+
+
+@pytest.mark.parametrize("value", ["1,x,3", "1,1_000", "1,2.0"])
+def test_delimited_text_rejects_non_integer_items(value):
+    fn = _delimited_array_transformer()
+    with pytest.raises(ValueError, match=r"ids: invalid Int16 array item"):
+        fn((value,))
+
+
+@pytest.mark.parametrize("value", ["32768", "-32769", "65536"])
+def test_delimited_text_checks_int16_range_before_driver(value):
+    fn = _delimited_array_transformer()
+    with pytest.raises(ValueError, match=r"ids: Int16 array item .* out of range"):
+        fn((value,))
+
+
+def test_delimited_text_rejects_non_string_input():
+    fn = _delimited_array_transformer()
+    with pytest.raises(ValueError, match="ids: expected string"):
+        fn(([1, 2],))
+
+
+@pytest.mark.parametrize(
+    ("ch_type", "delimiter", "pg_type", "message"),
+    [
+        ("Array(Int16)", "", "text", "delimiter must be a non-empty string"),
+        ("String", ",", "text", r"requires type Array\(Int\*\)"),
+        ("Array(Int16)", ",", "ARRAY", "requires a PostgreSQL text"),
+    ],
+)
+def test_delimited_array_rejects_invalid_definition(
+    ch_type, delimiter, pg_type, message
+):
+    with pytest.raises(ValueError, match=message):
+        _delimited_array_transformer(
+            ch_type=ch_type, delimiter=delimiter, pg_type=pg_type
+        )

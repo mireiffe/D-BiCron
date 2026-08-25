@@ -51,6 +51,22 @@ class TestUnwrap:
         assert t.unwrap_ch_type("Int64") == "Int64"
 
 
+class TestIntegerArrayTypes:
+    def test_extract_array_integer_type(self):
+        assert t.extract_ch_array_integer_type("Array(Int16)") == "Int16"
+        assert t.extract_ch_array_integer_type("Array(UInt64)") == "UInt64"
+
+    def test_reject_non_integer_array(self):
+        assert t.extract_ch_array_integer_type("Array(String)") is None
+        assert t.extract_ch_array_integer_type("Int16") is None
+        assert t.extract_ch_array_integer_type("Nullable(Array(Int16))") is None
+        assert t.extract_ch_array_integer_type("LowCardinality(Array(Int16))") is None
+
+    def test_integer_bounds(self):
+        assert t.ch_integer_bounds("Int16") == (-32768, 32767)
+        assert t.ch_integer_bounds("UInt8") == (0, 255)
+
+
 class TestDatetimeTz:
     def test_extract_tz(self):
         assert t.extract_ch_datetime_tz("DateTime64(6, 'UTC')") == "UTC"

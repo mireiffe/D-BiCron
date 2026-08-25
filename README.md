@@ -38,7 +38,8 @@ PG 에 데이터가 들어오는 방식이 테이블마다 달라서, 두 모드
 
 대상 CH 테이블이 없으면 설정대로 생성한다 (`CREATE TABLE IF NOT EXISTS`).
 `engine` / `order_by` / `primary_key` / `partition_by` / `indexes` / `settings` 와
-컬럼 단위 `column_overrides`(LowCardinality, Decimal, text→DateTime 파싱 등) /
+컬럼 단위 `column_overrides`(LowCardinality, Decimal, text→DateTime,
+delimiter 구분 text→정수 Array 파싱 등) /
 `drop_columns` / `use_nullable` 를 모두 설정으로 제어한다.
 
 ### 추적 & 실패 모델 (이 프로젝트의 핵심)
@@ -225,6 +226,9 @@ column_overrides:
     type: "DateTime64(3, 'UTC')"
     parse_format: "%Y%m%d %H%M%S"
     timezone: "Asia/Seoul"
+  item_ids:                      # "1,2,3" → [1, 2, 3]
+    type: Array(Int16)
+    delimiter: ","
 use_nullable: false
 
 # 배치 / 에러 처리
@@ -247,6 +251,16 @@ integrity:
   on_mismatch: fail               # (repair 후에도 누락 시) fail = retention 차단 | warn = 로그만
   tolerance: 0                    # 허용 누락 수
 ```
+
+`delimiter` 배열 파싱은 PG `text`/`varchar`/`char`에서 CH
+`Array(Int*)`/`Array(UInt*)`로 옮길 때 사용한다. 각 항목의 양끝 공백은 제거하며,
+source 값이 `NULL`·빈 문자열·공백 문자열이면 빈 배열 `[]`로 적재한다. 중간의 빈 항목
+(`1,,3`), 정수가 아닌 항목, 대상 정수 타입의 범위를 벗어난 값은 데이터 변형 없이
+명시적인 변환 오류로 run을 실패시킨다.
+
+이미 target 컬럼이 `String`으로 생성돼 있다면 설정 변경만으로 기존 CH 스키마가
+바뀌지는 않는다. 이 파이프라인은 없는 테이블만 생성하고 기존 컬럼을 `ALTER`하지 않으므로,
+배열 파싱을 켜기 전에 해당 target 컬럼을 별도로 마이그레이션하거나 테이블을 재생성해야 한다.
 
 **B) 통째로 갈아엎는 테이블 → `full_reload`** (매 실행 TRUNCATE 후 전체 재적재)
 

@@ -186,6 +186,41 @@ class TestValidation:
         with pytest.raises(ValueError, match="insert_types_check"):
             TableConfig.from_dict(_base(insert_types_check="false"))
 
+    def test_delimited_integer_array_override_ok(self):
+        cfg = TableConfig.from_dict(
+            _base(
+                column_overrides={
+                    "ids": {"type": "Array(Int16)", "delimiter": ","}
+                }
+            )
+        )
+        assert cfg.column_overrides["ids"]["delimiter"] == ","
+
+    @pytest.mark.parametrize("delimiter", ["", None, 1])
+    def test_array_delimiter_must_be_non_empty_string(self, delimiter):
+        with pytest.raises(ValueError, match="delimiter must be a non-empty string"):
+            TableConfig.from_dict(
+                _base(
+                    column_overrides={
+                        "ids": {"type": "Array(Int16)", "delimiter": delimiter}
+                    }
+                )
+            )
+
+    def test_array_delimiter_requires_integer_array_type(self):
+        with pytest.raises(ValueError, match=r"requires type Array\(Int\*\)"):
+            TableConfig.from_dict(
+                _base(
+                    column_overrides={
+                        "ids": {"type": "String", "delimiter": ","}
+                    }
+                )
+            )
+
+    def test_column_overrides_must_be_mapping(self):
+        with pytest.raises(ValueError, match="column_overrides must be a mapping"):
+            TableConfig.from_dict(_base(column_overrides=["ids"]))
+
     def test_legacy_retention_block_rejected_with_migration_hint(self):
         with pytest.raises(ValueError, match="config/retention.yaml"):
             TableConfig.from_dict(

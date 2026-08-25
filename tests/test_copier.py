@@ -285,6 +285,30 @@ class TestCopyFlow:
         _, _, ch, _ = self._run(cfg, [(1, "a")])
         assert any("CREATE TABLE IF NOT EXISTS `default`.`orders`" in s for s in ch.executed)
 
+    def test_delimited_text_array_override_end_to_end(self):
+        cfg = _cfg(
+            sync_mode="full_reload",
+            column_overrides={
+                "ids": {"type": "Array(Int16)", "delimiter": ","}
+            },
+        )
+        cols = [
+            ("id", "integer", "NO", None, None),
+            ("ids", "text", "YES", None, None),
+        ]
+        pg = FakePG(cols, [(1, "1, 2,3"), (2, None), (3, "")])
+        ch = FakeCH()
+        meta = FakeMeta()
+
+        result = TableCopier(cfg).copy(
+            pg, ch, meta, target_default_db="default"
+        )
+
+        assert result.status == "success"
+        assert ch.inserted == [(1, [1, 2, 3]), (2, []), (3, [])]
+        assert any("`ids` Array(Int16)" in sql for sql in ch.executed)
+        assert 'SELECT "id", "ids" FROM "public"."orders"' in pg.stream.query
+
     def test_append_first_run_copies_all_and_sets_watermark(self):
         cfg = _cfg(sync_mode="append", watermark_column="id", watermark_type="serial")
         result, pg, ch, meta = self._run(cfg, [(1, "a"), (2, "b"), (3, "c")], resume=None)

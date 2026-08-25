@@ -12,7 +12,14 @@ from __future__ import annotations
 
 import re
 
-from .chtypes import pg_type_to_ch, quote_ch_identifier
+from .chtypes import (
+    extract_ch_array_integer_type,
+    pg_type_to_ch,
+    quote_ch_identifier,
+)
+
+
+_PG_STRING_TYPES = {"character varying", "character", "text"}
 
 
 # ── ORDER BY / PRIMARY KEY ─────────────────────────────────────
@@ -151,6 +158,7 @@ def build_ch_columns(
     - column_overrides 값:
         * 문자열: CH 타입 그대로 (예: "LowCardinality(String)")
         * 객체: {"type": "...", "parse_format": "...", "timezone": "..."}
+        * text → 정수 배열: {"type": "Array(Int16)", "delimiter": ","}
     """
     order_by_set = set(order_by_cols)
     result: list[dict] = []
@@ -168,6 +176,24 @@ def build_ch_columns(
                     )
                 ch_type = ov["type"]
                 override_meta = {k: v for k, v in ov.items() if k != "type"}
+                if "delimiter" in ov:
+                    delimiter = ov["delimiter"]
+                    if not isinstance(delimiter, str) or delimiter == "":
+                        raise ValueError(
+                            f"column_overrides[{name}].delimiter must be a "
+                            f"non-empty string"
+                        )
+                    if extract_ch_array_integer_type(ch_type) is None:
+                        raise ValueError(
+                            f"column_overrides[{name}].delimiter requires type "
+                            f"Array(Int*) or Array(UInt*)"
+                        )
+                    if col["pg_type"] not in _PG_STRING_TYPES:
+                        raise ValueError(
+                            f"column_overrides[{name}].delimiter requires a "
+                            f"PostgreSQL text/varchar/char source column, got "
+                            f"{col['pg_type']}"
+                        )
             else:
                 ch_type = ov
         else:

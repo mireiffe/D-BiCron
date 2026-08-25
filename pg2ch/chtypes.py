@@ -38,6 +38,14 @@ PG_TO_CH: dict[str, str] = {
     "money": "Decimal(18,4)",
 }
 
+_CH_INTEGER_BITS = (8, 16, 32, 64, 128, 256)
+_CH_ARRAY_INTEGER_RE = re.compile(
+    rf"^Array\(\s*((?:U)?Int(?:{'|'.join(map(str, _CH_INTEGER_BITS))}))\s*\)$"
+)
+_CH_INTEGER_RE = re.compile(
+    rf"^(U?)Int({'|'.join(map(str, _CH_INTEGER_BITS))})$"
+)
+
 
 def pg_type_to_ch(
     pg_type: str,
@@ -73,6 +81,29 @@ def unwrap_ch_type(ch_type: str) -> str:
                 s = s[len(prefix) : -1]
                 changed = True
     return s
+
+
+def extract_ch_array_integer_type(ch_type: str) -> str | None:
+    """``Array(Int*)`` / ``Array(UInt*)`` 의 원소 타입을 반환한다.
+
+    delimiter 기반 text 파싱이 지원하는 정수 배열 타입만 인식하며, 그 외 타입은
+    ``None`` 을 반환한다.
+    """
+    base = ch_type.strip()
+    match = _CH_ARRAY_INTEGER_RE.fullmatch(base)
+    return match.group(1) if match else None
+
+
+def ch_integer_bounds(ch_type: str) -> tuple[int, int]:
+    """ClickHouse 정수 타입의 inclusive 범위를 반환한다."""
+    match = _CH_INTEGER_RE.fullmatch(ch_type)
+    if not match:
+        raise ValueError(f"unsupported ClickHouse integer type: {ch_type}")
+    unsigned, bits_raw = match.groups()
+    bits = int(bits_raw)
+    if unsigned:
+        return 0, (1 << bits) - 1
+    return -(1 << (bits - 1)), (1 << (bits - 1)) - 1
 
 
 def extract_ch_datetime_tz(ch_type: str) -> str | None:
