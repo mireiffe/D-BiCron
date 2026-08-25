@@ -42,6 +42,9 @@ column_overrides:
   status: LowCardinality(String)
   country: LowCardinality(String)
   amount: Decimal(18,4)
+  business_date_str:             # PG text "20260825" → CH Date 2026-08-25
+    type: Date
+    parse_format: "%Y%m%d"
   item_ids:                      # PG text "1,2,3" → CH [1, 2, 3]
     type: Array(Int16)           # Array(Int*) / Array(UInt*) 지원
     delimiter: ","               # 항목 trim; NULL/빈 문자열 → []

@@ -25,6 +25,9 @@ from .chtypes import (
 
 _PG_STRING_TYPES = {"character varying", "character", "text"}
 _INTEGER_TOKEN_RE = re.compile(r"^[+-]?[0-9]+$")
+_YYYYMMDD_RE = re.compile(r"^[0-9]{8}$")
+_CH_DATE_MIN = date(1970, 1, 1)
+_CH_DATE_MAX = date(2149, 6, 6)
 
 # non-nullable CH 컬럼에 NULL 유입 시 타입별 기본값
 _CH_DEFAULTS: dict[str, object] = {
@@ -61,6 +64,28 @@ def build_transformer(columns: list[dict]):
 
         override = col.get("override") or {}
         parse_format = override.get("parse_format")
+        if "parse_format" in override:
+            _name = col["name"]
+            if not isinstance(parse_format, str) or parse_format == "":
+                raise ValueError(
+                    f"column_overrides[{_name}].parse_format must be a "
+                    f"non-empty string"
+                )
+            if pg_t not in _PG_STRING_TYPES:
+                raise ValueError(
+                    f"column_overrides[{_name}].parse_format requires a PostgreSQL "
+                    f"text/varchar/char source column, got {pg_t}"
+                )
+            if base != "Date" and not base.startswith("DateTime"):
+                raise ValueError(
+                    f"column_overrides[{_name}].parse_format requires type "
+                    f"Date, DateTime, or DateTime64"
+                )
+            if base == "Date" and override.get("timezone") is not None:
+                raise ValueError(
+                    f"column_overrides[{_name}].timezone is only valid for "
+                    f"DateTime/DateTime64"
+                )
 
         # 2) PG delimiter-separated text → CH Array(Int*) / Array(UInt*)
         if "delimiter" in override:
@@ -125,29 +150,39 @@ def build_transformer(columns: list[dict]):
 
             transforms[i] = _arrayconv
 
-        # 3) PG text → CH DateTime* (column_overrides.parse_format)
+        # 3) PG text → CH Date / DateTime* (column_overrides.parse_format)
         elif (
             parse_format
             and pg_t in _PG_STRING_TYPES
-            and base.startswith("DateTime")
+            and (base == "Date" or base.startswith("DateTime"))
         ):
             _fmt = parse_format
-            tz_override = override.get("timezone")
-            if tz_override:
-                try:
-                    from zoneinfo import ZoneInfo
-
-                    _tz = ZoneInfo(tz_override)
-                except Exception as e:
-                    raise ValueError(
-                        f"column_overrides[{col['name']}].timezone "
-                        f"invalid: {tz_override}"
-                    ) from e
+            _date_only = base == "Date"
+            if _date_only:
+                _tz = None
             else:
-                _tz = ch_datetime_tzinfo(ch_type)
+                tz_override = override.get("timezone")
+                if tz_override:
+                    try:
+                        from zoneinfo import ZoneInfo
+
+                        _tz = ZoneInfo(tz_override)
+                    except Exception as e:
+                        raise ValueError(
+                            f"column_overrides[{col['name']}].timezone "
+                            f"invalid: {tz_override}"
+                        ) from e
+                else:
+                    _tz = ch_datetime_tzinfo(ch_type)
             _name = col["name"]
 
-            def _dtparse(v, _fmt=_fmt, _tz=_tz, _name=_name):
+            def _dtparse(
+                v,
+                _fmt=_fmt,
+                _tz=_tz,
+                _name=_name,
+                _date_only=_date_only,
+            ):
                 if v is None:
                     return v
                 if not isinstance(v, str):
@@ -155,12 +190,26 @@ def build_transformer(columns: list[dict]):
                         f"{_name}: expected string for parse_format, "
                         f"got {type(v).__name__}"
                     )
+                if _date_only and _fmt == "%Y%m%d" and not _YYYYMMDD_RE.fullmatch(v):
+                    raise ValueError(
+                        f"{_name}: failed to parse {v!r} with format {_fmt!r}: "
+                        f"expected exactly 8 digits"
+                    )
                 try:
                     dt = datetime.strptime(v, _fmt)
                 except ValueError as e:
                     raise ValueError(
                         f"{_name}: failed to parse {v!r} with format {_fmt!r}: {e}"
                     ) from e
+                if _date_only:
+                    parsed_date = dt.date()
+                    if not _CH_DATE_MIN <= parsed_date <= _CH_DATE_MAX:
+                        raise ValueError(
+                            f"{_name}: parsed Date {parsed_date.isoformat()} out of "
+                            f"ClickHouse Date range [{_CH_DATE_MIN.isoformat()}, "
+                            f"{_CH_DATE_MAX.isoformat()}]"
+                        )
+                    return parsed_date
                 if dt.tzinfo is None:
                     dt = dt.replace(tzinfo=_tz)
                 return dt

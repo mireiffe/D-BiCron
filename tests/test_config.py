@@ -221,6 +221,60 @@ class TestValidation:
         with pytest.raises(ValueError, match="column_overrides must be a mapping"):
             TableConfig.from_dict(_base(column_overrides=["ids"]))
 
+    def test_text_date_parse_override_ok(self):
+        cfg = TableConfig.from_dict(
+            _base(
+                column_overrides={
+                    "business_date": {"type": "Date", "parse_format": "%Y%m%d"}
+                }
+            )
+        )
+        assert cfg.column_overrides["business_date"] == {
+            "type": "Date",
+            "parse_format": "%Y%m%d",
+        }
+
+    @pytest.mark.parametrize("parse_format", ["", None, 1])
+    def test_parse_format_must_be_non_empty_string(self, parse_format):
+        with pytest.raises(ValueError, match="parse_format must be a non-empty string"):
+            TableConfig.from_dict(
+                _base(
+                    column_overrides={
+                        "business_date": {
+                            "type": "Date",
+                            "parse_format": parse_format,
+                        }
+                    }
+                )
+            )
+
+    def test_parse_format_requires_temporal_target(self):
+        with pytest.raises(ValueError, match="requires type Date, DateTime"):
+            TableConfig.from_dict(
+                _base(
+                    column_overrides={
+                        "business_date": {
+                            "type": "String",
+                            "parse_format": "%Y%m%d",
+                        }
+                    }
+                )
+            )
+
+    def test_date_parse_rejects_timezone(self):
+        with pytest.raises(ValueError, match="timezone is only valid"):
+            TableConfig.from_dict(
+                _base(
+                    column_overrides={
+                        "business_date": {
+                            "type": "Date",
+                            "parse_format": "%Y%m%d",
+                            "timezone": "UTC",
+                        }
+                    }
+                )
+            )
+
     def test_legacy_retention_block_rejected_with_migration_hint(self):
         with pytest.raises(ValueError, match="config/retention.yaml"):
             TableConfig.from_dict(

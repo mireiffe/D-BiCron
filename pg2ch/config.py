@@ -17,7 +17,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
-from .chtypes import extract_ch_array_integer_type
+from .chtypes import extract_ch_array_integer_type, unwrap_ch_type
 from .watermark import (
     WATERMARK_TYPES,
     parse_overlap,
@@ -288,6 +288,24 @@ class TableConfig:
                     raise ValueError(
                         f"{self.table_id}: column_overrides[{name}].delimiter "
                         f"requires type Array(Int*) or Array(UInt*)"
+                    )
+            if "parse_format" in override:
+                parse_format = override["parse_format"]
+                if not isinstance(parse_format, str) or parse_format == "":
+                    raise ValueError(
+                        f"{self.table_id}: column_overrides[{name}].parse_format "
+                        f"must be a non-empty string"
+                    )
+                base_type = unwrap_ch_type(ch_type)
+                if base_type != "Date" and not base_type.startswith("DateTime"):
+                    raise ValueError(
+                        f"{self.table_id}: column_overrides[{name}].parse_format "
+                        f"requires type Date, DateTime, or DateTime64"
+                    )
+                if base_type == "Date" and override.get("timezone") is not None:
+                    raise ValueError(
+                        f"{self.table_id}: column_overrides[{name}].timezone is "
+                        f"only valid for DateTime/DateTime64"
                     )
 
         if self.integrity_method not in _INTEGRITY_METHODS:

@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from datetime import date
+
 import pytest
 
 from pg2ch.config import TableConfig
@@ -308,6 +310,33 @@ class TestCopyFlow:
         assert ch.inserted == [(1, [1, 2, 3]), (2, []), (3, [])]
         assert any("`ids` Array(Int16)" in sql for sql in ch.executed)
         assert 'SELECT "id", "ids" FROM "public"."orders"' in pg.stream.query
+
+    def test_text_date_override_end_to_end(self):
+        cfg = _cfg(
+            sync_mode="full_reload",
+            column_overrides={
+                "business_date": {"type": "Date", "parse_format": "%Y%m%d"}
+            },
+        )
+        cols = [
+            ("id", "integer", "NO", None, None),
+            ("business_date", "text", "YES", None, None),
+        ]
+        pg = FakePG(cols, [(1, "20260825")])
+        ch = FakeCH()
+        meta = FakeMeta()
+
+        result = TableCopier(cfg).copy(
+            pg, ch, meta, target_default_db="default"
+        )
+
+        assert result.status == "success"
+        assert ch.inserted == [(1, date(2026, 8, 25))]
+        assert any("`business_date` Date" in sql for sql in ch.executed)
+        assert (
+            'SELECT "id", "business_date" FROM "public"."orders"'
+            in pg.stream.query
+        )
 
     def test_append_first_run_copies_all_and_sets_watermark(self):
         cfg = _cfg(sync_mode="append", watermark_column="id", watermark_type="serial")

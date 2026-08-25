@@ -16,6 +16,7 @@ from .chtypes import (
     extract_ch_array_integer_type,
     pg_type_to_ch,
     quote_ch_identifier,
+    unwrap_ch_type,
 )
 
 
@@ -158,6 +159,7 @@ def build_ch_columns(
     - column_overrides 값:
         * 문자열: CH 타입 그대로 (예: "LowCardinality(String)")
         * 객체: {"type": "...", "parse_format": "...", "timezone": "..."}
+        * YYYYMMDD text → Date: {"type": "Date", "parse_format": "%Y%m%d"}
         * text → 정수 배열: {"type": "Array(Int16)", "delimiter": ","}
     """
     order_by_set = set(order_by_cols)
@@ -193,6 +195,30 @@ def build_ch_columns(
                             f"column_overrides[{name}].delimiter requires a "
                             f"PostgreSQL text/varchar/char source column, got "
                             f"{col['pg_type']}"
+                        )
+                if "parse_format" in ov:
+                    parse_format = ov["parse_format"]
+                    if not isinstance(parse_format, str) or parse_format == "":
+                        raise ValueError(
+                            f"column_overrides[{name}].parse_format must be a "
+                            f"non-empty string"
+                        )
+                    base_type = unwrap_ch_type(ch_type)
+                    if base_type != "Date" and not base_type.startswith("DateTime"):
+                        raise ValueError(
+                            f"column_overrides[{name}].parse_format requires type "
+                            f"Date, DateTime, or DateTime64"
+                        )
+                    if col["pg_type"] not in _PG_STRING_TYPES:
+                        raise ValueError(
+                            f"column_overrides[{name}].parse_format requires a "
+                            f"PostgreSQL text/varchar/char source column, got "
+                            f"{col['pg_type']}"
+                        )
+                    if base_type == "Date" and ov.get("timezone") is not None:
+                        raise ValueError(
+                            f"column_overrides[{name}].timezone is only valid for "
+                            f"DateTime/DateTime64"
                         )
             else:
                 ch_type = ov

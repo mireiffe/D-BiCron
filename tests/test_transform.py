@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from datetime import date
 from decimal import Decimal
 
 import pytest
@@ -104,6 +105,119 @@ def test_parse_format_text_to_datetime():
     out = fn(("20260101 120000",))[0]
     assert out.year == 2026 and out.hour == 12
     assert out.tzinfo == timezone.utc
+
+
+def test_parse_format_datetime_keeps_timezone_override():
+    fn = build_transformer(
+        [
+            {
+                "name": "occurred",
+                "pg_type": "text",
+                "ch_type": "DateTime64(3, 'UTC')",
+                "override": {
+                    "parse_format": "%Y%m%d %H%M%S",
+                    "timezone": "Asia/Seoul",
+                },
+            }
+        ]
+    )
+    out = fn(("20260825 120000",))[0]
+    assert str(out.tzinfo) == "Asia/Seoul"
+
+
+@pytest.mark.parametrize("pg_type", ["text", "character varying", "character"])
+def test_parse_format_text_to_date(pg_type):
+    fn = build_transformer(
+        [
+            {
+                "name": "business_date",
+                "pg_type": pg_type,
+                "ch_type": "Date",
+                "override": {"parse_format": "%Y%m%d"},
+            }
+        ]
+    )
+    assert fn is not None
+    assert fn(("20260825",)) == (date(2026, 8, 25),)
+
+
+def test_parse_format_date_null_semantics():
+    non_nullable = build_transformer(
+        [
+            {
+                "name": "business_date",
+                "pg_type": "text",
+                "ch_type": "Date",
+                "override": {"parse_format": "%Y%m%d"},
+            }
+        ]
+    )
+    nullable = build_transformer(
+        [
+            {
+                "name": "business_date",
+                "pg_type": "text",
+                "ch_type": "Nullable(Date)",
+                "override": {"parse_format": "%Y%m%d"},
+            }
+        ]
+    )
+    assert non_nullable((None,)) == (date(1970, 1, 1),)
+    assert nullable((None,)) == (None,)
+
+
+@pytest.mark.parametrize(
+    "value", ["", "2026-08-25", "20260230", "2026825", "202681"]
+)
+def test_parse_format_date_rejects_invalid_value(value):
+    fn = build_transformer(
+        [
+            {
+                "name": "business_date",
+                "pg_type": "text",
+                "ch_type": "Date",
+                "override": {"parse_format": "%Y%m%d"},
+            }
+        ]
+    )
+    with pytest.raises(
+        ValueError,
+        match=r"business_date: failed to parse .* with format '%Y%m%d'",
+    ):
+        fn((value,))
+
+
+def test_parse_format_date_rejects_non_string_value():
+    fn = build_transformer(
+        [
+            {
+                "name": "business_date",
+                "pg_type": "text",
+                "ch_type": "Date",
+                "override": {"parse_format": "%Y%m%d"},
+            }
+        ]
+    )
+    with pytest.raises(ValueError, match="business_date: expected string"):
+        fn((20260825,))
+
+
+def test_parse_format_date_checks_clickhouse_range():
+    fn = build_transformer(
+        [
+            {
+                "name": "business_date",
+                "pg_type": "text",
+                "ch_type": "Date",
+                "override": {"parse_format": "%Y%m%d"},
+            }
+        ]
+    )
+    assert fn(("19700101",)) == (date(1970, 1, 1),)
+    assert fn(("21490606",)) == (date(2149, 6, 6),)
+    for value in ("19691231", "21490607"):
+        with pytest.raises(ValueError, match="out of ClickHouse Date range"):
+            fn((value,))
 
 
 def _delimited_array_transformer(

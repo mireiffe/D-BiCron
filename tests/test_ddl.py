@@ -38,6 +38,13 @@ class TestBuildChColumns:
         assert status["ch_type"] == "DateTime64(3, 'UTC')"
         assert status["override"] == {"parse_format": "%Y%m%d"}
 
+    def test_text_date_override_with_parse_format(self):
+        ov = {"status": {"type": "Date", "parse_format": "%Y%m%d"}}
+        result = ddl.build_ch_columns(PG_COLS, set(), ov, [])
+        status = [c for c in result if c["name"] == "status"][0]
+        assert status["ch_type"] == "Date"
+        assert status["override"] == {"parse_format": "%Y%m%d"}
+
     def test_dict_override_requires_type(self):
         with pytest.raises(ValueError, match="must include 'type'"):
             ddl.build_ch_columns(PG_COLS, set(), {"status": {"parse_format": "x"}}, [])
@@ -82,6 +89,15 @@ class TestBuildChColumns:
                 cols,
                 set(),
                 {"ids": {"type": "Array(Int16)", "delimiter": ","}},
+                [],
+            )
+
+    def test_parse_format_requires_pg_string_source(self):
+        with pytest.raises(ValueError, match="parse_format requires a PostgreSQL text"):
+            ddl.build_ch_columns(
+                PG_COLS,
+                set(),
+                {"id": {"type": "Date", "parse_format": "%Y%m%d"}},
                 [],
             )
 
